@@ -990,6 +990,36 @@ impl Protocol {
                     }
                     // A limit reported for the replay must not carry over to the real turn.
                     "result" => self.claude_usage_limit = None,
+                    // A failed hook is otherwise invisible: the CLI reports it
+                    // only on this frame, with everything the UI needs.
+                    "system" if v["subtype"] == "hook_response" && v["outcome"] != "success" => {
+                        let name = v["hook_name"].as_str().unwrap_or("hook");
+                        let outcome = v["outcome"].as_str().unwrap_or("failed");
+                        let exit = v["exit_code"].as_i64().unwrap_or_default();
+                        let mut detail = ["stderr", "stdout", "output"]
+                            .iter()
+                            .filter_map(|field| v[field].as_str())
+                            .map(str::trim)
+                            .find(|text| !text.is_empty())
+                            .unwrap_or("")
+                            .to_owned();
+                        crate::tool::tasks::bound(&mut detail, 2000);
+                        let head = if outcome == "error" {
+                            format!("{name} hook failed (exit code {exit})")
+                        } else {
+                            format!("{name} hook {outcome} (exit code {exit})")
+                        };
+                        let text = if detail.is_empty() {
+                            head
+                        } else {
+                            format!("{head}\n{detail}")
+                        };
+                        events.push(Event::Interjection {
+                            text,
+                            custom_type: "hook".into(),
+                            severity: Some("concern".into()),
+                        });
+                    }
                     "control_request" => {
                         let request = &v["request"];
                         if request["subtype"] == "can_use_tool" {
@@ -2037,6 +2067,33 @@ mod tests {
         assert!(claude.claude_usage_limit.is_none());
         let error = claude.frame(json!({"type":"result","is_error":true,"num_turns":1,"result":"Something else went wrong"}), &mut Vec::new()).unwrap_err();
         assert_eq!(error, "Something else went wrong");
+    }
+    #[test]
+    fn claude_failed_hook_surfaces_as_an_interjection() {
+        let mut claude = protocol(Kind::Claude);
+        let mut out = Vec::new();
+        let events = claude
+            .frame(
+                json!({"type":"system","subtype":"hook_response","hook_name":"SessionStart:startup","outcome":"error","exit_code":3,"stderr":"boom\n"}),
+                &mut out,
+            )
+            .unwrap();
+        assert_eq!(
+            events,
+            vec![Event::Interjection {
+                text: "SessionStart:startup hook failed (exit code 3)\nboom".into(),
+                custom_type: "hook".into(),
+                severity: Some("concern".into()),
+            }]
+        );
+        // A successful hook's output is context for the model, not a notice.
+        assert!(claude
+            .frame(
+                json!({"type":"system","subtype":"hook_response","hook_name":"SessionStart:startup","outcome":"success","exit_code":0,"output":"{}"}),
+                &mut out,
+            )
+            .unwrap()
+            .is_empty());
     }
     #[test]
     fn codex_handshake_stream_snapshot_and_resume() {
