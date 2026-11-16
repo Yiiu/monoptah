@@ -41,6 +41,18 @@ pub fn native_prompt(kind: Kind, text: &str) -> String {
     text.into()
 }
 
+/// A prompt the provider should receive verbatim: it begins with a slash
+/// command the provider advertised in its init. Mid-sentence slashes are
+/// ordinary prose, and a `provider:command` disambiguation keeps working.
+pub fn is_advertised_command(text: &str, names: &std::collections::BTreeSet<&str>) -> bool {
+    let Some(body) = text.trim_start().strip_prefix('/') else {
+        return false;
+    };
+    let end = body.find(char::is_whitespace).unwrap_or(body.len());
+    let word = &body[..end];
+    !word.is_empty() && names.contains(word.rsplit(':').next().unwrap_or(word))
+}
+
 /// OMP and Devin own slash arguments, including @file-like text. Expanding a
 /// local skill or mention ahead of them would turn a command into normal text.
 pub fn prepare_prompt(
@@ -354,5 +366,17 @@ mod tests {
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("thread/compact/start"));
         assert!(!output.contains("turn/start"));
+    }
+    #[test]
+    fn advertised_commands_match_at_the_start_only() {
+        use std::collections::BTreeSet;
+        let names = BTreeSet::from(["goal", "model"]);
+        assert!(is_advertised_command("/goal fix it", &names));
+        assert!(is_advertised_command("  /model", &names));
+        assert!(is_advertised_command("/claude:goal x", &names));
+        assert!(!is_advertised_command("please run /goal now", &names));
+        assert!(!is_advertised_command("/nosuchcmd hi", &names));
+        assert!(!is_advertised_command("/", &names));
+        assert!(!is_advertised_command("plain text", &names));
     }
 }
