@@ -1,8 +1,11 @@
 # Monoptah Native `/goal` Support — Design
 
 Date: 2026-11-16
-Status: builder check done (2026-11-16); all four findings resolved by
-investigation or controller call, none left to the design owner
+Status: implemented (2026-11-17) on branch `worktree-native-goal-support`;
+touched-module suites green (core goal notice/command tests, gpui runtime
+catalog + echo-row tests, composer Enter fall-throughs, goal rows, pill
+tests; conversation suite 283 passing). Live acceptance walk pending in the
+Native Dev build.
 Scope: Monoptah Native (GPUI) only. The Tauri app is explicitly out of scope.
 
 ## Intent and why
