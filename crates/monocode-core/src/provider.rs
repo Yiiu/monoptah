@@ -26,6 +26,7 @@ mod compaction;
 pub(crate) mod devin;
 mod discovery;
 mod follow_up;
+mod goal;
 mod kind;
 mod lifecycle;
 mod limits;

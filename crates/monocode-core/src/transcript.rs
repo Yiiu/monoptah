@@ -21,6 +21,27 @@ impl Interjection {
     }
 }
 
+/// A claude `/goal` lifecycle notice parsed off the wire.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalNotice {
+    pub phase: GoalPhase,
+    /// The goal's condition, when the notice carries one (set/cleared).
+    pub condition: Option<String>,
+    /// The full notice line, so naive renderers still show something.
+    pub notice: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GoalPhase {
+    Set,
+    Checkin,
+    Paused,
+    Cleared,
+    Achieved,
+    Error,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Row {
     pub role: String,
