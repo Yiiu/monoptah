@@ -15,7 +15,7 @@ use monocode_core::{
         ToolCall, ToolState,
         tasks::{Panel, TaskStatus},
     },
-    transcript::{Interjection, Row, attachments::ROLE as ATTACHMENTS},
+    transcript::{GoalNotice, GoalPhase, Interjection, Row, attachments::ROLE as ATTACHMENTS},
 };
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
@@ -323,6 +323,12 @@ fn notice(rows: &[Row], at: usize, end: usize) -> Option<Value> {
             .ok()
             .filter(|note| !note.text.trim().is_empty())
             .map(|note| json!({"type": "notice", "id": id, "text": note.text})),
+        "goal" => serde_json::from_str::<GoalNotice>(&text)
+            .ok()
+            .filter(|note| !note.notice.trim().is_empty())
+            .map(|note| {
+                json!({"type": "notice", "id": id, "text": note.notice, "dim": note.phase == GoalPhase::Checkin})
+            }),
         "visual" => {
             let document = serde_json::from_str::<monocode_core::visual::VisualDocument>(&text)
                 .ok()

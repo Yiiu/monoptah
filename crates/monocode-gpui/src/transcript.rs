@@ -10,6 +10,7 @@ pub(crate) mod emoji;
 #[cfg(test)]
 mod follow_tests;
 pub(crate) mod git_turns;
+mod goal;
 mod history;
 pub(crate) use history::{HistoryPager, PreparedHistory};
 mod links;
@@ -169,6 +170,9 @@ enum Body {
     Visual(Arc<monocode_core::visual::VisualDocument>),
     Plain(SharedString),
     Interjection(monocode_core::transcript::Interjection),
+    /// A goal lifecycle notice in the transcript flow. Checkins render as a
+    /// thin divider; the other phases as a labelled system row.
+    Goal(monocode_core::transcript::GoalNotice),
     MonoCard(serde_json::Value),
     /// A queued message's bubble, by its index in `pending`.
     Pending(usize),
@@ -3738,6 +3742,19 @@ impl TranscriptView {
                         thought_phase: None,
                     });
                 }
+            } else if role == "goal" {
+                if let Ok(notice) = serde_json::from_str(&text) {
+                    self.rows.push(UiRow {
+                        key: (0, 0),
+                        body: Body::Goal(notice),
+                        message,
+                        first: false,
+                        last: false,
+                        work: false,
+                        work_tail: false,
+                        thought_phase: None,
+                    });
+                }
             } else if role == "remote-plan" {
                 if let Ok(plan) = serde_json::from_str(&text) {
                     self.rows.push(UiRow {
@@ -5186,6 +5203,7 @@ impl TranscriptView {
                     })
                     .into_any_element()
             }
+            Body::Goal(ref notice) => self.goal_row(message_start, notice, cx),
             Body::MonoCard(ref value) => {
                 let chosen = self.reply_after(row.message);
                 crate::monos::cards::render(value, chosen.as_deref(), cx)
@@ -8214,5 +8232,61 @@ mod cloud_rewind_tests {
             .reason(),
             Some(monocode_core::checkpoint::gate::BEFORE_MOVE)
         );
+    }
+}
+
+#[cfg(test)]
+mod goal_row_tests {
+    use super::*;
+    use gpui::{TestAppContext, WindowOptions};
+    use monocode_core::transcript::GoalPhase;
+
+    #[gpui::test]
+    fn goal_rows_map_to_typed_bodies(cx: &mut TestAppContext) {
+        let window = cx
+            .update(|cx| {
+                cx.open_window(WindowOptions::default(), |_, cx| {
+                    cx.new(|_| TranscriptView::new())
+                })
+            })
+            .unwrap();
+        let mut transcript = monocode_core::transcript::Transcript::default();
+        transcript.begin("user");
+        transcript.append("/goal fix it");
+        for (phase, notice) in [
+            (GoalPhase::Set, "Goal set: fix it"),
+            (GoalPhase::Checkin, "Goal still active · 2 · retrying in 4s"),
+        ] {
+            let body = serde_json::to_string(&monocode_core::transcript::GoalNotice {
+                phase,
+                condition: Some("fix it".into()),
+                notice: notice.into(),
+            })
+            .unwrap();
+            transcript.begin("goal");
+            transcript.append(&body);
+        }
+        let rows = transcript.rows.clone();
+        window
+            .update(cx, |view, _, cx| view.patch(0, rows, cx))
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |view, _, _| {
+                let goals: Vec<_> = view
+                    .rows
+                    .iter()
+                    .filter_map(|row| match &row.body {
+                        Body::Goal(notice) => Some(notice.phase.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    goals,
+                    vec![GoalPhase::Set, GoalPhase::Checkin],
+                    "goal rows keep their typed phase through the body mapping"
+                );
+            })
+            .unwrap();
     }
 }
