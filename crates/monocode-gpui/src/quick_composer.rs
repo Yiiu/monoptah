@@ -438,8 +438,13 @@ impl QuickComposer {
     }
     fn launch(&mut self, foreground: bool, cx: &mut Context<Self>) {
         if self.picker == Some(Picker::Commands) {
-            self.choose_command(self.highlight, cx);
-            return;
+            if !self.command_options(cx).is_empty() {
+                self.choose_command(self.highlight, cx);
+                return;
+            }
+            // An unmatched `/word` is an ordinary prompt for the provider:
+            // submit it instead of silently doing nothing.
+            self.close_picker_state(cx);
         }
         if self.input.read(cx).is_composing() || !self.can_submit(cx) {
             return;
@@ -2264,5 +2269,32 @@ mod tests {
         assert_eq!(launch.worktree_cwd, None);
         assert!(launch.foreground);
         assert_eq!(launch.access, AccessMode::FullAccess);
+    }
+
+    #[gpui::test]
+    fn unmatched_command_submits_instead_of_silent_return(cx: &mut TestAppContext) {
+        let window = open(cx);
+        let launched = std::rc::Rc::new(std::cell::RefCell::new(None));
+        window
+            .update(cx, |view, window, cx| {
+                let sink = launched.clone();
+                cx.subscribe_in(&cx.entity(), window, move |_, _, launch: &Launch, _, _| {
+                    *sink.borrow_mut() = Some(launch.clone());
+                })
+                .detach();
+                view.input
+                    .update(cx, |i, cx| i.set_text("/goal".into(), cx));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |view, _, cx| {
+                assert!(view.picker == Some(Picker::Commands));
+                assert!(view.command_options(cx).is_empty());
+                view.launch(true, cx);
+            })
+            .unwrap();
+        let launch = launched.borrow_mut().take().expect("launched");
+        assert_eq!(launch.prompt, "/goal");
     }
 }
