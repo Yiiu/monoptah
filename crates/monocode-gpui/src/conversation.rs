@@ -1327,18 +1327,47 @@ impl Conversation {
             .unwrap_or_default();
         Some((phase, condition))
     }
-    /// The active goal as a pill in the row above the composer, with a `×`
-    /// that clears the goal through the same raw-command passthrough that set
-    /// it. No goal, no pill and no reserved space.
+    /// The active goal as a capsule above the composer, in the stroked-pill
+    /// family of the Commit shelf: a breathing accent dot while the goal
+    /// steers turns, the condition, and a `×` that clears the goal through
+    /// the same raw-command passthrough that set it. No goal, no pill and no
+    /// reserved space.
     fn goal_pill(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let (phase, condition) = self.goal_state(cx)?;
         let paused = phase == GoalPhase::Paused;
         let shown: String = condition.chars().take(48).collect();
         let truncated = condition.chars().count() > 48;
         let label = if paused {
-            "目标（已暂停）"
+            "目标 · 已暂停 · "
         } else {
-            "目标"
+            "目标 · "
+        };
+        let breath = if paused {
+            None
+        } else {
+            Some(crate::pulse::looping(
+                gpui::ElementId::Name("goal-pill-breath".into()),
+                std::time::Duration::from_millis(2_000),
+                crate::pulse::Rate::Low,
+                move |phase| {
+                    // The same slow swell the background clock's dot uses.
+                    let breath = 0.5 - 0.5 * (phase * std::f32::consts::TAU).cos();
+                    let accent = accent_color();
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .size(px(12.))
+                        .rounded_full()
+                        .bg(accent.opacity(0.22 * (1. - breath)))
+                        .child(
+                            div()
+                                .size(px(6.))
+                                .rounded_full()
+                                .bg(accent.opacity(0.6 + 0.4 * breath)),
+                        )
+                },
+            ))
         };
         Some(
             div()
@@ -1348,12 +1377,41 @@ impl Conversation {
                 .items_center()
                 .child(self.goal_anchor.probe())
                 .child(
-                    tool_pill("goal-state", "Session goal")
+                    div()
+                        .id("goal-state")
                         .debug_selector(|| "goal-state".into())
-                        .max_w(px(300.))
-                        .when(paused, |d| d.bg(content(0.07)))
+                        .role(Role::Button)
+                        .aria_label(format!("目标：{condition}"))
+                        .cursor_pointer()
+                        .h(px(26.))
+                        .max_w(px(320.))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .pl(px(10.))
+                        .pr(px(4.))
+                        .rounded_full()
+                        .border_1()
+                        .border_color(content(0.1))
+                        .text_size(px(12.))
+                        .text_color(content(0.7))
+                        .hover(|s| {
+                            s.border_color(content(0.2))
+                                .bg(content(0.06))
+                                .text_color(content(1.))
+                        })
+                        .when_some(breath, |d, breath| d.child(breath))
+                        .when(paused, |d| {
+                            d.child(
+                                div()
+                                    .size(px(7.))
+                                    .flex_shrink_0()
+                                    .rounded_full()
+                                    .bg(warning_color()),
+                            )
+                        })
                         .child(div().min_w_0().truncate().child(format!(
-                            "◎ {label}：{shown}{}",
+                            "{label}{shown}{}",
                             if truncated { "…" } else { "" }
                         )))
                         .child(
@@ -1365,8 +1423,12 @@ impl Conversation {
                                 .cursor_pointer()
                                 .flex()
                                 .items_center()
-                                .text_color(content(0.55))
-                                .child(icon("close", 12.))
+                                .justify_center()
+                                .size(px(18.))
+                                .rounded_full()
+                                .text_color(content(0.5))
+                                .hover(|s| s.bg(content(0.12)).text_color(content(0.85)))
+                                .child(icon("close", 10.))
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| {
                                     // Keep the press from opening the pill's popover.
                                     cx.stop_propagation();
