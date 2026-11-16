@@ -1457,10 +1457,12 @@ impl Render for Completion {
                 if this.token.is_some() && !this.input.read(cx).is_composing() {
                     if !this.choices.is_empty() {
                         this.pick(this.active, window, cx);
+                        cx.stop_propagation();
                     } else {
+                        // No match: Enter sends the draft instead of only
+                        // closing the picker, so unknown commands still go out.
                         this.dismiss(cx);
                     }
-                    cx.stop_propagation();
                 }
             }))
             .on_action(cx.listener(|this, _: &Accept, window, cx| {
@@ -1824,6 +1826,40 @@ mod tests {
             })
             .unwrap();
         assert_eq!(submitted.get(), 0);
+    }
+    #[gpui::test]
+    fn slash_enter_with_no_match_submits(cx: &mut TestAppContext) {
+        let window = window(cx);
+        let submitted = std::rc::Rc::new(std::cell::Cell::new(0));
+        let count = submitted.clone();
+        let _submission = window
+            .update(cx, |v, _, cx| {
+                cx.subscribe(&v.input, move |_, _, _: &input::Submitted, _| {
+                    count.set(count.get() + 1)
+                })
+            })
+            .unwrap();
+        window
+            .update(cx, |v, _, cx| {
+                v.input.update(cx, |i, cx| i.set_text("/goal".into(), cx))
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |v, _, _| {
+                assert!(v.token.is_some(), "the slash token is active");
+                assert!(v.choices.is_empty(), "no completion matches /goal");
+            })
+            .unwrap();
+        cx.simulate_keystrokes(window.into(), "enter");
+        cx.run_until_parked();
+        window
+            .update(cx, |v, _, cx| {
+                assert_eq!(v.input.read(cx).content, "/goal", "the draft is untouched");
+                assert!(v.token.is_none(), "the picker is dismissed");
+            })
+            .unwrap();
+        assert_eq!(submitted.get(), 1, "Enter reaches the submit path");
     }
     #[gpui::test]
     fn an_open_popup_keeps_up_and_down_from_prompt_history(cx: &mut TestAppContext) {
