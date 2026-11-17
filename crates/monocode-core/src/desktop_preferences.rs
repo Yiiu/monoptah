@@ -541,7 +541,7 @@ mod tests {
     fn reads_webkit_utf16_and_excludes_development_origins() {
         let root = tempfile::tempdir().unwrap();
         for (name, scheme, label) in [
-            ("production", "tauri", "Monocode 🦀"),
+            ("production", "tauri", "Monoptah 🦀"),
             ("development", "http", "Stale name"),
         ] {
             let path = root.path().join(name).join(name);
@@ -558,7 +558,7 @@ mod tests {
             .unwrap();
         }
         let preferences = DesktopPreferences::load_webkit(root.path());
-        assert_eq!(preferences.get("monocode.test"), Some("Monocode 🦀"));
+        assert_eq!(preferences.get("monocode.test"), Some("Monoptah 🦀"));
         assert!(!desktop_origin(&origin("http", "localhost")));
         assert!(desktop_origin(&origin("https", "tauri.localhost")));
         assert!(!desktop_origin(b"tauri localhost"));

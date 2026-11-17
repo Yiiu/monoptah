@@ -21,9 +21,12 @@ thread_local! {
 
 impl Store {
     /// Changes whenever a session's saved transcript changes, without reading
-    /// any block content: the edit time, the stored size, and for indexed
-    /// Monos the number and last sequence of their blocks.
-    fn shared_fingerprints(&self) -> Result<HashMap<String, String>, String> {
+    /// any block content: the edit time, the stored size, for indexed Monos
+    /// the number and last sequence of their blocks, and for chunked sessions
+    /// their storage revision — a chunked save never touches `blocks_json`,
+    /// so without the revision two same-time same-length saves would read as
+    /// one.
+    pub(super) fn shared_fingerprints(&self) -> Result<HashMap<String, String>, String> {
         let mut monos: HashMap<String, (i64, i64)> = HashMap::new();
         if has_table(&self.conn, "mono_blocks")? {
             let mut query = sql(self.conn.prepare(
@@ -40,6 +43,16 @@ impl Store {
                 );
             }
         }
+        let mut native: HashMap<String, i64> = HashMap::new();
+        if has_table(&self.conn, "native_sessions")? {
+            let mut query = sql(self
+                .conn
+                .prepare("SELECT session_id,session_revision FROM native_sessions"))?;
+            let mut rows = sql(query.query([]))?;
+            while let Some(row) = sql(rows.next())? {
+                native.insert(sql(row.get(0))?, sql(row.get(1))?);
+            }
+        }
         let mut query = sql(self
             .conn
             .prepare("SELECT id,ifnull(updated_at,0),octet_length(blocks_json) FROM sessions"))?;
@@ -48,10 +61,11 @@ impl Store {
         while let Some(row) = sql(rows.next())? {
             let id: String = sql(row.get(0))?;
             let (count, last) = monos.get(&id).copied().unwrap_or((0, 0));
+            let revision = native.get(&id).copied().unwrap_or(-1);
             out.insert(
                 id,
                 format!(
-                    "{}:{}:{count}:{last}",
+                    "{}:{}:{count}:{last}:{revision}",
                     sql(row.get::<_, i64>(1))?,
                     sql(row.get::<_, Option<i64>>(2))?.unwrap_or(0)
                 ),

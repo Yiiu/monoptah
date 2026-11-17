@@ -1,6 +1,7 @@
 //! UI batches stay responsive while the shared JSON transcript is saved at a
 //! bounded cadence. Delivery receipts and settled turns always flush immediately.
 use super::*;
+use monocode_core::store::DirtyBlock;
 use std::time::Instant;
 
 // Match the desktop's routine-save window. Accepted messages and settled turns
@@ -9,6 +10,11 @@ const SHARED_SAVE_INTERVAL: Duration = Duration::from_millis(650);
 
 pub(super) struct PendingSave {
     from: Option<usize>,
+    /// Non-adjacent dirty block ranges for a chunked-mode session, recorded
+    /// instead of `from` so one flush covers an early edit plus a streaming
+    /// tail. The two never mix for one session: blob sessions keep using the
+    /// `from` suffix window.
+    dirty: Vec<DirtyBlock>,
     context_dirty: bool,
     last_flush: Instant,
     interval: Duration,
@@ -19,6 +25,7 @@ impl PendingSave {
     pub(super) fn new(shared: bool, now: Instant) -> Self {
         Self {
             from: None,
+            dirty: Vec::new(),
             context_dirty: false,
             last_flush: now,
             interval: if shared {
@@ -38,12 +45,75 @@ impl PendingSave {
         self.from = Some(self.from.map_or(row, |old| old.min(row)));
     }
 
+    /// Record one dirty block range (inclusive absolute rows) for a
+    /// chunked-mode session. Unlike `changed`'s suffix window, the ranges need
+    /// not be adjacent; the store writes only the blocks they touch.
+    pub(super) fn dirty_block(&mut self, block: DirtyBlock) {
+        self.dirty.push(block);
+    }
+
     pub(super) fn context_changed(&mut self) {
         self.context_dirty = true;
     }
 
+    /// The earliest row any pending change touched, whichever tracking
+    /// mechanism holds it.
+    fn pending_from(&self) -> Option<usize> {
+        let dirty = self
+            .dirty
+            .iter()
+            .map(|block| block.first_row)
+            .filter(|row| *row >= 0)
+            .min()
+            .map(|row| row as usize);
+        match (self.from, dirty) {
+            (Some(from), Some(dirty)) => Some(from.min(dirty)),
+            (from, dirty) => from.or(dirty),
+        }
+    }
+
+    /// The disjoint row ranges pending a flush, as slices of `transcript`.
+    fn pending_ranges<'a>(&self, transcript: &'a Transcript) -> Vec<(usize, &'a [Row])> {
+        if self.dirty.is_empty() {
+            return self
+                .from
+                .map(|from| (from, &transcript.rows[from..]))
+                .into_iter()
+                .collect();
+        }
+        let mut ranges: Vec<(usize, usize)> = self
+            .dirty
+            .iter()
+            .filter_map(|block| {
+                (block.first_row >= 0).then_some((
+                    block.first_row as usize,
+                    (block.last_row + 1).max(0) as usize,
+                ))
+            })
+            .collect();
+        if let Some(from) = self.from {
+            ranges.push((from, transcript.rows.len()));
+        }
+        ranges.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::new();
+        for (start, end) in ranges {
+            match merged.last_mut() {
+                Some((_, last_end)) if start <= *last_end => *last_end = (*last_end).max(end),
+                _ => merged.push((start, end)),
+            }
+        }
+        merged
+            .into_iter()
+            .map(|(start, end)| {
+                let end = end.min(transcript.rows.len());
+                (start.min(end), &transcript.rows[start.min(end)..end])
+            })
+            .filter(|(_, rows)| !rows.is_empty())
+            .collect()
+    }
+
     pub(super) fn due(&self, boundary: bool, now: Instant) -> bool {
-        (self.from.is_some() || self.context_dirty)
+        (self.pending_from().is_some() || self.context_dirty)
             && (boundary || now.saturating_duration_since(self.last_flush) >= self.interval)
     }
 
@@ -53,33 +123,57 @@ impl PendingSave {
         session: i64,
         transcript: &Transcript,
         context: &monocode_core::context::Usage,
+        reason: SaveReason,
         now: Instant,
     ) -> Result<(), String> {
-        if self.from.is_none() && !self.context_dirty {
+        if self.pending_from().is_none() && !self.context_dirty {
             return Ok(());
         }
+        let wait = Instant::now();
         let mut store = locked(store)?;
-        if let Some(from) = self.from {
-            store.write_rows(session, from, &transcript.rows[from..])?;
-        }
-        if self.context_dirty {
-            let selected = if let Some((provider, account)) = &self.context_owner {
-                store
-                    .agent_settings(session)?
-                    .is_some_and(|settings| settings.account.id == *account)
-                    && store
-                        .sessions()?
-                        .iter()
-                        .any(|current| current.id == session && current.provider == *provider)
-            } else {
-                true
-            };
-            if selected {
-                store.save_context_usage(session, context)?;
+        let acquired = Instant::now();
+        let _ = store.take_save_sample();
+        let ranges = self.pending_ranges(transcript);
+        let result: Result<(), String> = (|| {
+            if !ranges.is_empty() {
+                // One call, one transaction: an early edit and a streaming
+                // tail land together, and a blob session's suffix behaves
+                // exactly as the single-range write always did.
+                store.write_row_ranges(session, &ranges)?;
             }
+            if self.context_dirty {
+                let selected = if let Some((provider, account)) = &self.context_owner {
+                    store
+                        .agent_settings(session)?
+                        .is_some_and(|settings| settings.account.id == *account)
+                        && store
+                            .sessions()?
+                            .iter()
+                            .any(|current| current.id == session && current.provider == *provider)
+                } else {
+                    true
+                };
+                if selected {
+                    store.save_context_usage(session, context)?;
+                }
+            }
+            Ok(())
+        })();
+        // Take before releasing this save's lock, including the failure path.
+        let sample = store.take_save_sample();
+        let held = acquired.elapsed();
+        drop(store);
+        if let Some(mut sample) = sample {
+            sample.reason = reason;
+            sample.lock_wait = acquired.saturating_duration_since(wait);
+            sample.lock_held = held;
+            sample.succeeded &= result.is_ok();
+            crate::persistence_log::record(sample);
         }
+        result?;
         // Keep pending changes after a failed write so final cleanup retries.
         self.from = None;
+        self.dirty.clear();
         self.context_dirty = false;
         self.last_flush = now;
         Ok(())
@@ -91,18 +185,61 @@ impl PendingSave {
         session: i64,
         from: usize,
         transcript: &Transcript,
-        message: &str,
+        message: Option<&str>,
         now: Instant,
     ) -> Result<(), String> {
-        let from = self.from.map_or(from, |old| old.min(from));
-        locked(store)?.write_rows_with_message(
-            session,
-            from,
-            &transcript.rows[from..],
-            Some(message),
-        )?;
+        let from = self.pending_from().map_or(from, |old| old.min(from));
+        let wait = Instant::now();
+        let mut store = locked(store)?;
+        let acquired = Instant::now();
+        let result =
+            store.write_rows_with_message(session, from, &transcript.rows[from..], message);
+        let sample = store.take_save_sample();
+        let held = acquired.elapsed();
+        drop(store);
+        if let Some(mut sample) = sample {
+            sample.reason = SaveReason::Acceptance;
+            sample.lock_wait = acquired.saturating_duration_since(wait);
+            sample.lock_held = held;
+            crate::persistence_log::record(sample);
+        }
+        result?;
         self.from = None;
+        self.dirty.clear();
         self.last_flush = now;
+        Ok(())
+    }
+}
+
+/// Publish ordinary streaming rows before their save competes for the Store
+/// lock: the display never waits behind a parked save (spec L108). Acceptance
+/// receipts, visual saved replies and finish states are not routed through
+/// here — they still confirm only after the commit succeeds.
+pub(super) fn publish_then_flush(
+    pending: &mut PendingSave,
+    store: &Database,
+    session: i64,
+    transcript: &Transcript,
+    context: &monocode_core::context::Usage,
+    boundary: bool,
+    publish: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    let now = Instant::now();
+    publish()?;
+    if pending.due(boundary, now) {
+        pending.flush(
+            store,
+            session,
+            transcript,
+            context,
+            if boundary {
+                SaveReason::Boundary
+            } else {
+                SaveReason::Routine
+            },
+            now,
+        )
+    } else {
         Ok(())
     }
 }
@@ -119,6 +256,317 @@ pub(super) fn save_turn_receipt(
     let mut settings = store.agent_settings(session)?.unwrap_or_default();
     settings.turns.insert(turn, info);
     store.save_agent_settings(session, &settings)
+}
+
+#[cfg(test)]
+mod persistence_safety_tests {
+    use super::*;
+
+    #[test]
+    fn initial_acceptance_preserves_the_first_routine_deadline() {
+        let core = Store::open_monocode(std::path::Path::new(":memory:")).unwrap();
+        let session = core.create("codex", "/project").unwrap();
+        let store = Arc::new(Mutex::new(core));
+        let mut transcript = Transcript::default();
+        transcript.begin("user");
+        transcript.append("Synthetic");
+        transcript.begin("assistant");
+        let now = Instant::now();
+        let mut pending = PendingSave::new(true, now);
+        pending
+            .accept(&store, session.id, 0, &transcript, None, now)
+            .unwrap();
+        pending.changed(transcript.append("x"));
+        assert_eq!(pending.last_flush, now);
+        assert!(!pending.due(false, now + Duration::from_millis(649)));
+        assert!(pending.due(false, now + Duration::from_millis(650)));
+        assert!(locked(&store).unwrap().take_save_sample().is_none());
+    }
+
+    #[test]
+    fn failed_commit_keeps_pending_rows_and_acceptance_retryable() {
+        let mut core = Store::open_monocode(std::path::Path::new(":memory:")).unwrap();
+        let session = core.create("codex", "/project").unwrap();
+        let mut transcript = Transcript::default();
+        transcript.begin("user");
+        transcript.append("Synthetic");
+        transcript.begin("assistant");
+        core.write_rows(session.id, 0, &transcript.rows).unwrap();
+        let store = Arc::new(Mutex::new(core));
+        let now = Instant::now();
+        let mut pending = PendingSave::new(true, now);
+        pending.changed(transcript.append("中文🙂"));
+        locked(&store)
+            .unwrap()
+            .fail_next_save_commit_for_test()
+            .unwrap();
+        assert!(
+            pending
+                .flush(
+                    &store,
+                    session.id,
+                    &transcript,
+                    &Default::default(),
+                    SaveReason::Final,
+                    now
+                )
+                .is_err()
+        );
+        assert!(pending.from.is_some());
+        assert!(pending.due(true, now));
+        pending
+            .flush(
+                &store,
+                session.id,
+                &transcript,
+                &Default::default(),
+                SaveReason::Final,
+                now,
+            )
+            .unwrap();
+        assert!(pending.from.is_none());
+        assert_eq!(
+            locked(&store).unwrap().load(session.id).unwrap().rows,
+            transcript.rows
+        );
+        assert!(
+            locked(&store).unwrap().take_save_sample().is_none(),
+            "sample is consumed inside the save lock"
+        );
+        let from = transcript.begin("user");
+        transcript.append("Next synthetic");
+        pending.changed(from);
+        locked(&store)
+            .unwrap()
+            .fail_next_save_commit_for_test()
+            .unwrap();
+        assert!(
+            pending
+                .accept(
+                    &store,
+                    session.id,
+                    from,
+                    &transcript,
+                    Some("fixed-message"),
+                    now
+                )
+                .is_err()
+        );
+        assert_eq!(pending.from, Some(from));
+        pending
+            .accept(
+                &store,
+                session.id,
+                from,
+                &transcript,
+                Some("fixed-message"),
+                now,
+            )
+            .unwrap();
+        assert!(pending.from.is_none());
+    }
+
+    /// A saved conversation plus a streaming tail, as the safety tests use it.
+    fn safety_conversation() -> (Database, i64, Transcript) {
+        let mut store = Store::open_monocode(std::path::Path::new(":memory:")).unwrap();
+        let session = store.create("codex", "/project").unwrap();
+        let mut transcript = Transcript::default();
+        transcript.begin("user");
+        transcript.append("Prompt");
+        transcript.begin("assistant");
+        store.write_rows(session.id, 0, &transcript.rows).unwrap();
+        (Arc::new(Mutex::new(store)), session.id, transcript)
+    }
+
+    /// Park the Store mutex on a real thread (the batch-1 barrier style): the
+    /// save cannot proceed until `release`, and a lost thread fails loudly
+    /// instead of hanging the suite.
+    struct ParkedStore {
+        release: std::sync::mpsc::Sender<()>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+    impl ParkedStore {
+        fn park(store: &Database) -> (Self, std::sync::mpsc::Receiver<()>) {
+            let (held, held_rx) = std::sync::mpsc::channel();
+            let (release, release_rx) = std::sync::mpsc::channel();
+            let store = store.clone();
+            let thread = std::thread::spawn(move || {
+                let _guard = locked(&store).unwrap();
+                held.send(()).unwrap();
+                release_rx
+                    .recv_timeout(Duration::from_secs(30))
+                    .expect("parked store released");
+            });
+            (
+                Self {
+                    release,
+                    thread: Some(thread),
+                },
+                held_rx,
+            )
+        }
+        fn release(mut self) {
+            if let Some(thread) = self.thread.take() {
+                self.release.send(()).unwrap();
+                thread.join().unwrap();
+            }
+        }
+    }
+    impl Drop for ParkedStore {
+        fn drop(&mut self) {
+            if let Some(thread) = self.thread.take() {
+                let _ = self.release.send(());
+                let _ = thread.join();
+            }
+        }
+    }
+
+    fn streaming_update(start: usize, rows: Vec<Row>) -> Update {
+        Update {
+            worktree_cwd: None,
+            commands: None,
+            provider_turn_id: None,
+            turn_ready: false,
+            follow_up_delivered: Vec::new(),
+            follow_up_errors: Vec::new(),
+            delivered: None,
+            start,
+            rows,
+            provider_id: None,
+            model: None,
+            config_model: None,
+            config_settings: None,
+            title: None,
+            context: None,
+            metrics: None,
+            usage_limit: None,
+            background: None,
+            approvals: Vec::new(),
+            approvals_resolved: Vec::new(),
+            questions: Vec::new(),
+            questions_resolved: Vec::new(),
+            handoff: None,
+            status: "Streaming".into(),
+            finished: false,
+        }
+    }
+
+    #[test]
+    fn display_publishes_before_save_completes() {
+        let (store, id, mut transcript) = safety_conversation();
+        let now = Instant::now();
+        let mut pending = PendingSave::new(true, now);
+        let tail = transcript.append("Tail token 中文");
+        pending.changed(tail);
+        let (tx, rx) = async_channel::bounded(8);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (parked, held) = ParkedStore::park(&store);
+        held.recv_timeout(Duration::from_secs(10)).unwrap();
+        // The save is due now, but the Store mutex is parked: the display
+        // update must still publish before the save can complete.
+        let worker_store = store.clone();
+        let worker_tx = tx.clone();
+        let worker_cancel = cancel.clone();
+        let worker = std::thread::spawn(move || {
+            let mut worker_transcript = Transcript::default();
+            worker_transcript.begin("user");
+            worker_transcript.append("Prompt");
+            let worker_tail = worker_transcript.begin("assistant");
+            worker_transcript.append("Tail token 中文");
+            let update =
+                streaming_update(worker_tail, worker_transcript.rows[worker_tail..].to_vec());
+            let mut pending = pending;
+            let result = publish_then_flush(
+                &mut pending,
+                &worker_store,
+                id,
+                &worker_transcript,
+                &Default::default(),
+                true,
+                move || publish(&worker_tx, &worker_cancel, update),
+            );
+            (pending, result)
+        });
+        // async_channel has no timed blocking receive, so a reader thread
+        // bridges it to a std channel with one.
+        let (update_tx, update_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = update_tx.send(rx.recv_blocking().expect("publish"));
+        });
+        let update = update_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the display publishes while the Store lock is parked");
+        assert_eq!(update.rows.last().unwrap().text, "Tail token 中文");
+        assert!(!worker.is_finished(), "the save still waits on the lock");
+        // Only now can the save run and commit.
+        parked.release();
+        let (pending, result) = worker.join().unwrap();
+        result.unwrap();
+        assert!(pending.from.is_none());
+        assert_eq!(
+            locked(&store).unwrap().load(id).unwrap().rows,
+            transcript.rows
+        );
+    }
+
+    #[test]
+    fn non_adjacent_dirty_ranges_flush_as_one_save() {
+        let (store, id, mut transcript) = safety_conversation();
+        let now = Instant::now();
+        let mut pending = PendingSave::new(true, now);
+        // Three messages the first save lands; then an in-place edit of the
+        // early one and of the tail, with the middle untouched: the two
+        // non-adjacent dirty ranges coalesce into one flush whose write set
+        // leaves the middle row out.
+        let early = transcript.begin("user");
+        transcript.append("Early");
+        let middle = transcript.begin("assistant");
+        transcript.append("Unchanged middle");
+        let tail = transcript.begin("user");
+        transcript.append("Tail");
+        assert!(middle > early && tail > middle);
+        pending.changed(early);
+        pending
+            .flush(
+                &store,
+                id,
+                &transcript,
+                &Default::default(),
+                SaveReason::Routine,
+                now,
+            )
+            .unwrap();
+        transcript.rows[early].text.push_str(" edited");
+        transcript.rows[tail].text.push_str(" edited");
+        pending.dirty_block(DirtyBlock {
+            block_seq: 0,
+            first_row: early as i64,
+            last_row: early as i64,
+        });
+        pending.dirty_block(DirtyBlock {
+            block_seq: 0,
+            first_row: tail as i64,
+            last_row: tail as i64,
+        });
+        assert!(pending.due(false, now + SHARED_SAVE_INTERVAL));
+        pending
+            .flush(
+                &store,
+                id,
+                &transcript,
+                &Default::default(),
+                SaveReason::Routine,
+                now + SHARED_SAVE_INTERVAL,
+            )
+            .unwrap();
+        assert!(pending.from.is_none());
+        assert!(pending.dirty.is_empty());
+        assert_eq!(
+            locked(&store).unwrap().load(id).unwrap().rows,
+            transcript.rows
+        );
+        assert!(!pending.due(true, now + SHARED_SAVE_INTERVAL));
+    }
 }
 
 #[cfg(test)]
@@ -158,7 +606,14 @@ mod tests {
         transcript.append("Stopped");
         pending.changed(stopped);
         pending
-            .flush(&store, id, &transcript, &Default::default(), now)
+            .flush(
+                &store,
+                id,
+                &transcript,
+                &Default::default(),
+                SaveReason::Final,
+                now,
+            )
             .unwrap();
         assert_eq!(
             locked(&store).unwrap().load(id).unwrap().rows,
@@ -191,7 +646,7 @@ mod tests {
         let from = transcript.begin("user");
         transcript.append("Next");
         pending
-            .accept(&store, id, from, &transcript, "queued", now)
+            .accept(&store, id, from, &transcript, Some("queued"), now)
             .unwrap();
         let store = locked(&store).unwrap();
         assert_eq!(store.load(id).unwrap().rows, transcript.rows);

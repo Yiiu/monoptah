@@ -17,6 +17,7 @@ use crate::{
     popover::AnchorSlot,
     runtime::{Database, locked},
     theme::*,
+    ui_store_saves::{SaveOutcome, UiStoreSaves},
 };
 use gpui::{
     App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, ListAlignment,
@@ -55,6 +56,12 @@ pub(crate) struct Inbox {
     state: ViewState,
     snapshot: Snapshot,
     sessions: Vec<Session>,
+    /// Saves the ViewState through the app's fixed-key background saver.
+    saver: UiStoreSaves,
+    /// The generation of the newest accepted save; only it may change `save_error`.
+    save_generation: u64,
+    /// The latest save failure, distinct from network and provider errors.
+    save_error: Option<String>,
     focus: FocusHandle,
     search: Entity<Input>,
     comment: Entity<Input>,
@@ -194,6 +201,8 @@ impl Inbox {
             })
             .unwrap_or_else(|_| (ViewState::default(), cwd.clone()));
         state.filters.hidden_projects = other_projects(&projects, &cwd);
+        let saver = crate::ui_store_saves::inbox_saver(cx)
+            .expect("the app installs the inbox setting saver at startup");
         let search = cx.new(|cx| Input::field("Filter inbox", "Filter inbox", content(0.4), cx));
         let comment = cx.new(Input::inbox_comment);
         let connect_url = cx.new(|cx| Input::field("Instance URL", "https://", content(0.4), cx));
@@ -270,6 +279,9 @@ impl Inbox {
             state,
             snapshot: Snapshot::default(),
             sessions: vec![],
+            saver,
+            save_generation: 0,
+            save_error: None,
             focus: cx.focus_handle(),
             search,
             comment,
@@ -352,7 +364,7 @@ impl Inbox {
             let switched = self.service.cwd != cwd;
             if switched {
                 self.state.filters.hidden_projects = other_projects(&projects, &cwd);
-                self.save();
+                self.save(cx);
             }
             self.projects = projects;
             self.service.cwd = cwd.clone();
@@ -405,7 +417,7 @@ impl Inbox {
         if active {
             if let Some(item) = self.item() {
                 self.state.seen.mark(&item);
-                self.save();
+                self.save(cx);
             } else if let Some(key) = self.initial_key(cx) {
                 self.select(key, cx);
             }
@@ -518,7 +530,7 @@ impl Inbox {
                 {
                     this.leave_source(source.into(), cx);
                 }
-                this.save();
+                this.save(cx);
                 cx.emit(Event::ItemsChanged(appeared));
                 if this.selected.is_some()
                     && this
@@ -552,9 +564,55 @@ impl Inbox {
             monocode_core::files::path_key(&self.service.cwd.to_string_lossy())
         )
     }
-    fn save(&mut self) {
-        if let Err(error) = locked(&self.store).and_then(|db| self.state.save(&db)) {
-            self.error = Some(error);
+    /// Persists the current ViewState through the background setting saver: the
+    /// newest accepted value wins, the UI never waits for the Store, and only the
+    /// newest generation may change the save error. The JSON format and the
+    /// setting key stay exactly what `ViewState::save` wrote.
+    fn save(&mut self, cx: &mut Context<Self>) {
+        let value = match serde_json::to_string(&self.state) {
+            Ok(value) => value,
+            Err(error) => return self.show_save_error(error.to_string(), cx),
+        };
+        match self.saver.save_latest(value) {
+            Ok(ticket) => {
+                let generation = ticket.generation;
+                self.save_generation = generation;
+                cx.spawn(async move |this, cx| {
+                    let outcome = ticket.result.recv().await.ok();
+                    let _ = this.update(cx, |this, cx| {
+                        this.save_settled(generation, outcome, cx);
+                    });
+                })
+                .detach();
+            }
+            // Refused because a quit drain already stopped accepting saves.
+            Err(error) => self.show_save_error(error, cx),
+        }
+    }
+    fn show_save_error(&mut self, error: String, cx: &mut Context<Self>) {
+        self.save_error = Some(format!("Could not save inbox state: {error}"));
+        cx.notify();
+    }
+    /// Applies one save outcome. A result from a superseded generation arrives
+    /// too late to touch the error shown for the current one, and success never
+    /// clears errors that are not about saving.
+    fn save_settled(
+        &mut self,
+        generation: u64,
+        outcome: Option<Result<SaveOutcome, String>>,
+        cx: &mut Context<Self>,
+    ) {
+        if generation != self.save_generation {
+            return;
+        }
+        match outcome {
+            Some(Ok(SaveOutcome::Committed { .. })) => {
+                if self.save_error.take().is_some() {
+                    cx.notify();
+                }
+            }
+            Some(Err(error)) => self.show_save_error(error, cx),
+            Some(Ok(SaveOutcome::Superseded { .. })) | None => {}
         }
     }
     fn visible_items(&self, cx: &App) -> Vec<Item> {
@@ -585,7 +643,7 @@ impl Inbox {
         if let Some(item) = self.item() {
             if self.active {
                 self.state.seen.mark(&item);
-                self.save();
+                self.save(cx);
             }
             if !item.project_path.is_empty() {
                 self.start_project = PathBuf::from(&item.project_path);
@@ -638,7 +696,7 @@ impl Inbox {
         if let Some(key) = self.initial_key(cx) {
             self.select(key, cx);
         }
-        self.save();
+        self.save(cx);
         cx.notify();
     }
     /// Saves the view of the current source and shows `source` with the search
@@ -1213,5 +1271,89 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(start_prompt(&item, "b"), item.prompt("b", false));
+    }
+}
+
+#[cfg(test)]
+mod persistence_safety_tests {
+    use super::*;
+    use gpui::TestAppContext;
+    use std::{path::Path, sync::Arc, sync::Mutex};
+
+    fn memory_store() -> Database {
+        Arc::new(Mutex::new(
+            monocode_core::store::Store::open(Path::new(":memory:")).unwrap(),
+        ))
+    }
+
+    fn inbox(cx: &mut TestAppContext, store: &Database) -> Entity<Inbox> {
+        cx.update(|cx| {
+            crate::ui_store_saves::install(store.clone(), cx);
+            cx.new(|cx| {
+                Inbox::new_inner(
+                    store.clone(),
+                    vec![],
+                    PathBuf::from("/private/tmp/inbox-persistence"),
+                    false,
+                    cx,
+                )
+            })
+        })
+    }
+
+    #[gpui::test]
+    fn owner_close_keeps_latest_save(cx: &mut TestAppContext) {
+        let store = memory_store();
+        let view = inbox(cx, &store);
+        view.update(cx, |inbox, cx| {
+            inbox.state.source = "linear".into();
+            inbox.save(cx);
+        });
+        // The view is gone; the accepted save must still land.
+        drop(view);
+        cx.run_until_parked();
+        let saved = locked(&store)
+            .unwrap()
+            .setting(crate::ui_store_saves::INBOX_KEY)
+            .unwrap();
+        assert!(
+            saved
+                .as_deref()
+                .is_some_and(|raw| raw.contains("\"linear\"")),
+            "the latest accepted value committed after the view closed: {saved:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn old_failure_does_not_override_new_success(cx: &mut TestAppContext) {
+        let store = memory_store();
+        let view = inbox(cx, &store);
+        view.update(cx, |inbox, cx| {
+            inbox.error = Some("network offline".into());
+            let stale = 1;
+            inbox.save_generation = 2;
+            // The newest save succeeded: no save error, unrelated error untouched.
+            inbox.save_settled(2, Some(Ok(SaveOutcome::Committed { generation: 2 })), cx);
+            assert_eq!(inbox.save_error, None);
+            assert_eq!(inbox.error.as_deref(), Some("network offline"));
+            // A late failure from the superseded save cannot override it.
+            inbox.save_settled(stale, Some(Err("disk full".into())), cx);
+            assert_eq!(inbox.save_error, None);
+            assert_eq!(inbox.error.as_deref(), Some("network offline"));
+            // The current generation's failure is shown, and only as a save error.
+            inbox.save_settled(2, Some(Err("disk full".into())), cx);
+            assert!(
+                inbox
+                    .save_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("disk full"))
+            );
+            assert_eq!(inbox.error.as_deref(), Some("network offline"));
+            // A newer success clears only the save error.
+            inbox.save_generation = 3;
+            inbox.save_settled(3, Some(Ok(SaveOutcome::Committed { generation: 3 })), cx);
+            assert_eq!(inbox.save_error, None);
+            assert_eq!(inbox.error.as_deref(), Some("network offline"));
+        });
     }
 }

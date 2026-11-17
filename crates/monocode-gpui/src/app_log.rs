@@ -59,7 +59,8 @@ fn rotate(path: &PathBuf) {
 }
 
 fn wanted(metadata: &log::Metadata) -> bool {
-    metadata.level() <= log::Level::Warn
+    (metadata.target() == crate::persistence_log::TARGET && metadata.level() <= log::Level::Info)
+        || metadata.level() <= log::Level::Warn
         || (metadata.level() <= log::Level::Info && metadata.target().starts_with("gpui_macos"))
 }
 

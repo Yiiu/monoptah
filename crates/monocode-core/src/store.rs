@@ -13,6 +13,8 @@ pub use cloud_rows::{AppendOutcome, RowAnchor};
 mod managed_sessions;
 mod monocode_import;
 mod monos;
+mod native_chunks;
+pub use native_chunks::{ConversionReport, DirtyBlock, NATIVE_CHUNKS_MODE_VERSION};
 mod notes;
 mod remote;
 mod remote_legacy;
@@ -26,7 +28,9 @@ pub use session_metadata::{MobileSessionMetadata, SessionSidebarMetadata};
 mod session_preview;
 pub use session_preview::SessionPreviewData;
 mod edit;
+mod save_stats;
 mod shared;
+pub use save_stats::{SaveConfiguration, SaveReason, SaveSample};
 mod side_threads;
 mod thread_files;
 mod today;
@@ -110,6 +114,7 @@ pub struct Store {
     conn: Connection,
     path: std::path::PathBuf,
     shared: Option<shared::Shared>,
+    save_stats: save_stats::SaveStats,
 }
 impl Store {
     pub fn reset_provider_id_if(&self, id: i64, expected: Option<&str>) -> Result<(), String> {
@@ -246,6 +251,7 @@ impl Store {
             conn,
             path: path.into(),
             shared: None,
+            save_stats: Default::default(),
         })
     }
     /// The selected desktop or isolated-development database.
@@ -829,6 +835,7 @@ impl Store {
             conn,
             path: self.path.clone(),
             shared: None,
+            save_stats: Default::default(),
         }))
     }
     /// Stream saved message bodies without loading conversations into the UI.
@@ -950,6 +957,75 @@ impl Store {
         }
         self.shared_load_before(session, before, all)
     }
+    /// Up to `limit` transcript rows from absolute row `first_row` on, for UI
+    /// pagination. The chunked backend reads only the blocks covering the
+    /// window; everything else projects its whole history. Paging never
+    /// shifts the row origin — the same row keeps its number under any
+    /// window or limit.
+    pub fn page_rows(
+        &self,
+        session: i64,
+        first_row: usize,
+        limit: usize,
+    ) -> Result<Vec<Row>, String> {
+        if self.shared.is_some() && self.remote_session(session)?.is_none() {
+            return self.shared_page_rows(session, first_row as i64, limit);
+        }
+        let history = self.load(session)?;
+        Ok(history
+            .rows
+            .into_iter()
+            .skip(first_row)
+            .take(limit)
+            .collect())
+    }
+    /// The stored block extents of a chunked-mode session, in block order;
+    /// empty for every other store or session. The runtime uses the extents
+    /// to record which block an in-place row edit lands in, so a chunked
+    /// save writes that block instead of a suffix of the window.
+    pub fn block_extents(&self, session: i64) -> Result<Vec<DirtyBlock>, String> {
+        if self.shared.is_none() {
+            return Ok(Vec::new());
+        }
+        self.shared_block_extents(session)
+    }
+    /// The session's stored blocks, read through its active backend: the
+    /// chunked reader reconstructs a chunked session's blocks (its
+    /// `blocks_json` stays the untouched creation fixture), and a blob
+    /// session's list parses from `blocks_json`. This is exactly what the
+    /// store's own merge path reads, so a caller comparing stored content
+    /// against what a save produced (the persistence probe's
+    /// restart-integrity fingerprint) sees the backend's real state, never
+    /// the stale blob beside it.
+    pub fn stored_blocks(&self, session: i64) -> Result<Vec<serde_json::Value>, String> {
+        if self.shared.is_none() {
+            return Err("Stored blocks exist only in the desktop schema".into());
+        }
+        if self.remote_session(session)?.is_some() {
+            return Err("Remote transcripts are owned by the host".into());
+        }
+        self.shared_stored_blocks(session)
+    }
+    /// Store a session's whole block list through its active backend: the
+    /// chunked writer for a chunked session (its `blocks_json` stays
+    /// untouched), the desktop blob otherwise. The full-replace entry the
+    /// runtime's rewind, follow-up and cloud-restore paths use internally,
+    /// exposed for a caller that legitimately holds a whole block list —
+    /// the persistence probe's backend opt-in, which must carry the
+    /// fixture's exact ids, receipts and unknown metadata rather than
+    /// rows re-derived blocks.
+    pub fn store_blocks(&self, session: i64, blocks: &[serde_json::Value]) -> Result<(), String> {
+        if self.remote_session(session)?.is_some() {
+            return Err("Remote transcripts are owned by the host".into());
+        }
+        if self.cloud_location(session)?.is_cloud() {
+            return Err(CLOUD_OWNED.into());
+        }
+        if self.shared.is_none() {
+            return Err("Stored blocks exist only in the desktop schema".into());
+        }
+        self.shared_store_blocks_atomic(session, blocks)
+    }
     pub fn load(&self, session: i64) -> Result<Transcript, String> {
         if let Some(remote) = self.remote_session(session)? {
             let Some(id) = remote.session_id.as_deref() else {
@@ -1020,6 +1096,49 @@ impl Store {
         rows: &[Row],
         message_id: Option<&str>,
     ) -> Result<(), String> {
+        self.write_row_ranges_with_message(session, &[(start, rows)], message_id)
+    }
+    /// One save covering several non-adjacent row ranges: a chunked-mode
+    /// session dirties only the blocks those ranges touch, so an early edit
+    /// and a streaming tail commit together without rewriting the middle. The
+    /// ranges must be disjoint; one transaction covers them all.
+    pub fn write_row_ranges(
+        &mut self,
+        session: i64,
+        ranges: &[(usize, &[Row])],
+    ) -> Result<(), String> {
+        self.write_row_ranges_with_message(session, ranges, None)
+    }
+    fn write_row_ranges_with_message(
+        &mut self,
+        session: i64,
+        ranges: &[(usize, &[Row])],
+        message_id: Option<&str>,
+    ) -> Result<(), String> {
+        self.save_stats.begin(if message_id.is_some() {
+            SaveReason::Acceptance
+        } else {
+            SaveReason::Routine
+        });
+        let result = self.write_row_ranges_measured(session, ranges, message_id);
+        self.save_stats.finish(result.is_ok());
+        result
+    }
+
+    /// Take this while still holding the lock used for the corresponding save.
+    pub fn take_save_sample(&mut self) -> Option<SaveSample> {
+        self.save_stats.take()
+    }
+
+    fn write_row_ranges_measured(
+        &mut self,
+        session: i64,
+        ranges: &[(usize, &[Row])],
+        message_id: Option<&str>,
+    ) -> Result<(), String> {
+        if ranges.is_empty() {
+            return Ok(());
+        }
         if self.remote_session(session)?.is_some() {
             return Err("Remote transcripts are owned by the host".into());
         }
@@ -1030,12 +1149,20 @@ impl Store {
             return Err(CLOUD_OWNED.into());
         }
         if self.shared.is_some() {
-            return self.shared_write_rows(session, start, rows, message_id);
+            return self.shared_write_rows(session, ranges, message_id);
         }
 
         let tx = self.conn.transaction().map_err(|e| e.to_string())?;
-        upsert_rows(&tx, session, start, rows)?;
-        if !rows.is_empty() {
+        let mut changed = 0;
+        for (start, rows) in ranges {
+            upsert_rows(&tx, session, *start, rows)?;
+            // The legacy table path has no JSON encoding or history read. SQLite
+            // touches every supplied row; shared blobs count semantic row changes.
+            changed += rows.len();
+        }
+        self.save_stats
+            .update(|sample| sample.changed_rows = changed);
+        if ranges.iter().any(|(_, rows)| !rows.is_empty()) {
             tx.execute(
                 "UPDATE native_sessions SET updated_at=?2 WHERE id=?1",
                 params![
@@ -1048,7 +1175,13 @@ impl Store {
         if let Some(id) = message_id {
             tx.execute("INSERT INTO native_settings(key,value) VALUES(?1,'1') ON CONFLICT(key) DO UPDATE SET value='1'",[format!("mono-delivered:{session}:{id}")]).map_err(|e|e.to_string())?;
         }
-        tx.commit().map_err(|e| e.to_string())
+        let started = std::time::Instant::now();
+        let result = tx.commit().map_err(|e| e.to_string());
+        self.save_stats.update(|sample| {
+            sample.commit += started.elapsed();
+            sample.commit_count += u64::from(result.is_ok());
+        });
+        result
     }
     /// Archiving preserves the transcript, provider context and configuration.
     pub fn set_archived(&self, id: i64, archived: bool) -> Result<(), String> {

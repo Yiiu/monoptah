@@ -476,6 +476,63 @@ fn indexed_mono_history_stays_in_its_desktop_tables_with_block_ids_intact() {
 }
 
 #[test]
+fn failed_commit_keeps_pending_rows() {
+    let mut store = Store::open_monocode(Path::new(":memory:")).unwrap();
+    let (id, _) = saved(
+        &store,
+        json!([
+            {"id":"fixed-user","role":"user","text":"Synthetic","startedAt":100,"futureMetadata":{"keep":true}},
+            {"id":"fixed-answer","role":"assistant","text":"","sentAt":100}
+        ]),
+    );
+    let mut transcript = store.load(id).unwrap();
+    let from = transcript.append("中文🙂");
+    store.fail_next_save_commit_for_test().unwrap();
+    assert!(store
+        .write_rows(id, from, &transcript.rows[from..])
+        .is_err());
+    let failed = store.take_save_sample().unwrap();
+    assert!(!failed.succeeded);
+    assert_eq!(failed.commit_count, 0);
+    assert_eq!(transcript.rows[from].text, "中文🙂");
+    assert!(store.shared_blocks(id).unwrap()[1]["text"]
+        .as_str()
+        .unwrap()
+        .is_empty());
+    store
+        .write_rows(id, from, &transcript.rows[from..])
+        .unwrap();
+    let recovered = store.take_save_sample().unwrap();
+    assert!(recovered.succeeded);
+    assert_eq!(recovered.commit_count, 1);
+    assert_eq!(recovered.changed_rows, 1);
+    assert_eq!(store.load(id).unwrap().rows, transcript.rows);
+    assert_eq!(
+        store.shared_blocks(id).unwrap()[0]["futureMetadata"],
+        json!({"keep":true})
+    );
+}
+
+#[test]
+fn save_samples_count_existing_utf8_buffers_and_same_value_rows() {
+    let mut store = Store::open_monocode(Path::new(":memory:")).unwrap();
+    let (id, _) = saved(
+        &store,
+        json!([{"id":"fixed","role":"assistant","text":"中文🙂","sentAt":100}]),
+    );
+    let transcript = store.load(id).unwrap();
+    let raw = encode(&store.shared_blocks(id).unwrap()).unwrap();
+    store.write_rows(id, 0, &transcript.rows).unwrap();
+    let sample = store.take_save_sample().unwrap();
+    assert_eq!(sample.history_bytes_read, raw.len() as u64);
+    assert_eq!(sample.serialized_bytes, raw.len() as u64);
+    assert_eq!(sample.changed_rows, 0);
+    assert_eq!(sample.commit_count, 1); // measurement preserves the old same-value commit
+    assert_eq!("中文🙂".len(), 10);
+    assert!(store.take_save_sample().is_none());
+}
+
+#[test]
 fn desktop_open_uses_existing_records_and_does_not_rewrite_the_database() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("monocode.db");
@@ -484,6 +541,15 @@ fn desktop_open_uses_existing_records_and_does_not_rewrite_the_database() {
     let id = store.persisted_session_id(row.id).unwrap();
     assert!(id.parse::<i64>().is_err());
     assert_eq!(store.sessions().unwrap().len(), 1);
+    // A brand-new database gains the chunked backend's tables (batch 2); a
+    // database from before that backend must stay exactly as it was, so drop
+    // them and prove reopening alters nothing.
+    store
+        .conn
+        .execute_batch(
+            "DROP TABLE native_chunks; DROP TABLE native_blocks; DROP TABLE native_sessions; DROP TABLE native_payloads;",
+        )
+        .unwrap();
     drop(store);
     let original = std::fs::read(&path).unwrap();
     let store = Store::open_monocode(&path).unwrap();
@@ -491,6 +557,83 @@ fn desktop_open_uses_existing_records_and_does_not_rewrite_the_database() {
     assert_eq!(store.persisted_session_id(row.id).unwrap(), id);
     assert_eq!(std::fs::read(&path).unwrap(), original);
     assert!(!has_table(&store.conn, "native_sessions").unwrap());
+}
+
+#[test]
+fn same_time_same_length_edit_invalidates_search() {
+    // Two chunked saves that leave the same `updated_at` and the same empty
+    // `blocks_json` must still differ in the search fingerprint: the storage
+    // revision is part of it, so an edit another window missed is re-indexed.
+    let mut store = Store::open_monocode(Path::new(":memory:")).unwrap();
+    store.prefer_chunked_storage(true).unwrap();
+    let session = store.create("codex", "/project").unwrap().id;
+    let original = store.persisted_session_id(session).unwrap();
+    store
+        .write_rows(
+            session,
+            0,
+            &[
+                crate::transcript::Row {
+                    role: "user".into(),
+                    text: "Find the giraffe".into(),
+                    first: true,
+                    sent_at: Some(1),
+                },
+                crate::transcript::Row {
+                    role: "assistant".into(),
+                    text: "Here it is".into(),
+                    first: true,
+                    sent_at: Some(2),
+                },
+            ],
+        )
+        .unwrap();
+    let pinned = 500;
+    store
+        .conn
+        .execute(
+            "UPDATE sessions SET updated_at=?2 WHERE id=?1",
+            params![original, pinned],
+        )
+        .unwrap();
+    let before = store.shared_fingerprints().unwrap()[&original].clone();
+    // A same-length save: the blob stays "[]" before and after, and the edit
+    // time is pinned back to the very same value.
+    store
+        .write_rows(
+            session,
+            2,
+            &[crate::transcript::Row {
+                role: "assistant".into(),
+                text: "Edited!".into(),
+                first: true,
+                sent_at: Some(3),
+            }],
+        )
+        .unwrap();
+    let blob: String = store
+        .conn
+        .query_row(
+            "SELECT blocks_json FROM sessions WHERE id=?1",
+            [&original],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(blob, "[]");
+    store
+        .conn
+        .execute(
+            "UPDATE sessions SET updated_at=?2 WHERE id=?1",
+            params![original, pinned],
+        )
+        .unwrap();
+    let after = store.shared_fingerprints().unwrap()[&original].clone();
+    assert_ne!(before, after);
+    // Everything except the revision is identical.
+    let (before_prefix, before_revision) = before.rsplit_once(':').unwrap();
+    let (after_prefix, after_revision) = after.rsplit_once(':').unwrap();
+    assert_eq!(before_prefix, after_prefix);
+    assert_ne!(before_revision, after_revision);
 }
 
 fn saved(store: &Store, blocks: Value) -> (i64, String) {
@@ -1494,6 +1637,100 @@ fn a_steer_with_an_earlier_turns_start_still_joins_the_running_turn() {
     .unwrap();
     assert_eq!(turns[&5].joined_turn, Some(3));
     assert_eq!(turns[&5].started_at, None);
+}
+
+use crate::store::native_chunks::tests::{native_rows, native_snapshot, seed_native_session};
+
+#[test]
+fn failed_receipt_transaction_keeps_queue() {
+    let mut store = Store::open_monocode(Path::new(":memory:")).unwrap();
+    let blocks = vec![
+        json!({"id":"first-prompt","role":"user","text":"First","sentAt":1}),
+        json!({"id":"first-reply","role":"assistant","text":"Done","sentAt":2}),
+    ];
+    let id = "receipt-atomic";
+    seed_native_session(&store.conn, id, &blocks);
+    let handle = store.resolve_session_id(id).unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE sessions SET queued_messages_json=?2 WHERE id=?1",
+            params![id, r#"[{"id":"queued-1","text":"Next","intent":"chat"}]"#],
+        )
+        .unwrap();
+    let rows = vec![
+        Row {
+            role: "user".into(),
+            text: "Next".into(),
+            first: true,
+            sent_at: Some(3),
+        },
+        Row {
+            role: "assistant".into(),
+            text: String::new(),
+            first: true,
+            sent_at: None,
+        },
+    ];
+    // The commit fails: the queue, the message rows and the receipt must all
+    // stay absent together.
+    store.fail_next_save_commit_for_test().unwrap();
+    let error = store
+        .write_rows_with_message(handle, 2, &rows, Some("queued-1"))
+        .unwrap_err();
+    assert!(!error.is_empty());
+    let queue: String = store
+        .conn
+        .query_row(
+            "SELECT queued_messages_json FROM sessions WHERE id=?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        queue.contains("queued-1"),
+        "the queue must keep the message"
+    );
+    assert_eq!(native_snapshot(&store.conn, id).len(), 2);
+    assert_eq!(native_rows(&store.conn, id).len(), 2);
+    let receipts: i64 = store
+        .conn
+        .query_row(
+            "SELECT count(*) FROM native_blocks WHERE session_id=?1 AND skeleton_json LIKE '%appRequestId%'",
+            params![id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(receipts, 0, "the receipt must not survive a failed commit");
+    // The retry lands the queue dequeue, the message rows and the receipt together.
+    store
+        .write_rows_with_message(handle, 2, &rows, Some("queued-1"))
+        .unwrap();
+    let queue: String = store
+        .conn
+        .query_row(
+            "SELECT queued_messages_json FROM sessions WHERE id=?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(queue, "[]");
+    let snapshot = native_snapshot(&store.conn, id);
+    assert_eq!(snapshot.len(), 4);
+    assert_eq!(snapshot[0].4, 1);
+    let receipts: i64 = store
+        .conn
+        .query_row(
+            "SELECT count(*) FROM native_blocks WHERE session_id=?1 AND skeleton_json LIKE '%appRequestId%'",
+            params![id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(receipts, 1);
+    let stored = native_rows(&store.conn, id);
+    assert_eq!(stored.len(), 4);
+    assert_eq!(stored[2].text, "Next");
+    assert_eq!(stored[2].role, "user");
 }
 
 mod transcript_index {

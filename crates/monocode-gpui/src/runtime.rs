@@ -1,7 +1,7 @@
 use monocode_core::agent::{Approval, Control, Settings};
 use monocode_core::{
     provider::{self, Event, Kind, Request},
-    store::{Session, Store},
+    store::{SaveReason, Session, Store},
     transcript::{Row, Transcript},
 };
 use std::sync::{
@@ -183,7 +183,8 @@ fn run_turn_using(
     let shared = locked(&store)
         .map(|s| s.uses_monocode_schema())
         .unwrap_or(false);
-    let mut pending = PendingSave::new(shared, std::time::Instant::now());
+    let save_clock = std::time::Instant::now();
+    let mut pending = PendingSave::new(shared, save_clock);
     pending.own_context(&summary.provider, &source_account);
     let mut initial_delivery = None;
     let mut accepted_messages = Vec::new();
@@ -253,11 +254,14 @@ fn run_turn_using(
         // Keep the already painted prompt in the failure replay even if saving
         // the turn's configuration fails before its first transcript write.
         locked(&store)?.configure_agent(summary.id, &summary.provider, &persisted)?;
-        locked(&store)?.write_rows_with_message(
+        pending.accept(
+            &store,
             summary.id,
             start,
-            &transcript.rows[start..],
+            &transcript,
             settings.mono_message_id.as_deref(),
+            // Preserve the original first routine-save deadline.
+            save_clock,
         )?;
         let mut info =
             settings
@@ -706,6 +710,14 @@ fn run_turn_using(
             settings,
         };
         let mut tool_rows = std::collections::HashMap::new();
+        // A chunked session's stored block extents, read once before the turn:
+        // a tool row updates in place, and recording the block that holds it
+        // keeps the save to that block instead of a suffix of the window. A
+        // row past the extents (or a blob session) keeps the suffix path.
+        let block_extents = {
+            let store = locked(&store)?;
+            store.block_extents(summary.id).unwrap_or_default()
+        };
         // The running-work list attributes the provider and its tools to this session.
         let result = monocode_core::process::owned_by(summary.id, || {
             provider::run_with_controls(request, cancel.clone(), Some(controls), |events| {
@@ -783,7 +795,7 @@ fn run_turn_using(
                                 summary.id,
                                 at,
                                 &transcript,
-                                &message.id,
+                                Some(&message.id),
                                 std::time::Instant::now(),
                             )?;
                             if let Some((root_turn, root)) = &turn_receipt {
@@ -848,7 +860,13 @@ fn run_turn_using(
                             transcript.rows[ix].text =
                                 serde_json::to_string(&tool).map_err(|e| e.to_string())?;
                             start = start.min(ix);
-                            pending.changed(ix);
+                            if let Some(block) = block_extents.iter().find(|block| {
+                                (ix as i64) >= block.first_row && (ix as i64) <= block.last_row
+                            }) {
+                                pending.dirty_block(block.clone());
+                            } else {
+                                pending.changed(ix);
+                            }
                             contributions::record(&store, summary.id, &summary.cwd, &tool);
                         }
                         Event::SessionId(id) => {
@@ -975,40 +993,73 @@ fn run_turn_using(
                 }
                 let now = std::time::Instant::now();
                 let publication_result = (|| {
-                    if pending.due(boundary, now) {
-                        pending.flush(&store, summary.id, &transcript, &context, now)?;
+                    let update = || {
+                        publish(
+                            &tx,
+                            &cancel,
+                            Update {
+                                worktree_cwd: None,
+                                commands,
+                                provider_turn_id,
+                                turn_ready,
+                                follow_up_delivered,
+                                follow_up_errors,
+                                delivered: None,
+                                start,
+                                rows: transcript.rows[start..].to_vec(),
+                                provider_id: changed_id,
+                                model,
+                                config_model,
+                                config_settings,
+                                title: None,
+                                context: context_changed.then_some(context),
+                                metrics,
+                                usage_limit: None,
+                                background,
+                                approvals,
+                                approvals_resolved,
+                                questions,
+                                questions_resolved,
+                                handoff,
+                                status,
+                                finished: false,
+                            },
+                        )
+                    };
+                    if publications.is_empty() {
+                        // Ordinary streaming text reaches the display before
+                        // its save competes for the Store lock; receipts,
+                        // visual saved replies and finish states still
+                        // confirm only after the commit succeeds.
+                        persistence::publish_then_flush(
+                            &mut pending,
+                            &store,
+                            summary.id,
+                            &transcript,
+                            &context,
+                            boundary,
+                            update,
+                        )
+                    } else {
+                        // A visual's saved reply confirms only after both
+                        // durable storage and the live transcript update have
+                        // accepted it, so its flush still comes first.
+                        if pending.due(boundary, now) {
+                            pending.flush(
+                                &store,
+                                summary.id,
+                                &transcript,
+                                &context,
+                                if boundary {
+                                    SaveReason::Boundary
+                                } else {
+                                    SaveReason::Routine
+                                },
+                                now,
+                            )?;
+                        }
+                        update()
                     }
-                    publish(
-                        &tx,
-                        &cancel,
-                        Update {
-                            worktree_cwd: None,
-                            commands,
-                            provider_turn_id,
-                            turn_ready,
-                            follow_up_delivered,
-                            follow_up_errors,
-                            delivered: None,
-                            start,
-                            rows: transcript.rows[start..].to_vec(),
-                            provider_id: changed_id,
-                            model,
-                            config_model,
-                            config_settings,
-                            title: None,
-                            context: context_changed.then_some(context),
-                            metrics,
-                            usage_limit: None,
-                            background,
-                            approvals,
-                            approvals_resolved,
-                            questions,
-                            questions_resolved,
-                            handoff,
-                            status,
-                            finished: false,
-                        },
-                    )
                 })();
                 // A tool succeeds only after both durable storage and the live
                 // transcript update have accepted the visual.
@@ -1133,6 +1184,7 @@ fn run_turn_using(
             summary.id,
             &transcript,
             &context,
+            SaveReason::Final,
             std::time::Instant::now(),
         ) {
             Ok(()) => error,
@@ -1149,6 +1201,7 @@ fn run_turn_using(
                 summary.id,
                 &transcript,
                 &context,
+                SaveReason::Final,
                 std::time::Instant::now(),
             )
             .map(|_| "Ready".into())

@@ -5,7 +5,7 @@
 //! images (or a call fails) the items are suggested from their file names instead.
 //! The caller always lets the user review the suggestion; nothing here writes metadata.
 
-use super::{self as emoji, Format};
+use crate::mono::emoji::{self, Format};
 use crate::provider;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

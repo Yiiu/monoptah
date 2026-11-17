@@ -1,0 +1,382 @@
+# Native persistence profiling
+
+The core probe measures synthetic transcript saves into a new temporary blob-schema database. It requires `--scenario ID`, optionally accepts `--backend native-chunks` and `--supplemental-saves N`, never accepts a database path, and never calls a provider. Use no production sessions, credentials or app data. Its stdout is one `schema_version: 3` JSON object; exit 0 means complete, exit 2 means incomplete or skipped. Process-write counters are implemented only on macOS: Windows runs retain null counters and exit 2 with `process_io_unavailable` even when every functional integrity check passes.
+
+## Not yet migrated: synchronous UI Store calls
+
+Task 3's first batch moves only the Inbox's `ViewState` save onto the fixed-key background saver (`ui_store_saves.rs`, key `native-inbox-state`). Everything below still takes the Store on its original thread and is deliberately out of scope for the setting saver: these calls need transactional business receipts, result-dependent UI updates, or dedicated lifecycle designs of their own. Line numbers are from the controller's read-only audit at baseline d2675a25 and may move.
+
+| Location | Context and result dependency | Batch scope |
+| --- | --- | --- |
+| notes.rs:296 | persist runs from UI debounce/flush, upsert result updates note and clears dirty; selecting a note waits for successful flush | Still synchronous; needs dedicated result/dirty/lifecycle design, not a setting saver |
+| notes.rs:386,407 | create/delete update current selection and note list synchronously | Still synchronous; result-dependent operations, delete requires own safety review |
+| notes.rs:570,826 | UI callback upsert / note lookup | Still outside current Inbox scope |
+| conversation.rs:2515 | provider change + optional provider_id restoration happen before applying model pick; failure stops UI state change | Still synchronous; transaction/result semantics differ from latest-value settings |
+| conversation/mono.rs:341 | mono_patch_card writes row before publishing transcript patch | Still synchronous; persistence acknowledgement must follow successful save |
+| conversation/mono.rs:465 | mono_post writes report rows before emitting SessionChanged | Still synchronous; do not move to fixed-key setting saver |
+| shell.rs:1066 | new_with_metadata obtains data_dir during UI construction | Still synchronous startup/view construction |
+| shell.rs:1608 | Telegram setup data-dir lookup through Store | Still synchronous; outside Inbox scope |
+| shell.rs:4673 | save_state already uses background executor and checks generation after acquiring Store | Already off UI for this operation, not a remaining synchronous save |
+| shell.rs:1134 | application quit workspace-save hook uses background executor | Already off UI, separate best-effort lifecycle |
+| shell.rs:2056,2105–2112,4174,5222,6676 | surrounding async/background operations | Do not classify a lock hit alone as UI blocking |
+
+Other conversation constructor/history and Mono/cloud/remote paths were not fully audited by that pass. Do not claim all UI locking is fixed. The Inbox constructor still loads state and `data_dir` synchronously (inbox.rs `new_inner`), and the Inbox refresh still loads sessions on the background executor and may wait for the Store even after the UI save fix. Task 4's coverage list starts from this table.
+
+This batch retains the transcript blob format. The write-reduction target of 95% belongs to the second batch and is pending acceptance. The first batch may improve UI lock behavior, but the core probe has no UI or GPUI lock measurements. Historical **549.76 GB** diagnostic data is not this Before baseline and must not appear as a measured Before value.
+
+## Freeze Before before Task 3
+
+The controller owns measurement and validation. Finish measurement-tool formatting, lint and related tests first. Then freeze Before using the instrumented old save path, **strictly before Task 3 Inbox edits**. Task 2 supplies the comparator and these instructions; it has not collected or finalized measurements.
+
+Use the native workspace's `native-dev` profile and its `Cargo.lock`. Build identity is embedded at compilation: record `build.source_sha`, `diff_sha256`, `source_tree_sha256`, `toolchain`, `cargo_lock_sha256` and `profile` from each raw result. The diff hash is the producer's length-delimited source/diff identity, not simply a hash of textual `git diff`. Later working-tree changes do not change an existing binary's identity. Record the exact binary/invocation used; do not label a stale build as the current source.
+
+Run each scenario with the same fixture and declared workload on both sides. Each process has a **536870912 byte (512 MiB)** absolute process-write budget and a **120000 ms** wall limit. One save, checkpoint or close may overshoot; retain that result and mark it incomplete. The producer gates saves inside the shared Store mutex. Do not increase budgets, weaken SQLite durability or remove/coalesce events to make a run finish. Do not repeat the old large scenarios for statistical sampling. An incomplete large Before remains incomplete, with no improvement claim.
+
+The eight IDs are `append-1m`, `append-10m`, `append-40m`, `same-value`, `early-tool`, `large-tool`, `long-answer` and `parallel`. Most have four hot saves per session at 0/650/1300/1950 ms and a final save at 2600 ms. `early-tool` has one hot event and one final event; `parallel` has four sessions in tick/session manifest order. Actual starts/completions can be late or reordered in parallel; preserve all declared events and raw timing.
+
+If the measurement tool fails, repair only that tool, retain the failed raw attempt and its cost, and re-establish the affected baseline before business edits. If tools, fixture, workload, configuration, lock or toolchain change, establish a new matching Before/After pair. Do not overwrite an earlier attempt. A representation change needs an explicit schema-contract revision: version 1 compares content fingerprints within the unchanged blob schema.
+
+## Raw artifact convention
+
+Keep this batch under the following directory (local experiment artifacts, not source fixtures). `<batch>` identifies one frozen measurement setup; `<run-id>` is a unique attempt identifier such as a UTC timestamp.
+
+```text
+.superpowers/sdd/2026-11-16-native-persistence-safety/results/<batch>/
+  runs/<scenario>/before-<run-id>/probe.json
+  runs/<scenario>/before-<run-id>/manifest.json
+  runs/<scenario>/before-<run-id>/invocation.json
+  runs/<scenario>/before-<run-id>/stderr.log
+  runs/<scenario>/after-<run-id>/...             # same files
+  comparisons/<scenario>-<before-id>-<after-id>.json
+  experiment-cost.json
+```
+
+`probe.json` is untouched stdout, including failed/skipped/partial attempts. Copy its exact `manifest` into `manifest.json` (keep `null` if setup failed). `invocation.json` records the binary path, scenario/arguments, start/end time, exit status and the raw file path; the complete build identity stays in `probe.json`. Keep stderr separate from JSON; review it for secrets before sharing. Never put credentials or production content in these artifacts. If a process dies without valid JSON, retain its raw output and record the missing final process counter as unknown.
+
+`experiment-cost.json` is the controller's ledger for **every** attempt on both sides, including discarded runs, tool failures, skips and budget overshoots. Record each raw path and `process_lifetime_written_bytes`, then sum the known final absolute counters. If any counter is null/unavailable, report the known subtotal and unknown-run count; the full experiment cost remains unknown. Do not replace unknown counters with zero or hide setup/failed work by restarting a process. A comparator report's pair cost covers only its two inputs and explicitly excludes other attempts.
+
+Once both raw files exist, create the comparison directory and run, substituting the retained paths:
+
+```sh
+node scripts/compare-native-persistence.mjs \
+  --before <before-run-directory>/probe.json \
+  --after <after-run-directory>/probe.json \
+  --out <batch-directory>/comparisons/<scenario>-<before-id>-<after-id>.json
+```
+
+Read the command's exit status directly. Exit **0** means complete and comparable, independent of whether the 95% target is met. Exit **1** means invalid input, incomplete measurements or inconsistent data/configuration. For parsed runs the output includes rejection reasons; missing/unreadable JSON, bad CLI arguments and output-write failures produce a short error. Raw inputs cannot be used as the output, including symlink/hard-link aliases. Parent output directories must already exist.
+
+## Reading a comparison
+
+`compareRuns(before, after)` returns `{ comparable, reasons, cases }`. One invocation compares one scenario and returns one case. The case retains both complete raw schema-shaped inputs, including build identities, configuration, completion evidence, checkpoint and integrity fingerprints. An input with an invalid schema shape is represented as null in that raw slot, with explicit field-path reasons. The original raw file remains the evidence.
+
+**Schema version 3.** The current probe and comparator require `schema_version: 3`; `compareRuns` accepts v3↔v3 only and rejects v1/v2 on either side with an explicit `schema_version` field-path reason. Historical batch-1 v1 and batch-2 v2 artifacts remain evidence for their recorded binaries. Establish a matching v3 baseline with an instrumented pre-layout producer; never backfill missing skeleton counters or mix schemas. Fixture/workload manifests and content fingerprints are unchanged. The current measurement contract includes:
+
+| Field | Meaning |
+| --- | --- |
+| `backend` | Run-level `{kind: "blob"\|"native_chunks", mode_version: u32\|null}`. The default backend is `blob` with null mode version; `--backend native-chunks` opts the synthetic fixture into native mode 1. Two runs of the same kind must agree on `mode_version`; blob↔native is also supported. |
+| `samples[*].values.blocks_written` | `u64\|null`, populated on both backends. On the blob backend it is the session's whole block count: that backend re-encodes and rewrites the entire `blocks_json` array on every save, including same-value and final saves. The probe cross-checks it against the after-save fingerprint block count; the comparator checks it against `manifest.initial_blocks_per_session` (no declared workload operation adds or removes a block). |
+| `samples[*].values.chunks_written`, `chunk_bytes_written`, `skeleton_bytes_written` | Native-only committed counters. `chunk_bytes_written` keeps its original row-chunk/payload-segment meaning. `skeleton_bytes_written` counts JSON submitted to actual block upserts, including an unchanged skeleton resubmitted with changed rows. Native counters must be nonnegative integers with null missing reasons; blob counters must be null with `backend:blob`. The comparator rejects contradictions. Failed samples clear committed counters while retaining attempted read/encoding work. |
+| `stages.conversion` | A seventh stage with the ordinary stage shape, after `setup`. Until a workload actually converts a session it stays unattempted with every field null; once attempted it must satisfy the usual completed/timed/counter rules. Its metric paths report `missing_reason: "conversion_not_attempted_by_workload"` for a side that did not convert, so conversion costs stay separate from hot-save improvements. |
+| `summary.totals`/`max` counters | `blocks_written`, `chunks_written`, `chunk_bytes_written`, `skeleton_bytes_written`, re-derived from samples like every other total. A native counter of zero is an observed no-write result; unavailable blob-only aggregates stay null with `backend:blob`. |
+
+Schema v3 changes measurement fields only. Native transcript JSON bytes are `skeleton_bytes_written + chunk_bytes_written`; this sum excludes scalar metadata, IDs, indexes, deletes and SQLite page/WAL/filesystem amplification. Content fingerprints and cross-run fingerprint equality rules remain unchanged. Logical counters cannot establish process-I/O acceptance when OS counters are unavailable.
+
+`cases[0].metrics` uses raw JSON paths, for example `whole_run_process_written_bytes`, `stages.hot.process_written_bytes`, `summary.totals.serialized_bytes`, `summary.max.save_ns` and `samples.0.values.encoding_ns`. Each metric records `before`, `after`, `absolute_difference` (**After − Before**) and `improvement_rate` (**(Before − After) / Before**). Thus 0.9 means a 90% reduction, and a negative value means a regression. Absolute differences remain available when both raw numbers are known, even for incomparable runs; all improvement rates are null unless the entire pair passes validation. A zero Before denominator also gives null. Missing fields/counters give explicit reasons and never become zero.
+
+The comparator requires complete build identity, equal scenario/full manifest (including ordered events and all save parameters), `native-dev`, equal toolchain, native lock hash and all SQLite configuration fields including version/compile-options hash. Source SHA, diff hash and source-tree hash may differ and remain recorded. It requires all stages completed/timed, all process counters known and consistent, no exhausted budget or overshoot, and a final non-BUSY `TRUNCATE` checkpoint with matching log/checkpointed frame counts.
+
+Every declared event must have a successful sample in manifest order with matching event/session/logical time/reason, and `completed_event_indexes` must equal the full manifest event indexes. Sample counts/order must match across runs. Unequal counts never produce paired duration improvements, even if one side supplies a summary or p95. Summary totals/maxima are checked against individual measurements rather than trusted as proof of completion.
+
+All integrity flags must be true. The comparator checks the initial fixture and row/block counts, expected saved rows, retained history/unknown metadata/receipts/queue hashes, restart equality and cross-run fingerprints. A true boolean cannot override disagreeing fingerprints. Version 1 always reports p95, UI response and core lock wait/held timing as null with their missing reasons. Do not invent a p95 for these small fixed workloads; at least 100 explicitly labeled supplemental small samples would require a separate measurement contract and matched counts.
+
+`performance.process_write_target_met` is true/false only for a valid known whole-run process-write reduction with a nonzero Before denominator; otherwise it is null. `performance.enforced` is false: target failure does not turn a complete comparable pair into exit 1. This does not establish UI responsiveness or certify the second batch's write-reduction acceptance.
+
+Keep these quantities separate:
+
+| Quantity | Meaning and limits |
+| --- | --- |
+| `whole_run_process_written_bytes` | Difference in OS process write counters from main entry through cleanup; includes fixture, setup, verification and temporary-directory cleanup. On macOS the source is `proc_pid_rusage(RUSAGE_INFO_V2).ri_diskio_byteswritten`. It is not physical NAND wear. |
+| `process_lifetime_written_bytes` | Final absolute OS counter, used for experiment cost; includes process work before the first baseline read. Never substitute a stage delta for it. |
+| `serialized_bytes` | Attempted transcript/block/acceptance-queue JSON encoding work, including unchanged or rolled-back content. The dirty block is encoded before layout/change detection; this is neither committed JSON bytes nor filesystem traffic. Transient display/ToolCall/revision encodings remain outside this counter. |
+| `skeleton_bytes_written + chunk_bytes_written` | Committed native transcript JSON parameters, excluding scalar/index/delete/page/WAL/filesystem costs. Same-value and failed saves expose zero committed-write bytes. |
+| `history_bytes_read` | Existing raw transcript buffer reads; no extra reads are introduced by measuring them. |
+| `changed_rows` / `commit_count` | Semantic supplied-row changes / actual save commits. A same-value save can have zero changes; inspect raw evidence. |
+| `database_bytes` / `wal_bytes` | Per-stage file-size snapshots, not cumulative written bytes. |
+| `wal_peak_bytes` | Sampled lower-bound WAL size peak, observed every 2 ms and at operation boundaries. A final empty WAL does not imply no WAL traffic. |
+| `save_ns` / encoding/projection/commit timings | Per-save, total and maximum duration measurements. Stage elapsed times include their declared work and waits; stage I/O does not have to sum to whole-run I/O. |
+
+## Measurement status
+
+Batch-1 (2026-11-16) Before/After are finalized by the controller from the retained raw and
+comparison evidence. The table's Before/After columns are `stages.hot.process_written_bytes`
+(bytes of OS process writes during the hot save stage); 绝对差值 is After − Before; 改善率 is
+(Before − After) / Before from the comparator. Raw evidence lives under the gitignored
+`.superpowers/sdd/2026-11-16-native-persistence-safety/results/batch-1/` — this table is the
+durable in-repo record of the frozen baseline.
+
+| 场景 | Before | After | 绝对差值 | 改善率 | 样本数（Before / After） | 完整性 | 完成状态 |
+| --- | ---: | ---: | ---: | ---: | --- | --- | --- |
+| append-1m | 6,475,776 | 6,471,680 | −4,096 | 0.000633 | 5 / 5 | 全真 | complete |
+| append-10m | 84,746,240 | 84,705,280 | −40,960 | 0.000483 | 5 / 5 | 全真 | complete |
+| append-40m | 338,051,072 | 337,985,536 | −65,536 | 0.000194 | 5 / 5 | 全真 | complete |
+| same-value | 90,112 | 81,920 | −8,192 | 0.0909 | 5 / 5 | 全真 | complete |
+| early-tool | 1,081,344 | 1,081,344 | 0 | 0.0 | 2 / 2 | 全真 | complete |
+| large-tool | 135,438,336 | 135,417,856 | −20,480 | 0.000151 | 5 / 5 | 全真 | complete |
+| long-answer | 50,954,240 | 50,937,856 | −16,384 | 0.000322 | 5 / 5 | 全真 | complete |
+| parallel | 34,566,144 | 34,566,144 | 0 | 0.0 | 20 / 20 | 全真 | complete |
+
+All eight pairs: comparator `comparable: true`, exit 0, one attempt per scenario per side, no
+budget exhaustion, final TRUNCATE checkpoint non-BUSY with matching frame counts. Whole-run
+process writes for context: Before 803,069,952 B total, After 802,811,904 B total across the
+eight runs each side (per-scenario values in the retained comparisons).
+
+Before identity: source_sha `d2675a25c536434e225762fa0482c13b439ac962`, diff_sha256
+`43550cb3c6b5142312a7b189183017ed9b9a9628b33ff3ce2d8687c8af7ea7c2`, source_tree_sha256
+`d3168a384e32abc631dc1f23d7054824c9ab4ff574e9aa9ebd84e690cb1545d7`. After identity:
+source_sha `d2675a25c536434e225762fa0482c13b439ac962` (same commit), diff_sha256
+`74f7e06d5c60980ebe906d7732c6d7acf71fa07a6b5b29feba852a29c2ef660a`, source_tree_sha256
+`29065ee84687879e1d79f0a30a76b510f5d87cc9310ce2a36117b7159bcc3a77`. Both sides: complete,
+toolchain rustc 1.98.1, cargo_lock_sha256
+`f9d33039c8563280ad2b21b332267336d717b29389ba571c5aed351751e504bb`, profile native-dev;
+source/diff/tree hashes differ as the comparator permits. Each run's `invocation.json` pins
+its probe binary SHA256.
+
+Pair write costs (comparator `pair_process_lifetime_written_bytes`, summing both sides' final
+absolute counters): 1,605,881,856 B across the eight pairs. Total experiment cost including
+all attempts: 1,605,881,856 B over 16 attempts (8 Before + 8 After, one attempt each), zero
+unknown counters, zero discarded runs (`experiment-cost.json`). UI lock/response measurement:
+待测 (the core probe's UI/p95 fields are null by contract; the fifteen GPUI
+persistence-safety tests prove liveness behaviorally, not as a UI timing measurement).
+Second-batch 95% write-reduction acceptance: 未达成且不属于本批验收 — batch 1 deliberately
+leaves the transcript blob write path unchanged, so hot writes match Before within noise
+(0–0.09%); the 95% target belongs to batch 2.
+
+Post-review note: after After collection, the whole-request review's fix round touched the
+build script's rerun-if-changed scope, one Inbox save-refusal message, one code comment, and
+one log-target constant — none of them alter the probed save path, the fixture, workload,
+configuration, lock or toolchain, so the retained pair remains valid evidence; each run's
+recorded identity names the exact binary it measured. Before building the probe for a future
+measurement, run `touch crates/monocode-core/build.rs` so the embedded identity reflects the
+current tree.
+
+To check changes to the comparator, run `node --test scripts/compare-native-persistence.test.mjs`. The tests use synthetic JSON and temporary files only; they run no Rust builds or persistence workload.
+
+## Batch-2 measurement (2026-11-17, native ordinary-session incremental storage)
+
+Re-pairing per the protocol (测量工具或配置改变时重新建立配对基线): the probe changed after the
+Task-2 freeze (Task 5 `--backend` flag, Task 6 opt-in/fingerprint reads, Task 8a supplemental
+mode), so Before was re-frozen with the **final** binary on the unchanged blob save path and
+After uses the **same binary** with `--backend native-chunks` — both sides share one build
+identity and differ only in the invocation-level backend flag. The Task-2 freeze runs remain
+retained history. Raw evidence: `.superpowers/sdd/2026-11-16-native-transcript-incremental-storage/results/batch-2/runs/`
+(gitignored); `compare-task8.json` per scenario.
+
+| 场景 | Before (blob) | After (native) | 绝对差值 | 改善率 | 样本数 | 完整性 | 完成状态 |
+| --- | ---: | ---: | ---: | ---: | --- | --- | --- |
+| append-1m | 6,471,680 | 143,360 | −6,328,320 | 0.9779 | 5 / 5 | 全真 | complete |
+| append-10m | 84,705,280 | 180,224 | −84,525,056 | 0.9979 | 5 / 5 | 全真 | complete |
+| append-40m | 337,985,536 | 196,608 | −337,788,928 | 0.9994 | 5 / 5 | 全真 | complete |
+| same-value | 81,920 | 65,536 | −16,384 | 0.2000 | 5 / 5 | 全真 | complete |
+| early-tool | 1,081,344 | 24,576 | −1,056,768 | 0.9773 | 2 / 2 | 全真 | complete |
+| large-tool | 135,417,856 | 86,310,912 | −49,106,944 | 0.3626 | 5 / 5 | 全真 | complete |
+| long-answer | 50,937,856 | 344,064 | −50,593,792 | 0.9932 | 5 / 5 | 全真 | complete |
+| parallel | 34,545,664 | 868,352 | −33,677,312 | 0.9749 | 20 / 20 | 全真 | complete |
+
+Acceptance lines (spec 验收门槛):
+
+- **既有历史 95% (L124)**: append-40m hot 337,985,536 → 196,608 B = **99.94% 降低** — 达标.
+  One attempt per side, no budget exhaustion, all integrity flags true, comparator
+  `comparable: true` on all eight pairs.
+- **增长关系 (L125)**: per-save logical writes do not grow with completed history — chunk
+  bytes `[1,091 / 2,115 / 3,184 / 4,208 / 0]`, history reads `[196 … 8,433]` B and process
+  writes 16–49 KB per save are **identical across the 1 MiB, 10 MiB and 40 MiB** After runs.
+- **大消息 (L126)**: the recorded chunk/payload-segment counters are bounded —
+  large-tool saves write 2 chunks / ≤8,547 B per save (final same-value save 0 B),
+  long-answer 1 chunk / 38,742–41,859 B. **This does not establish bounded total
+  transcript writes**: the counter excludes `native_blocks.skeleton_json` writes.
+  large-tool's measured process-level hot writes remain 86,310,912 B (36.26%
+  reduction), with ~21 MB read per save and ≈220 ms wall time (≈128 ms projection).
+  The follow-up source audit below identifies a large, repeatedly rewritten
+  skeleton. Large-message acceptance remains **未达标**; the exact page/WAL
+  contribution to the process counter still requires measurement.
+- **性能 (L127)**: supplemental controlled run (append-1m shape, 120 labeled small saves,
+  native backend): **p95 = 4.95 ms, max = 10.80 ms** (nearest-rank over per-save wall
+  nanoseconds; final save excluded). CI has no timing assertions.
+- **无变化 (L123)**: same-value final save writes 0 chunk bytes; the scenario's nonzero hot
+  totals (81,920 / 65,536 B) are commit/page overhead present on both sides, After lower.
+- **一次性转换成本 (L124, 单列)**: not mixed into hot — probe After setup stage reported
+  separately per run (e.g. large-tool setup 40,906,752 B); Task 7's direct measurement: an
+  82,495 B blob converts writing 164,304 B chunks+payloads ≈ 1.99× for giant members (~1×
+  without), plus one full-database consistency backup file per converted session.
+
+Whole-run process writes for context (includes one-time setup on both sides): Before
+803,348,480 B, After 438,366,208 B across the eight runs each side (45.43% lower); the
+acceptance metric is the hot-stage table above.
+
+Identity — single binary, both sides: source_sha `d2675a25c536434e225762fa0482c13b439ac962`,
+diff_sha256 `379fc5f64debdc567a1b8f5f3c92a9f5a17d6b945e3b6a260c260875adc709e7`,
+source_tree_sha256 `7163c17d629c5728ebe475cde612dab877219171de68a20f2fcac63ecf087c03`,
+toolchain rustc 1.98.1, cargo_lock_sha256
+`f9d33039c8563280ad2b21b332267336d717b29389ba571c5aed351751e504bb`, profile native-dev;
+each run's `invocation.json` pins the probe binary SHA256 (rebuilt after
+`touch crates/monocode-core/build.rs`).
+
+Pair write costs (`pair_process_lifetime_written_bytes`): 1,241,714,688 B across the eight
+Task-8 pairs. Batch-2 experiment cost ledger (all attempts, including the Task-2 freeze, the
+three Task-6 devchecks, the Task-8 sweep and the supplemental run): 31 attempts, 28 with
+known counters summing 2,225,180,672 B, 3 unknown counters (two unretained Task-1 tool
+verifications and one controller identity smoke — `null`, never zero) → `total_bytes: null`
+(`results/batch-2/experiment-cost.json`).
+
+## Persistence safety follow-up (2026-11-17)
+
+The review fix batch is tracked in
+`docs/superpowers/plans/2026-11-17-native-persistence-review-fixes.md`.
+It adds per-handle storage-mode guards, read-side rejection of newer formats,
+transactional public block replacement with retryable rollback, and receipt scans
+that skip drafts already deleted in the same transaction. Both row loads and public
+raw-block reads acquire matching content/revision guards from one read snapshot.
+Sparse saves and downgrade exports roll back failed commits, including SQLite BUSY,
+before retrying. Conversion checks the caller's prior blob snapshot under its write
+lock; downgrade rechecks the mode and revision there and retains a guard for exactly
+the exported blob. Draft removal also updates the tail used to assign append IDs.
+
+Each conversion starts a fresh 62-bit random revision range rather than resetting
+a reused native session to zero, and returns its committed revision to the caller.
+This removes deterministic revision reuse after downgrade/reconversion and lets the
+converting handle save immediately without a reload. Random starting points still
+have a nonzero collision probability (2^-62 per pair); no generation table or schema
+change was introduced.
+
+Backups retain one latest verified recovery point per session at
+`<database>.pre-native-<session-handle>.backup`. A new attempt copies into a separate
+temporary file, checks the committed blob and SQLite integrity, and closes and syncs
+the standalone copy before taking the source write lock. Inside `BEGIN IMMEDIATE`,
+the conversion rechecks mode, ownership, the source blob, SQLite `data_version` and
+any previously loaded history guard before atomically publishing the prepared file.
+A late attempt cannot replace a newer successful conversion's recovery point. Failed
+copying, verification or source revalidation preserves the previous backup.
+Successful replacement does not keep older snapshots as a historical archive; no
+automatic cleanup of another session's backup is performed.
+
+These correctness changes have not been remeasured with the macOS process-I/O
+protocol. The tables above describe their recorded binaries. Live Native Dev
+verification and the large-tool process-I/O investigation remain pending; the
+original ignored review artifacts are absent from this checkout, so completion of
+all twelve historical findings cannot be inferred from this fix batch.
+
+### Large-tool source diagnosis
+
+A read-only audit traced the 5 MiB synthetic tool input through
+`store/shared/blocks.rs::update`: non-JSON input is treated as `command`, then copied
+into both `tool.title` and the block's `text`. The chunk layout only strips selected
+tool members and text that can be reconstructed from plain text rows; these two
+large fields remain in `native_blocks.skeleton_json`. For this fixture they add
+roughly 10 MiB to that row, beyond the row chunks and stripped input payload.
+
+`native_chunks/writer.rs::write_block` upserts the entire skeleton on each changed
+save, while `chunk_bytes_written` counts only chunk and payload-segment writes.
+This identifies real SQL write amplification and a measurement coverage gap;
+it does not measure the filesystem/WAL multiplier. The next performance fix must
+bound skeleton storage while preserving the original metadata and count its bytes
+alongside chunk writes. Repeated reads/encoding of the entire active tool block
+also remain. No new process-I/O benchmark was run for this diagnosis.
+
+### Windows functional verification (2026-11-17)
+
+The repeated check passed 457 store tests and 19 probe tests, core clippy and
+formatting. Actual probe startup also found that `build.rs` expanded 1,142 paths
+into a 52,952-character `git diff` command, exceeding Windows' command-line limit.
+It now uses the fixed scope paths for that diff and still hashes each source file.
+The patch hash conservatively includes tracked metadata changes within the scope;
+future performance pairs must use the repaired producer on both sides.
+
+After rebuilding, five native scenarios (`append-1m`, `same-value`, `early-tool`,
+`large-tool`, `parallel`) and one blob append-1m control completed 42 saves in new
+synthetic databases. All content/metadata/receipt/queue and close/reopen integrity
+flags were true, SQLite integrity checks passed, and the control's manifest and
+saved/reopened fingerprints matched the native append-1m run. The executable's
+embedded source identity matched the current checkout.
+
+Each raw report remains incomplete with exit 2 solely for
+`process_io_unavailable`, retaining null counters. These are functional checks,
+not process-write reduction or UI acceptance. Initial failed attempts were also
+retained; artifact paths, hashes and costs are recorded in the review-fix ledger.
+Native Dev GUI verification remains pending under the clean-checkout rule.
+
+### Large-tool layout follow-up (schema v3, Windows, 2026-11-17)
+
+The schema-v3 producer first retained an instrumented Before executable with the
+original member-selection policy. The layout fix then moved oversized string
+values, including tool text/title/preview and nested unknown metadata, into the
+existing segmented payload representation. Root block IDs stay inline. Plain text
+exactly recoverable from rows still uses its text sentinel. Mode version remains 1;
+the reader already substitutes payloads independently of their JSON location.
+Downgrade verifies either the exact new or exact original canonical form, retaining
+its projection/revision/transaction checks. Noncanonical but reconstructible forms
+are still refused in both cases.
+
+One `large-tool` attempt per side used the same 5 MiB tool fixture, four 1 KiB
+appends at the original 650 ms cadence and the final save. Full manifests, SQLite
+settings, toolchain, lock and initial/saved/reopened content fingerprints matched.
+Every integrity flag was true, all five events completed, and the final checkpoints
+were non-BUSY with matching frame counts.
+
+The following are **committed transcript JSON parameter bytes** (skeleton + row
+chunks + payload segments), not process or filesystem writes:
+
+| Event | Before | After |
+| --- | ---: | ---: |
+| First append; creates giant title/text | 10,490,694 | 10,490,730 |
+| Second append | 10,494,790 | 9,066 |
+| Third append | 10,498,886 | 13,162 |
+| Fourth append | 10,502,982 | 17,258 |
+| Final, unchanged | 0 | 0 |
+| All four hot appends | 41,987,352 | 10,530,216 |
+| Last three appends, shown separately | 31,496,658 | 39,486 |
+
+Hot logical JSON bytes fell **74.92%**, including first-generation captions. The
+last three incremental events fell **99.87%**; that subtotal is not a replacement
+for the complete hot workload. Each changed skeleton is now 515 B, versus
+10,488,291–10,494,435 B Before. The first full title/text copies remain real new data
+and account for most of the retained 10.53 MB. No event was dropped or moved into
+setup to improve the result.
+
+Encoding/read costs remain: `summary.totals.serialized_bytes` is 78,688,428 B on
+both sides, and recorded history reads are 94,417,254 / 94,417,398 B. This change
+bounds repeated giant-string writes; it does not eliminate full active-block
+projection, reconstruction or encoding. Arbitrarily huge keys, root IDs, many
+small metadata members and giant serialized `ToolCall.display` data do not have a
+new general bound. UI responsiveness and save-latency acceptance remain unmeasured.
+
+Both raw probes retain exit 2, status `incomplete`, null process counters and the
+sole incomplete reason `process_io_unavailable`. The strict process-I/O comparator
+also returned exit 1 / `comparable:false`; its reasons are retained. The separate
+controller report verifies logical/content comparability only. No OS-write reduction
+or 95% disk target is inferred. Two measurement attempts have unknown process costs;
+`experiment-cost-after.json` keeps `unknown_run_count:2` and `total_bytes:null`.
+
+Artifacts (including both immutable executable copies, raw stdout/stderr, manifests,
+invocations, summaries and cost ledgers):
+`C:/Users/a1103/AppData/Local/Temp/monoptah-large-tool-write-bound-20261117-bwd1v7v5w/`.
+`logical-comparison.json` records the logical pair; `process-io-comparison.json`
+records the strict rejection. Before/After source-tree SHA256 values are
+`b9ee10745eb94df1479d68a2762313216809bca4227bd7caaf2e72ecbbb252e3` /
+`e7619a4ca7ac009f11125f7d9475f1adaeb0e68b2de6fbc565e8586a237c346b`;
+executable SHA256 values are
+`0aff0c6c5224ef7f8eaff1eb903a798be4557a4e91bf1c220b2e973cb948ed6f` /
+`55158a7d70915f2294603643d2b03267df82090eae81152e463f0a241a334fd4`.
+Both use rustc 1.97.1, `native-dev`, HEAD
+`139f600013c2e9d9e2d7d2e4d56c76bd24595163` and native lock hash
+`1791c2611439bb501a26dd680e142312be0709d0edfb444437deb4745bbde677`.
+
+The runtime RED batch reproduced four giant-skeleton/bound failures (44/48 native
+checks passed). The final combined pass completed 466 store-related tests, 19 probe
+tests, 21 comparator tests, native formatting and core all-targets clippy. Tests
+cover nested Unicode/unknown strings, hidden drafts, root-ID preservation, source
+markers, old-layout save/reopen/export, noncanonical export refusal, bounded steady
+writes, no-change zero and committed-counter rollback. One independent code review
+completed the five implementation/safety checklist points with no blocking findings;
+it also read the retained logical comparison. macOS process-I/O pairing and
+clean-origin Native Dev GUI checks remain pending. All edits remain uncommitted.

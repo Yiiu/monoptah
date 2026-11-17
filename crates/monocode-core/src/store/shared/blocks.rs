@@ -1,5 +1,6 @@
 //! Lossless desktop block adaptation. Unknown fields and non-displayed blocks
 //! stay in the source document when native rows are appended or edited.
+use crate::store::native_chunks::{DirtyBlock, StoredBlockIndex};
 use crate::{
     tool::{tasks, ToolCall, ToolState},
     transcript::{Row, Transcript},
@@ -434,6 +435,93 @@ fn update(old: Option<&Value>, rows: &[Row]) -> Result<Value, String> {
     Ok(block)
 }
 pub(super) fn merge(blocks: &[Value], start: usize, delta: &[Row]) -> Result<Vec<Value>, String> {
+    merge_measured(blocks, start, delta, &mut 0)
+}
+
+/// One sparse save's block-level plan: the stored blocks the row ranges touch
+/// (with the inclusive rows each will hold), the rows past the stored extent
+/// that start new blocks, and the absolute row the first new block lands on.
+pub(super) struct SparseUpdate {
+    pub dirty: Vec<DirtyBlock>,
+    pub appended: Vec<Row>,
+    pub append_from_row: i64,
+}
+
+/// Map disjoint, sorted row ranges onto stored block extents. Only the blocks
+/// those ranges touch become dirty — the middle history never enters the write
+/// set. Appended rows extend the tail block while they continue it (`first`
+/// unset) and start new blocks at each `first` row; absolute row numbers never
+/// shift, because new rows only land at the tail. The extents are provisional
+/// where text re-chunks: rendering a merged block re-projects its rows by the
+/// transcript's row width, so the caller re-aligns each dirty block's extent
+/// (and the new-block origin) to the rendered row count before the writer
+/// validates the plan.
+pub(super) fn sparse_plan(
+    index: &[StoredBlockIndex],
+    ranges: &[(usize, &[Row])],
+) -> Result<SparseUpdate, String> {
+    let total = index
+        .last()
+        .map_or(0, |block| block.first_row + block.row_count);
+    for (start, _) in ranges {
+        if i64::try_from(*start).unwrap_or(i64::MAX) > total {
+            return Err(
+                "Transcript changed; refusing to overwrite a different conversation revision"
+                    .into(),
+            );
+        }
+    }
+    // The rows past the stored extent all sit in the one range that straddles
+    // or follows it (the others were checked against `total` above).
+    let mut appended: &[Row] = &[];
+    for (start, rows) in ranges {
+        let start = *start as i64;
+        if start + rows.len() as i64 > total {
+            let skip = (total - start).clamp(0, rows.len() as i64) as usize;
+            appended = &rows[skip..];
+        }
+    }
+    // Rows continuing the tail block (no `first` marker) extend it; the rest
+    // start new blocks. Without a stored tail, every appended row is new.
+    let extension = if index.is_empty() {
+        0
+    } else {
+        appended.iter().take_while(|row| !row.first).count() as i64
+    };
+    let mut dirty = Vec::new();
+    for block in index {
+        let is_last = Some(block.block_seq) == index.last().map(|last| last.block_seq);
+        let touched = ranges.iter().any(|(start, rows)| {
+            let start = *start as i64;
+            start < block.first_row + block.row_count && start + rows.len() as i64 > block.first_row
+        });
+        let extends_tail = is_last && extension > 0;
+        if !touched && !extends_tail {
+            continue;
+        }
+        let mut last_row = block.first_row + block.row_count - 1;
+        if extends_tail {
+            last_row = last_row.max(total - 1 + extension);
+        }
+        dirty.push(DirtyBlock {
+            block_seq: block.block_seq,
+            first_row: block.first_row,
+            last_row,
+        });
+    }
+    Ok(SparseUpdate {
+        dirty,
+        appended: appended[extension as usize..].to_vec(),
+        append_from_row: total + extension,
+    })
+}
+
+pub(super) fn merge_measured(
+    blocks: &[Value],
+    start: usize,
+    delta: &[Row],
+    changed_rows: &mut usize,
+) -> Result<Vec<Value>, String> {
     let mut rows = project(blocks)?;
     let original_len = rows.len();
     if start > rows.len() {
@@ -443,8 +531,10 @@ pub(super) fn merge(blocks: &[Value], start: usize, delta: &[Row]) -> Result<Vec
     }
     for (ix, row) in delta.iter().enumerate() {
         if let Some(existing) = rows.get_mut(start + ix) {
+            *changed_rows += usize::from(existing != row);
             *existing = row.clone();
         } else {
+            *changed_rows += 1;
             rows.push(row.clone());
         }
     }

@@ -80,6 +80,11 @@ pub fn build(input: LaunchInput) -> TuiLaunch {
     if input.kind == Kind::Claude && !input.windows {
         if let Some((cli, spool)) = &input.hook {
             args.extend(["--settings".into(), hook_settings_json(cli, spool).into()]);
+            // Without this, `--settings <json>` makes claude skip the project
+            // `.claude/settings.json` entirely (the inline JSON replaces the
+            // settings sources instead of merging with them), so SessionStart
+            // and other project hooks never run. Mirror provider.rs:1578.
+            args.push("--setting-sources=user,project,local".into());
         }
     }
     // `--resume` takes an optional value, so an id that looks like a flag would
@@ -489,7 +494,7 @@ mod tests {
     }
 
     #[test]
-    fn flag_order_is_model_mode_settings_session_prompt() {
+    fn flag_order_is_model_mode_settings_sources_session_prompt() {
         let launch = build(LaunchInput {
             hook: hook(),
             initial_prompt: Some("go".into()),
@@ -498,12 +503,18 @@ mod tests {
         let args = args(&launch);
         let id = launch.minted_id.unwrap();
         assert_eq!(
-            [&args[0], &args[2], &args[4], &args[6]],
-            ["--model", "--permission-mode", "--settings", "--session-id"]
+            [&args[0], &args[2], &args[4], &args[6], &args[7]],
+            [
+                "--model",
+                "--permission-mode",
+                "--settings",
+                "--setting-sources=user,project,local",
+                "--session-id"
+            ]
         );
-        assert_eq!(args[7], id);
-        assert_eq!(args[8], "go");
-        assert_eq!(args.len(), 9);
+        assert_eq!(args[8], id);
+        assert_eq!(args[9], "go");
+        assert_eq!(args.len(), 10);
     }
 
     // providers without TUI flags

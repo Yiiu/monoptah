@@ -387,6 +387,61 @@ fn an_indexed_conversation_is_refused_without_writing() {
     assert_eq!(store.cloud_synced_revision("env", "host-1").unwrap(), None);
 }
 
+#[test]
+fn cloud_move_preserves_row_numbers_and_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    // A chunked session with local rows, flipped to the cloud at its own
+    // anchor: the host rows append after the moved rows, under the same
+    // absolute numbers.
+    let mut store = Store::open_monocode(&dir.path().join("monocode.db")).unwrap();
+    store.prefer_chunked_storage(true).unwrap();
+    let id = store.create("claude", "/Users/me/repo").unwrap().id;
+    store.write_rows(id, 0, &local_rows(4)).unwrap();
+    let anchor = store.row_anchor(id).unwrap();
+    assert_eq!(anchor.count, 4);
+    set_cloud(&store, id, anchor.count);
+    let before_rows = store.shared_load(id).unwrap().rows;
+    // An indexed Mono session lives in the same database: the rejection gate
+    // must refuse that one and leave the chunked session alone.
+    store
+        .conn
+        .execute_batch("CREATE TABLE mono_transcripts (session_id TEXT PRIMARY KEY)")
+        .unwrap();
+    let indexed = store.create("claude", "/Users/me/repo").unwrap().id;
+    let indexed_original = store.persisted_session_id(indexed).unwrap();
+    store
+        .conn
+        .execute(
+            "INSERT INTO mono_transcripts VALUES(?1)",
+            [&indexed_original],
+        )
+        .unwrap();
+    set_cloud(&store, indexed, 2);
+    let out = store
+        .append_remote_rows(
+            id,
+            &snapshot(1, &[("user", "cloud q"), ("assistant", "cloud a")]),
+        )
+        .unwrap();
+    assert_eq!((out.start, out.written, out.truncated), (4, 2, 0));
+    let loaded = store.load(id).unwrap().rows;
+    assert_eq!(&loaded[..4], &before_rows[..]);
+    assert_eq!(
+        texts(&store, id)[4..],
+        ["user:cloud q", "assistant:cloud a"]
+    );
+    // The indexed Mono session is still refused, without writing anything.
+    let stored = raw_blocks(&store, indexed);
+    assert_eq!(store.row_anchor(indexed).unwrap_err(), INDEXED_UNSUPPORTED);
+    assert_eq!(
+        store
+            .append_remote_rows(indexed, &snapshot(1, &[("user", "q")]))
+            .unwrap_err(),
+        INDEXED_UNSUPPORTED
+    );
+    assert_eq!(raw_blocks(&store, indexed), stored);
+}
+
 fn qualified(revision: u64, blocks: &[Value]) -> Value {
     let mut value = json!({"revision": revision, "status": "idle",
         "session": {"id": "host-1", "blocks": blocks}});
