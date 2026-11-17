@@ -1194,9 +1194,10 @@ export function contextUsedFromAssistant(
  * Context level and window from a turn `result`.
  *
  * `usage` at the top level sums every iteration of the turn, so the last entry
- * of `usage.iterations` is what actually sits in the window. `modelUsage`
- * carries the window itself, which is why we let the CLI tell us rather than
- * keeping a model table in sync.
+ * of `usage.iterations` is what actually sits in the window. If iterations are
+ * absent, leave the latest assistant reading intact rather than using totals.
+ * `modelUsage` carries the window itself, which is why we let the CLI tell us
+ * rather than keeping a model table in sync.
  */
 export function contextFromResult(
   rec: Record<string, unknown>,
@@ -1204,7 +1205,7 @@ export function contextFromResult(
   const usage = asRecord(rec.usage);
   const iterations = Array.isArray(usage?.iterations) ? usage.iterations : [];
   const last = asRecord(iterations[iterations.length - 1]);
-  const used = contextUsedFromUsage(last ?? usage);
+  const used = contextUsedFromUsage(last);
 
   let window: number | undefined;
   const modelUsage = asRecord(rec.modelUsage);

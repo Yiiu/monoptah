@@ -951,11 +951,12 @@ impl Protocol {
                         if metrics.reported() {
                             events.push(Event::Metrics(metrics));
                         }
-                        let last = v["usage"]["iterations"]
+                        // Result totals sum every request in the turn. Without a
+                        // last iteration, keep the latest assistant reading.
+                        let used = v["usage"]["iterations"]
                             .as_array()
                             .and_then(|iterations| iterations.last())
-                            .unwrap_or(&v["usage"]);
-                        let used = crate::context::claude_used(last);
+                            .and_then(crate::context::claude_used);
                         let window = v["modelUsage"]
                             .as_object()
                             .into_iter()
@@ -2082,6 +2083,88 @@ mod tests {
             used: Some(2050),
             window: Some(200000)
         }));
+    }
+    #[test]
+    fn claude_context_reports_preserve_latest_request_when_result_has_only_totals() {
+        for iterations in [None, Some(json!([]))] {
+            let mut claude = protocol(Kind::Claude);
+            let mut context = crate::context::Usage {
+                used: 300_000,
+                window: Some(500_000),
+            };
+            let events = claude
+                .frame(
+                    json!({"type":"assistant","message":{"content":[],"usage":{
+                        "input_tokens":2_000,
+                        "cache_creation_input_tokens":8_000,
+                        "cache_read_input_tokens":200_000,
+                        "output_tokens":500
+                    }}}),
+                    &mut Vec::new(),
+                )
+                .unwrap();
+            for event in events {
+                if let Event::Context { used, window } = event {
+                    context.merge(used, window);
+                }
+            }
+            assert_eq!(context.used, 210_500);
+            let mut result = json!({
+                "type":"result",
+                "usage":{"input_tokens":1_800_000,"output_tokens":125},
+                "modelUsage":{"model":{"contextWindow":500_000}}
+            });
+            if let Some(iterations) = iterations {
+                result["usage"]["iterations"] = iterations;
+            }
+            let events = claude.frame(result, &mut Vec::new()).unwrap();
+            assert!(events.contains(&Event::Context {
+                used: None,
+                window: Some(500_000),
+            }));
+            assert!(events.contains(&Event::Metrics(TurnMetrics {
+                input_tokens: 1_800_000,
+                output_tokens: 125,
+                ..Default::default()
+            })));
+            for event in events {
+                if let Event::Context { used, window } = event {
+                    context.merge(used, window);
+                }
+            }
+            assert_eq!(
+                context,
+                crate::context::Usage {
+                    used: 210_500,
+                    window: Some(500_000),
+                }
+            );
+        }
+    }
+    #[test]
+    fn claude_context_reports_do_not_infer_a_reading_from_result_totals() {
+        let mut claude = protocol(Kind::Claude);
+        let events = claude
+            .frame(
+                json!({"type":"result","usage":{"input_tokens":1_800_000},
+                    "modelUsage":{"model":{"contextWindow":500_000}}}),
+                &mut Vec::new(),
+            )
+            .unwrap();
+        assert!(events.contains(&Event::Context {
+            used: None,
+            window: Some(500_000),
+        }));
+        let mut claude = protocol(Kind::Claude);
+        let events = claude
+            .frame(
+                json!({"type":"result","usage":{"input_tokens":1_800_000}}),
+                &mut Vec::new(),
+            )
+            .unwrap();
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, Event::Context { .. })));
     }
     #[test]
     fn claude_replayed_task_notification_result_does_not_end_the_turn() {
