@@ -45,12 +45,13 @@ pub(crate) fn page_rows(
     first_row: i64,
     limit: usize,
 ) -> Result<Vec<Row>, String> {
+    let index = block_index(conn, session_id).map_err(|error| error.to_string())?;
     let limit = limit.min(1 << 40);
     let mut rows = Vec::new();
     if limit == 0 {
         return Ok(rows);
     }
-    for stored in block_index(conn, session_id).map_err(|error| error.to_string())? {
+    for stored in index {
         if stored.row_count == 0 || stored.first_row + stored.row_count <= first_row {
             continue;
         }

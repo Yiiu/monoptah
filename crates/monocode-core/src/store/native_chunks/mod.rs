@@ -64,10 +64,26 @@ pub(crate) fn session_storage_mode(
     let marker = marker_mode_version(conn, session_id)?;
     Ok(match marker {
         None => StorageMode::Blob,
-        Some(version) => StorageMode::NativeChunks {
-            mode_version: u32::try_from(version)
-                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, version))?,
-        },
+        Some(version) => {
+            if version > i64::from(NATIVE_CHUNKS_MODE_VERSION) {
+                return Err(rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Integer,
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        format!(
+                            "{UNSUPPORTED_STORAGE_MODE}: this conversation uses storage mode \
+                             version {version}, newer than this Monoptah build understands \
+                             ({NATIVE_CHUNKS_MODE_VERSION}). Update Monoptah to read it."
+                        ),
+                    )),
+                ));
+            }
+            StorageMode::NativeChunks {
+                mode_version: u32::try_from(version)
+                    .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, version))?,
+            }
+        }
     })
 }
 
@@ -113,8 +129,8 @@ pub(crate) fn unsupported_storage_mode_refusal(
         return Ok(Some(format!(
             "{UNSUPPORTED_STORAGE_MODE}: a session in this database is stored with storage \
              mode version {version}, newer than this Monoptah build understands \
-             ({NATIVE_CHUNKS_MODE_VERSION}). Update Monoptah before writing to it; reading \
-             stays available."
+             ({NATIVE_CHUNKS_MODE_VERSION}). Update Monoptah before writing to it; sessions \
+             with supported storage modes remain readable."
         )));
     }
     Ok(None)

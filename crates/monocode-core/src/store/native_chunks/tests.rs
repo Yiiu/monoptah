@@ -316,17 +316,17 @@ fn older_writer_refuses_newer_mode() {
             )
             .unwrap();
     }
-    // Opening still succeeds: reads stay available, writes are refused.
+    // Opening still succeeds: supported sessions stay readable, future
+    // representations refuse both reads and writes.
     let mut store = Store::open_monocode(&path).unwrap();
-    assert_eq!(
-        session_storage_mode(&store.conn, "future").unwrap(),
-        StorageMode::NativeChunks {
-            mode_version: NATIVE_CHUNKS_MODE_VERSION + 1
-        }
-    );
+    let error = session_storage_mode(&store.conn, "future")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains(UNSUPPORTED_STORAGE_MODE), "{error}");
     let id = store.resolve_session_id("future").unwrap();
-    let transcript = store.load(id).unwrap();
-    let error = store.write_rows(id, 0, &transcript.rows).unwrap_err();
+    let error = store.load(id).unwrap_err();
+    assert!(error.contains(UNSUPPORTED_STORAGE_MODE), "{error}");
+    let error = store.write_rows(id, 0, &[]).unwrap_err();
     assert!(error.contains(UNSUPPORTED_STORAGE_MODE), "{error}");
     let error = store.save_setting("blocked", "1").unwrap_err();
     assert!(error.contains(UNSUPPORTED_STORAGE_MODE), "{error}");
@@ -352,6 +352,412 @@ fn older_writer_refuses_newer_mode() {
     let store = Store::open_monocode(&path).unwrap();
     let error = store.save_setting("blocked", "1").unwrap_err();
     assert!(error.contains(UNSUPPORTED_STORAGE_MODE), "{error}");
+}
+
+fn mode_flip_refuses_stale_write(native_before: bool, full_replace: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mode-flip.db");
+    let original = "mode-flip";
+    let blocks = vec![json!({"id":"prompt","role":"user","text":"Original","sentAt":1})];
+    let mut a = Store::open_monocode(&path).unwrap();
+    insert_session(&a.conn, original, &blocks);
+    let id = a.resolve_session_id(original).unwrap();
+    if native_before {
+        a.convert_session_to_chunked(id).unwrap();
+    }
+    let mut stale_rows = a.load(id).unwrap().rows;
+    stale_rows[0].text = "Stale edit".into();
+    let mut stale_blocks = a.stored_blocks(id).unwrap();
+    stale_blocks[0]["text"] = json!("Stale edit");
+
+    let mut b = Store::open_monocode(&path).unwrap();
+    let other = b.resolve_session_id(original).unwrap();
+    if native_before {
+        b.downgrade_session_to_blob(other).unwrap();
+    } else {
+        b.convert_session_to_chunked(other).unwrap();
+    }
+    let mut latest = b.load(other).unwrap().rows;
+    latest[0].text = "Other window committed".into();
+    b.write_rows(other, 0, &latest).unwrap();
+
+    let result = if full_replace {
+        a.store_blocks(id, &stale_blocks)
+    } else {
+        a.write_rows(id, 0, &stale_rows)
+    };
+    assert!(
+        result.is_err(),
+        "stale writes must refuse after a mode flip"
+    );
+    assert_eq!(b.load(other).unwrap().rows, latest);
+    // Reload explicitly acknowledges the new representation and permits saving.
+    let mut refreshed = a.load(id).unwrap().rows;
+    assert_eq!(refreshed, latest);
+    refreshed[0].text = "Edit after reload".into();
+    a.write_rows(id, 0, &refreshed).unwrap();
+    assert_eq!(b.load(other).unwrap().rows, refreshed);
+}
+
+#[test]
+fn review_blob_to_native_refuses_stale_sparse_write() {
+    mode_flip_refuses_stale_write(false, false);
+}
+
+#[test]
+fn review_native_to_blob_refuses_stale_sparse_write() {
+    mode_flip_refuses_stale_write(true, false);
+}
+
+#[test]
+fn review_blob_to_native_refuses_stale_full_replace() {
+    mode_flip_refuses_stale_write(false, true);
+}
+
+#[test]
+fn review_native_to_blob_refuses_stale_full_replace() {
+    mode_flip_refuses_stale_write(true, true);
+}
+
+#[test]
+fn review_conversion_seeds_committed_revision_without_reload() {
+    let mut store = Store::open_monocode(Path::new(":memory:")).unwrap();
+    insert_session(
+        &store.conn,
+        "convert-and-save",
+        &[json!({"id":"p","role":"user","text":"Before conversion","sentAt":1})],
+    );
+    let id = store.resolve_session_id("convert-and-save").unwrap();
+    let mut rows = store.load(id).unwrap().rows;
+    store.convert_session_to_chunked(id).unwrap();
+    rows[0].text = "Saved immediately after conversion".into();
+    store.write_rows(id, 0, &rows).unwrap();
+    assert_eq!(store.load(id).unwrap().rows, rows);
+}
+
+#[test]
+fn review_round_trip_mode_flip_refuses_stale_native_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mode-round-trip.db");
+    let mut a = Store::open_monocode(&path).unwrap();
+    insert_session(
+        &a.conn,
+        "round-trip",
+        &[json!({"id":"p","role":"user","text":"Original","sentAt":1})],
+    );
+    let id = a.resolve_session_id("round-trip").unwrap();
+    a.convert_session_to_chunked(id).unwrap();
+    let mut stale = a.load(id).unwrap().rows;
+    stale[0].text = "Stale edit".into();
+    let mut b = Store::open_monocode(&path).unwrap();
+    let other = b.resolve_session_id("round-trip").unwrap();
+    b.downgrade_session_to_blob(other).unwrap();
+    let mut latest = b.load(other).unwrap().rows;
+    latest[0].text = "Committed between conversions".into();
+    b.write_rows(other, 0, &latest).unwrap();
+    b.convert_session_to_chunked(other).unwrap();
+    assert!(
+        a.write_rows(id, 0, &stale).is_err(),
+        "reconversion must not reuse the stale revision"
+    );
+    assert_eq!(b.load(other).unwrap().rows, latest);
+}
+
+fn busy_commit_rolls_back(downgrade: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("busy-commit.db");
+    let mut store = Store::open_monocode(&path).unwrap();
+    seed_native_session(
+        &store.conn,
+        "busy",
+        &[json!({"id":"p","role":"user","text":"Before","sentAt":1})],
+    );
+    let id = store.resolve_session_id("busy").unwrap();
+    let mut rows = store.load(id).unwrap().rows;
+    store
+        .conn
+        .pragma_update(None, "journal_mode", "DELETE")
+        .unwrap();
+    store.conn.busy_timeout(Duration::ZERO).unwrap();
+    let reader = Connection::open(&path).unwrap();
+    reader.execute_batch("BEGIN").unwrap();
+    let _: String = reader
+        .query_row(
+            "SELECT blocks_json FROM sessions WHERE id='busy'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    rows[0].text = "After".into();
+    let result = if downgrade {
+        store.downgrade_session_to_blob(id)
+    } else {
+        store.write_rows(id, 0, &rows)
+    };
+    assert!(result.is_err(), "the held reader must make COMMIT busy");
+    assert!(
+        store.conn.is_autocommit(),
+        "a failed commit must roll back its transaction"
+    );
+    reader.execute_batch("COMMIT").unwrap();
+    assert!(store.storage_mode_version(id).unwrap().is_some());
+    if downgrade {
+        store.downgrade_session_to_blob(id).unwrap();
+        assert!(store.storage_mode_version(id).unwrap().is_none());
+    } else {
+        store.write_rows(id, 0, &rows).unwrap();
+        assert_eq!(store.load(id).unwrap().rows, rows);
+    }
+}
+
+#[test]
+fn review_sparse_busy_commit_rolls_back_and_can_retry() {
+    busy_commit_rolls_back(false);
+}
+
+#[test]
+fn review_downgrade_busy_commit_rolls_back_and_can_retry() {
+    busy_commit_rolls_back(true);
+}
+
+#[test]
+fn review_conversion_refuses_a_stale_loaded_blob() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stale-conversion.db");
+    let mut a = Store::open_monocode(&path).unwrap();
+    insert_session(
+        &a.conn,
+        "stale",
+        &[json!({"id":"p","role":"user","text":"Original","sentAt":1})],
+    );
+    let id = a.resolve_session_id("stale").unwrap();
+    a.load(id).unwrap();
+    let mut b = Store::open_monocode(&path).unwrap();
+    let other = b.resolve_session_id("stale").unwrap();
+    let mut latest = b.load(other).unwrap().rows;
+    latest[0].text = "Other window committed".into();
+    b.write_rows(other, 0, &latest).unwrap();
+    assert!(
+        a.convert_session_to_chunked(id).is_err(),
+        "conversion must not acknowledge an unseen edit"
+    );
+    assert_eq!(b.load(other).unwrap().rows, latest);
+}
+
+#[test]
+fn review_downgrade_keeps_a_blob_guard_for_the_same_handle() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("downgrade-guard.db");
+    let mut a = Store::open_monocode(&path).unwrap();
+    seed_native_session(
+        &a.conn,
+        "guard",
+        &[json!({"id":"p","role":"user","text":"Original","sentAt":1})],
+    );
+    let id = a.resolve_session_id("guard").unwrap();
+    let mut stale = a.load(id).unwrap().rows;
+    a.downgrade_session_to_blob(id).unwrap();
+    let mut b = Store::open_monocode(&path).unwrap();
+    let other = b.resolve_session_id("guard").unwrap();
+    let mut latest = b.load(other).unwrap().rows;
+    latest[0].text = "Other window committed".into();
+    b.write_rows(other, 0, &latest).unwrap();
+    stale[0].text = "Stale edit".into();
+    assert!(a.write_rows(id, 0, &stale).is_err());
+    assert_eq!(b.load(other).unwrap().rows, latest);
+}
+
+fn stored_blocks_mode_flip_refuses_stale_replace(native_before: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("blocks-guard.db");
+    let mut a = Store::open_monocode(&path).unwrap();
+    insert_session(
+        &a.conn,
+        "blocks",
+        &[json!({"id":"p","role":"user","text":"Original","sentAt":1})],
+    );
+    let id = a.resolve_session_id("blocks").unwrap();
+    if native_before {
+        a.convert_session_to_chunked(id).unwrap();
+    }
+    drop(a);
+    // A fresh handle has never loaded rows or acquired a revision guard.
+    let a = Store::open_monocode(&path).unwrap();
+    let id = a.resolve_session_id("blocks").unwrap();
+    let mut stale = a.stored_blocks(id).unwrap();
+    let mut b = Store::open_monocode(&path).unwrap();
+    let other = b.resolve_session_id("blocks").unwrap();
+    if native_before {
+        b.downgrade_session_to_blob(other).unwrap();
+    } else {
+        b.convert_session_to_chunked(other).unwrap();
+    }
+    let mut latest = b.load(other).unwrap().rows;
+    latest[0].text = "Other window committed".into();
+    b.write_rows(other, 0, &latest).unwrap();
+    stale[0]["text"] = json!("Stale edit");
+    assert!(a.store_blocks(id, &stale).is_err());
+    assert_eq!(b.load(other).unwrap().rows, latest);
+}
+
+#[test]
+fn review_stored_blocks_guards_blob_to_native_replace() {
+    stored_blocks_mode_flip_refuses_stale_replace(false);
+}
+
+#[test]
+fn review_stored_blocks_guards_native_to_blob_replace() {
+    stored_blocks_mode_flip_refuses_stale_replace(true);
+}
+
+#[test]
+fn review_acceptance_of_the_only_draft_can_commit_and_retry() {
+    let mut store = Store::open_monocode(Path::new(":memory:")).unwrap();
+    let id = created_chunked(&store, "codex");
+    store
+        .store_blocks(
+            id,
+            &[json!({"id":"only-draft","role":"user","text":"Queued","draft":true})],
+        )
+        .unwrap();
+    assert!(store.load(id).unwrap().rows.is_empty());
+    let row = crate::transcript::Row {
+        role: "user".into(),
+        text: "Queued".into(),
+        first: true,
+        sent_at: Some(1),
+    };
+    store
+        .write_rows_with_message(id, 0, std::slice::from_ref(&row), Some("only-draft"))
+        .unwrap();
+    assert_eq!(store.load(id).unwrap().rows, vec![row.clone()]);
+    assert_eq!(
+        store.stored_blocks(id).unwrap()[0]["appRequestId"],
+        "only-draft"
+    );
+    store
+        .write_rows_with_message(id, 0, std::slice::from_ref(&row), Some("only-draft"))
+        .unwrap();
+    assert_eq!(store.load(id).unwrap().rows, vec![row]);
+}
+
+#[test]
+fn review_future_mode_refuses_full_history_and_page_reads() {
+    let store = Store::open_monocode(Path::new(":memory:")).unwrap();
+    seed_native_session(
+        &store.conn,
+        "future-read",
+        &[json!({"id":"p","role":"user","text":"Synthetic","sentAt":1})],
+    );
+    store
+        .conn
+        .execute(
+            "UPDATE native_sessions SET mode_version=?1 WHERE session_id='future-read'",
+            [i64::from(NATIVE_CHUNKS_MODE_VERSION) + 1],
+        )
+        .unwrap();
+    let id = store.resolve_session_id("future-read").unwrap();
+    let error = store.load(id).unwrap_err();
+    assert!(error.contains(UNSUPPORTED_STORAGE_MODE), "{error}");
+    let error = store.stored_blocks(id).unwrap_err();
+    assert!(error.contains(UNSUPPORTED_STORAGE_MODE), "{error}");
+    let error = page_rows(&store.conn, "future-read", 0, 1).unwrap_err();
+    assert!(error.contains(UNSUPPORTED_STORAGE_MODE), "{error}");
+    let error = iter_full_history(&store.conn, "future-read")
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap_err();
+    assert!(error.contains(UNSUPPORTED_STORAGE_MODE), "{error}");
+}
+
+#[test]
+fn review_public_store_blocks_rolls_back_and_can_retry() {
+    let store = Store::open_monocode(Path::new(":memory:")).unwrap();
+    let session = created_chunked(&store, "codex");
+    let original = store.persisted_session_id(session).unwrap();
+    let before = vec![json!({"id":"p","role":"user","text":"Before","sentAt":1})];
+    store.store_blocks(session, &before).unwrap();
+    let before_rows = store.load(session).unwrap().rows;
+    let snapshot = native_snapshot(&store.conn, &original);
+    // The transcript update succeeds, then updating its list flags fails.
+    store
+        .conn
+        .execute_batch(
+            "CREATE TRIGGER refuse_list_flags BEFORE UPDATE OF has_user_message ON sessions
+         BEGIN SELECT RAISE(ABORT, 'synthetic list flag failure'); END;",
+        )
+        .unwrap();
+    let after = vec![json!({"id":"p","role":"user","text":"After","sentAt":1})];
+    let error = store.store_blocks(session, &after).unwrap_err();
+    assert!(error.contains("synthetic list flag failure"), "{error}");
+    assert!(
+        store.conn.is_autocommit(),
+        "no transaction may leak on failure"
+    );
+    assert_eq!(native_snapshot(&store.conn, &original), snapshot);
+    // Do not reload: a rolled-back save must be retryable with the same guard.
+    store
+        .conn
+        .execute_batch("DROP TRIGGER refuse_list_flags")
+        .unwrap();
+    store.store_blocks(session, &after).unwrap();
+    let reloaded = store.load(session).unwrap().rows;
+    assert_ne!(reloaded, before_rows);
+    assert_eq!(reloaded[0].text, "After");
+}
+
+#[test]
+fn review_public_store_blocks_commit_failure_can_retry() {
+    let store = Store::open_monocode(Path::new(":memory:")).unwrap();
+    let session = created_chunked(&store, "codex");
+    let original = store.persisted_session_id(session).unwrap();
+    let before = vec![json!({"id":"p","role":"user","text":"Before","sentAt":1})];
+    store.store_blocks(session, &before).unwrap();
+    store.load(session).unwrap();
+    let snapshot = native_snapshot(&store.conn, &original);
+    store.fail_next_save_commit_for_test().unwrap();
+    let after = vec![json!({"id":"p","role":"user","text":"After","sentAt":1})];
+    assert!(store.store_blocks(session, &after).is_err());
+    assert!(store.conn.is_autocommit());
+    assert_eq!(native_snapshot(&store.conn, &original), snapshot);
+    store.store_blocks(session, &after).unwrap();
+    assert_eq!(store.load(session).unwrap().rows[0].text, "After");
+}
+
+#[test]
+fn review_receipt_skips_deleted_draft_when_updating_existing_prompt() {
+    let mut store = Store::open_monocode(Path::new(":memory:")).unwrap();
+    let session = created_chunked(&store, "codex");
+    store
+        .store_blocks(
+            session,
+            &[
+                json!({"id":"prompt","role":"user","text":"Existing prompt","sentAt":1}),
+                json!({"id":"queued","role":"user","text":"Queued prompt","draft":true}),
+            ],
+        )
+        .unwrap();
+    let original = store.persisted_session_id(session).unwrap();
+    store.conn.execute(
+        "UPDATE sessions SET queued_messages_json='[{\"id\":\"queued\",\"text\":\"Queued prompt\"}]' WHERE id=?1",
+        [&original],
+    ).unwrap();
+    let rows = store.load(session).unwrap().rows;
+    store
+        .write_rows_with_message(session, 0, &rows, Some("queued"))
+        .unwrap();
+    let saved = store.stored_blocks(session).unwrap();
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0]["appRequestId"], "queued");
+    let queued: String = store
+        .conn
+        .query_row(
+            "SELECT queued_messages_json FROM sessions WHERE id=?1",
+            [&original],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(queued, "[]");
+    assert!(!store.draft_sessions().unwrap().contains(&session));
 }
 
 #[test]
@@ -887,6 +1293,7 @@ fn zero_dirty_no_write() {
             blocks_written: 0,
             chunks_written: 0,
             chunk_bytes_written: 0,
+            skeleton_bytes_written: 0,
         }
     );
 }
@@ -1262,6 +1669,193 @@ fn giant_members_strip_and_split_with_markers() {
 }
 
 #[test]
+fn oversized_nested_tool_strings_keep_the_skeleton_small_and_round_trip() {
+    let text = "é漢🙂".repeat(CHUNK_TARGET_BYTES / 8 + 17);
+    let mut block = large_tool_block(&text);
+    block["text"] = json!(text);
+    block["tool"]["title"] = json!(text);
+    block["tool"]["preview"] = json!({"title":text,"future":[{"body":text}]});
+    block["futureMetadata"] = json!({"nested":[text],"small":true});
+    let rows = blocks::project(std::slice::from_ref(&block)).unwrap();
+    let raw = serde_json::to_string(&block).unwrap();
+    let form = store_block_form(&block, &raw, &rows).unwrap();
+    assert!(form.skeleton.len() < 4096);
+    assert_eq!(form.payloads.len(), 6);
+    for payload in &form.payloads {
+        assert!(pack_payload_segments(payload, CHUNK_TARGET_BYTES)
+            .iter()
+            .all(|piece| piece.len() <= CHUNK_TARGET_BYTES));
+    }
+    assert_eq!(
+        block_value(
+            &form.skeleton,
+            &pack_stored_chunks(&form.elements, CHUNK_TARGET_BYTES),
+            &form.payloads
+        )
+        .unwrap(),
+        block
+    );
+    let hidden =
+        json!({"id":"hidden-large","role":"assistant","draft":true,"text":text,"future":[text]});
+    let raw = serde_json::to_string(&hidden).unwrap();
+    let form = store_block_form(&hidden, &raw, &[]).unwrap();
+    assert!(form.skeleton.len() < 4096);
+    assert_eq!(
+        block_value(&form.skeleton, &[], &form.payloads).unwrap(),
+        hidden
+    );
+}
+
+#[test]
+fn giant_root_id_stays_inline_while_nested_ids_use_payloads() {
+    let text = "identifier".repeat(CHUNK_TARGET_BYTES / 8);
+    let block = json!({"id":text,"role":"assistant","draft":true,
+        "text":"hidden","future":{"id":text}});
+    let raw = serde_json::to_string(&block).unwrap();
+    let form = store_block_form(&block, &raw, &[]).unwrap();
+    assert!(form
+        .skeleton
+        .contains(&format!("\"id\":{}", serde_json::to_string(&text).unwrap())));
+    assert_eq!(form.payloads.len(), 1);
+    assert_eq!(
+        block_value(&form.skeleton, &[], &form.payloads).unwrap(),
+        block
+    );
+}
+
+#[test]
+fn oversized_nested_strings_still_refuse_source_markers() {
+    for marker in [ROWS_PLACEHOLDER, TEXT_SENTINEL, PAYLOAD_PLACEHOLDER] {
+        let block = json!({"id":"reserved-large","role":"assistant","text":"small",
+            "future":{"array":[format!("{}{marker}", "x".repeat(CHUNK_TARGET_BYTES))]}});
+        let rows = blocks::project(std::slice::from_ref(&block)).unwrap();
+        let raw = serde_json::to_string(&block).unwrap();
+        assert!(store_block_form(&block, &raw, &rows)
+            .err()
+            .unwrap()
+            .contains("reserved marker"));
+    }
+}
+
+fn seed_legacy_large_tool(store: &mut Store, id: &str) -> Vec<Value> {
+    let text = "x".repeat(2 * CHUNK_TARGET_BYTES + 123);
+    let mut tool = large_tool_block(&text);
+    tool["text"] = json!(text);
+    tool["tool"]["title"] = json!(text);
+    tool["tool"]["preview"] = json!({"title":text,"future":true});
+    tool["tool"]["nativePresentation"] = json!({"title":"Synthetic active tool","kind":"read"});
+    let values = vec![
+        json!({"id":"p","role":"user","text":"Synthetic prompt","appRequestId":"fake-receipt"}),
+        tool,
+        json!({"id":"hidden","role":"assistant","draft":true,"text":text,"future":true}),
+    ];
+    seed_native_session(&store.conn, id, &[]);
+    let updates = values
+        .iter()
+        .map(|block| {
+            let raw = serde_json::to_string(block).unwrap();
+            let rows = blocks::project(std::slice::from_ref(block)).unwrap();
+            let form = super::layout::legacy_store_block_form(block, &raw, &rows).unwrap();
+            BlockUpdate {
+                skeleton: form.skeleton,
+                rows: form.elements,
+                payloads: form.payloads,
+            }
+        })
+        .collect::<Vec<_>>();
+    let tx = store.conn.transaction().unwrap();
+    replace_blocks_tx(&tx, id, 0, &updates).unwrap();
+    tx.commit().unwrap();
+    values
+}
+
+#[test]
+fn legacy_large_members_can_downgrade_without_a_normalization_save() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("legacy-export.db");
+    let expected;
+    let rows;
+    {
+        let mut store = Store::open_monocode(&path).unwrap();
+        expected = seed_legacy_large_tool(&mut store, "legacy-export");
+        let handle = store.resolve_session_id("legacy-export").unwrap();
+        rows = store.load(handle).unwrap().rows;
+        store.downgrade_session_to_blob(handle).unwrap();
+        assert_eq!(store.stored_blocks(handle).unwrap(), expected);
+        assert_eq!(
+            native_row_counts(&store.conn, "legacy-export"),
+            (0, 0, 0, 0)
+        );
+    }
+    let store = Store::open_monocode(&path).unwrap();
+    let handle = store.resolve_session_id("legacy-export").unwrap();
+    assert_eq!(store.stored_blocks(handle).unwrap(), expected);
+    assert_eq!(store.load(handle).unwrap().rows, rows);
+}
+
+#[test]
+fn legacy_large_members_normalize_on_save_without_losing_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("legacy-save.db");
+    let expected;
+    let saved_rows;
+    {
+        let mut store = Store::open_monocode(&path).unwrap();
+        let mut values = seed_legacy_large_tool(&mut store, "legacy-save");
+        let handle = store.resolve_session_id("legacy-save").unwrap();
+        let mut rows = store.load(handle).unwrap().rows;
+        let index = rows.iter().position(|row| row.role == "tool").unwrap();
+        let mut call: crate::tool::ToolCall = serde_json::from_str(&rows[index].text).unwrap();
+        call.input.push_str(" appended 中文🙂");
+        values[1]["text"] = json!(call.input);
+        values[1]["tool"]["title"] = json!(call.input);
+        values[1]["tool"]["nativeInput"] = json!(call.input);
+        rows[index].text = serde_json::to_string(&call).unwrap();
+        store
+            .write_rows(handle, index, &rows[index..index + 1])
+            .unwrap();
+        assert!(native_snapshot(&store.conn, "legacy-save")[1].1.len() < 4096);
+        assert_eq!(store.stored_blocks(handle).unwrap(), values);
+        expected = values;
+        saved_rows = store.load(handle).unwrap().rows;
+    }
+    let mut store = Store::open_monocode(&path).unwrap();
+    let handle = store.resolve_session_id("legacy-save").unwrap();
+    assert_eq!(store.stored_blocks(handle).unwrap(), expected);
+    assert_eq!(store.load(handle).unwrap().rows, saved_rows);
+    store.downgrade_session_to_blob(handle).unwrap();
+    assert_eq!(store.stored_blocks(handle).unwrap(), expected);
+}
+
+#[test]
+fn downgrade_refuses_noncanonical_forms_in_both_layouts() {
+    for normalize in [false, true] {
+        let mut store = Store::open_monocode(Path::new(":memory:")).unwrap();
+        let expected = seed_legacy_large_tool(&mut store, "strict-export");
+        let handle = store.resolve_session_id("strict-export").unwrap();
+        store.load(handle).unwrap();
+        if normalize {
+            store.store_blocks(handle, &expected).unwrap();
+        }
+        // Still valid, reconstructible JSON with unchanged rows and metadata,
+        // but neither canonical writer emits this leading whitespace.
+        store.conn.execute(
+            "UPDATE native_blocks SET skeleton_json=' '||skeleton_json WHERE session_id=?1 AND block_seq=1",
+            ["strict-export"],
+        ).unwrap();
+        let before = native_snapshot(&store.conn, "strict-export");
+        let blob = stored_blob(&store.conn, "strict-export");
+        assert!(store
+            .downgrade_session_to_blob(handle)
+            .unwrap_err()
+            .contains("would not re-store to its stored form"));
+        assert_eq!(native_snapshot(&store.conn, "strict-export"), before);
+        assert_eq!(stored_blob(&store.conn, "strict-export"), blob);
+        assert_eq!(store.stored_blocks(handle).unwrap(), expected);
+    }
+}
+
+#[test]
 fn restart_equality_rows_and_raw_blocks() {
     let blocks = vec![
         json!({"id":"prompt","role":"user","text":"Write a report 🙂","sentAt":1,"futureMetadata":{"keep":[1,2]}}),
@@ -1396,9 +1990,17 @@ fn large_tool_block(input: &str) -> Value {
 #[test]
 fn large_tool_update_rewrites_bounded_bytes() {
     let mut store = Store::open_monocode(Path::new(":memory:")).unwrap();
+    // A tool already rendered by a previous update carries giant captions too.
+    // First creation of those captions is covered separately below.
+    let initial_input = "x".repeat(5 * 1024 * 1024);
+    let mut active = large_tool_block(&initial_input);
+    active["text"] = json!(initial_input);
+    active["tool"]["title"] = json!(initial_input);
+    active["tool"]["preview"] = json!({"title":initial_input,"future":true});
+    active["tool"]["nativePresentation"] = json!({"title":"Synthetic active tool","kind":"read"});
     let blocks = vec![
         json!({"id":"prompt","role":"user","text":"Run the reader","sentAt":1}),
-        large_tool_block(&"x".repeat(5 * 1024 * 1024)),
+        active,
         json!({"id":"tail","role":"assistant","text":"Tail reply","sentAt":2}),
     ];
     let id = "large-tool";
@@ -1411,9 +2013,12 @@ fn large_tool_update_rewrites_bounded_bytes() {
     let row_bytes: u64 = before[1].2.iter().map(|chunk| chunk.len() as u64).sum();
     assert!(row_bytes >= 5 * 1024 * 1024);
     assert!(before[1].1.contains(PAYLOAD_PLACEHOLDER));
-    assert_eq!(before[1].5.len(), 1);
-    assert!(before[1].5[0]
+    assert_eq!(before[1].5.len(), 4);
+    assert!(before[1].1.len() < 4096);
+    assert!(before[1]
+        .5
         .iter()
+        .flatten()
         .all(|segment| segment.len() <= CHUNK_TARGET_BYTES));
     // Repeated small updates, streamed exactly as the runtime updates a tool:
     // parse the row's ToolCall, append to its input, re-serialize.
@@ -1442,9 +2047,12 @@ fn large_tool_update_rewrites_bounded_bytes() {
             sample.chunk_bytes_written
         );
         assert!(sample.chunk_bytes_written >= 1024, "round {round}");
+        assert!(sample.skeleton_bytes_written < 4096, "round {round}");
+        let json_bytes = sample.skeleton_bytes_written + sample.chunk_bytes_written;
+        assert!(json_bytes <= 4 * (CHUNK_TARGET_BYTES + 4096) as u64 + 4096);
         assert!(
-            sample.chunk_bytes_written * 16 < row_bytes,
-            "round {round}: the write must not scale with the block"
+            json_bytes * 16 < row_bytes,
+            "round {round}: all transcript JSON writes must stay bounded"
         );
     }
     // Everything reads back byte-exact, through both reader entries.
@@ -1465,7 +2073,33 @@ fn large_tool_update_rewrites_bounded_bytes() {
     let sample = store.take_save_sample().expect("save sample");
     assert_eq!(sample.blocks_written, 0);
     assert_eq!(sample.chunk_bytes_written, 0);
+    assert_eq!(sample.skeleton_bytes_written, 0);
     assert_eq!(native_snapshot(&store.conn, id), after_rounds);
+}
+
+#[test]
+fn first_giant_captions_count_their_full_initial_write() {
+    let mut store = Store::open_monocode(Path::new(":memory:")).unwrap();
+    let input = "x".repeat(8 * CHUNK_TARGET_BYTES);
+    let block = large_tool_block(&input);
+    seed_native_session(&store.conn, "new-captions", std::slice::from_ref(&block));
+    let id = store.resolve_session_id("new-captions").unwrap();
+    let mut rows = store.load(id).unwrap().rows;
+    for round in 0..2 {
+        let mut call: crate::tool::ToolCall = serde_json::from_str(&rows[0].text).unwrap();
+        call.input.push_str(&"y".repeat(1024));
+        rows[0].text = serde_json::to_string(&call).unwrap();
+        store.write_rows(id, 0, &rows).unwrap();
+        let sample = store.take_save_sample().unwrap();
+        let written = sample.chunk_bytes_written + sample.skeleton_bytes_written;
+        if round == 0 {
+            // New full-size captions are real new content; never hide this cost.
+            assert!(written >= 2 * input.len() as u64);
+        } else {
+            assert!(written <= 4 * (CHUNK_TARGET_BYTES + 4096) as u64 + 4096);
+        }
+        assert!(sample.skeleton_bytes_written < 4096);
+    }
 }
 
 #[test]

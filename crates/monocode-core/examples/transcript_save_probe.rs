@@ -170,8 +170,10 @@ struct SampleValues {
     blocks_written: Option<u64>,
     chunks_written: Option<u64>,
     chunk_bytes_written: Option<u64>,
+    skeleton_bytes_written: Option<u64>,
     chunks_written_missing_reason: Option<&'static str>,
     chunk_bytes_written_missing_reason: Option<&'static str>,
+    skeleton_bytes_written_missing_reason: Option<&'static str>,
 }
 impl From<SaveSample> for SampleValues {
     fn from(sample: SaveSample) -> Self {
@@ -187,14 +189,16 @@ impl From<SaveSample> for SampleValues {
             encoding_ns: ns(sample.encoding),
             commit_ns: ns(sample.commit),
             succeeded: sample.succeeded,
-            // The chunk counters' blob shape: null with the backend's explicit
-            // missing reason, never a fabricated zero. A native-chunks run
-            // swaps the sample's real counters in at the save_event swap point.
+            // Native write counters' blob shape: null with the backend's
+            // explicit missing reason, never a fabricated zero. A native run
+            // swaps in the real counters at the save_event swap point.
             blocks_written: None,
             chunks_written: None,
             chunk_bytes_written: None,
+            skeleton_bytes_written: None,
             chunks_written_missing_reason: Some("backend:blob"),
             chunk_bytes_written_missing_reason: Some("backend:blob"),
+            skeleton_bytes_written_missing_reason: Some("backend:blob"),
         }
     }
 }
@@ -297,7 +301,7 @@ struct Report {
 impl Report {
     fn new(start_io: Option<u64>) -> Self {
         Self {
-            schema_version: 2,
+            schema_version: 3,
             scenario: None,
             status: "incomplete",
             incomplete_reasons: vec![],
@@ -790,6 +794,7 @@ fn save_event(
             sample.blocks_written,
             sample.chunks_written,
             sample.chunk_bytes_written,
+            sample.skeleton_bytes_written,
         )
     });
     let mut values = taken.map(SampleValues::from);
@@ -799,12 +804,17 @@ fn save_event(
         match (counted, native_chunks) {
             // The chunked backend's writer counted what it actually wrote,
             // chunk by chunk; its samples carry those numbers verbatim.
-            (Some((blocks_written, chunks_written, chunk_bytes_written)), true) => {
+            (
+                Some((blocks_written, chunks_written, chunk_bytes_written, skeleton_bytes_written)),
+                true,
+            ) => {
                 values.blocks_written = Some(blocks_written);
                 values.chunks_written = Some(chunks_written);
                 values.chunk_bytes_written = Some(chunk_bytes_written);
+                values.skeleton_bytes_written = Some(skeleton_bytes_written);
                 values.chunks_written_missing_reason = None;
                 values.chunk_bytes_written_missing_reason = None;
+                values.skeleton_bytes_written_missing_reason = None;
             }
             // The blob backend rewrites the session's whole block array per
             // save; no workload operation adds or removes a block, so this
@@ -856,6 +866,7 @@ fn summarize(samples: &[Sample]) -> Value {
     let blocks_written = known(|value| value.blocks_written);
     let chunks_written = known(|value| value.chunks_written);
     let chunk_bytes_written = known(|value| value.chunk_bytes_written);
+    let skeleton_bytes_written = known(|value| value.skeleton_bytes_written);
     let total = |known: &[u64]| (!known.is_empty()).then(|| known.iter().sum::<u64>());
     json!({"sample_count":samples.len(), "successful_sample_count":values.iter().filter(|value| value.succeeded).count(),
         "totals":{"history_bytes_read":values.iter().map(|v|v.history_bytes_read).sum::<u64>(),
@@ -867,7 +878,8 @@ fn summarize(samples: &[Sample]) -> Value {
             "commit_ns":values.iter().map(|v|v.commit_ns).sum::<u64>(),
             "save_ns":samples.iter().map(|v|v.save_ns).sum::<u64>(),"lock_wait_ns":null,"lock_held_ns":null,
             "blocks_written":total(&blocks_written),"chunks_written":total(&chunks_written),
-            "chunk_bytes_written":total(&chunk_bytes_written)},
+            "chunk_bytes_written":total(&chunk_bytes_written),
+            "skeleton_bytes_written":total(&skeleton_bytes_written)},
         "max":{"history_bytes_read":values.iter().map(|v|v.history_bytes_read).max(),
             "serialized_bytes":values.iter().map(|v|v.serialized_bytes).max(),
             "changed_rows":values.iter().map(|v|v.changed_rows).max(),
@@ -877,7 +889,8 @@ fn summarize(samples: &[Sample]) -> Value {
             "save_ns":samples.iter().map(|v|v.save_ns).max(),"lock_wait_ns":null,"lock_held_ns":null,
             "blocks_written":blocks_written.iter().copied().max(),
             "chunks_written":chunks_written.iter().copied().max(),
-            "chunk_bytes_written":chunk_bytes_written.iter().copied().max()},
+            "chunk_bytes_written":chunk_bytes_written.iter().copied().max(),
+            "skeleton_bytes_written":skeleton_bytes_written.iter().copied().max()},
         "p95_ns":null,"p95_missing_reason":"single_fixed_workload_fewer_than_100_samples"})
 }
 fn record_sample(
@@ -1459,7 +1472,7 @@ mod tests {
         assert_eq!(io_delta(Some(8), Some(7)), None);
         let report = Report::new(None);
         let json = serde_json::to_value(report).unwrap();
-        assert_eq!(json["schema_version"], 2);
+        assert_eq!(json["schema_version"], 3);
         assert!(json.get("version").is_none());
         assert_eq!(json["backend"]["kind"], "blob");
         assert!(json["backend"]["mode_version"].is_null());
@@ -1472,7 +1485,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_report_pins_backend_and_seven_stages() {
+    fn v3_report_pins_backend_and_seven_stages() {
         let json = serde_json::to_value(Report::new(None)).unwrap();
         let mut keys = json
             .as_object()
@@ -1546,11 +1559,16 @@ mod tests {
     }
 
     #[test]
-    fn v2_blob_chunk_counters_are_null_with_backend_reason() {
+    fn v3_blob_chunk_counters_are_null_with_backend_reason() {
         let values = SampleValues::from(SaveSample::default());
         assert_eq!(values.blocks_written, None);
         assert_eq!(values.chunks_written, None);
         assert_eq!(values.chunk_bytes_written, None);
+        assert_eq!(values.skeleton_bytes_written, None);
+        assert_eq!(
+            values.skeleton_bytes_written_missing_reason,
+            Some("backend:blob")
+        );
         assert_eq!(values.chunks_written_missing_reason, Some("backend:blob"));
         assert_eq!(
             values.chunk_bytes_written_missing_reason,
@@ -1558,10 +1576,11 @@ mod tests {
         );
         let json = serde_json::to_value(values).unwrap();
         assert!(json["chunks_written"].is_null() && json["chunk_bytes_written"].is_null());
+        assert!(json["skeleton_bytes_written"].is_null());
     }
 
     #[test]
-    fn v2_summary_totals_gain_block_and_chunk_counters() {
+    fn v3_summary_totals_gain_block_and_chunk_counters() {
         let sample = |values: Option<SampleValues>| Sample {
             event_index: 0,
             session_index: 0,
@@ -1581,11 +1600,26 @@ mod tests {
         assert_eq!(summary["max"]["blocks_written"], 6);
         assert!(summary["totals"]["chunks_written"].is_null());
         assert!(summary["totals"]["chunk_bytes_written"].is_null());
+        assert!(summary["totals"]["skeleton_bytes_written"].is_null());
         assert!(summary["max"]["chunks_written"].is_null());
+        assert!(summary["max"]["skeleton_bytes_written"].is_null());
         // No known value stays null; a fabricated zero total is a lie.
         let bare = summarize(&[sample(None)]);
         assert!(bare["totals"]["blocks_written"].is_null());
         assert!(bare["max"]["blocks_written"].is_null());
+        assert!(bare["totals"]["skeleton_bytes_written"].is_null());
+        assert!(bare["max"]["skeleton_bytes_written"].is_null());
+        let native = |bytes| {
+            let mut values = SampleValues::from(SaveSample::default());
+            values.skeleton_bytes_written = Some(bytes);
+            sample(Some(values))
+        };
+        let native_summary = summarize(&[native(0), native(37), native(11)]);
+        assert_eq!(native_summary["totals"]["skeleton_bytes_written"], 48);
+        assert_eq!(native_summary["max"]["skeleton_bytes_written"], 37);
+        let zero = summarize(&[native(0)]);
+        assert_eq!(zero["totals"]["skeleton_bytes_written"], 0);
+        assert_eq!(zero["max"]["skeleton_bytes_written"], 0);
     }
 
     #[test]
@@ -1617,6 +1651,11 @@ mod tests {
         assert_eq!(values.blocks_written, Some(blocks.len() as u64));
         assert_eq!(values.chunks_written, None);
         assert_eq!(values.chunk_bytes_written, None);
+        assert_eq!(values.skeleton_bytes_written, None);
+        assert_eq!(
+            values.skeleton_bytes_written_missing_reason,
+            Some("backend:blob")
+        );
         assert_eq!(values.chunks_written_missing_reason, Some("backend:blob"));
         assert_eq!(
             values.chunk_bytes_written_missing_reason,
@@ -1646,8 +1685,8 @@ mod tests {
                 "session_index",
             ]
         );
-        // The v2 fields live on samples/report only; the workload hash input
-        // (events + save_parameters) must not move.
+        // Measurement fields live on samples/report only; the workload hash
+        // input (events + save_parameters) must not move.
         assert_eq!(
             json_hash(&events("append-1m", 1)).unwrap(),
             json_hash(&events("append-1m", 1)).unwrap()
@@ -1801,8 +1840,31 @@ mod tests {
         assert_eq!(values.blocks_written, Some(1));
         assert!(values.chunks_written.is_some_and(|count| count >= 1));
         assert!(values.chunk_bytes_written.is_some_and(|count| count > 0));
+        assert!(values.skeleton_bytes_written.is_some_and(|count| count > 0));
         assert_eq!(values.chunks_written_missing_reason, None);
         assert_eq!(values.chunk_bytes_written_missing_reason, None);
+        assert_eq!(values.skeleton_bytes_written_missing_reason, None);
+        let final_event = events("append-1m", 1).pop().unwrap();
+        let unchanged = save_event(
+            &store,
+            &mut transcript,
+            id,
+            &final_event,
+            Instant::now(),
+            blocks.len(),
+            true,
+        )
+        .unwrap()
+        .values
+        .unwrap();
+        assert_eq!(unchanged.blocks_written, Some(0));
+        assert_eq!(unchanged.chunks_written, Some(0));
+        assert_eq!(unchanged.chunk_bytes_written, Some(0));
+        assert_eq!(unchanged.skeleton_bytes_written, Some(0));
+        assert_eq!(unchanged.skeleton_bytes_written_missing_reason, None);
+        // Rendering still encodes the full dirty block even when comparison
+        // finds nothing to commit; encoding bytes are not write bytes.
+        assert!(unchanged.serialized_bytes > 0);
     }
 
     #[test]
@@ -1831,6 +1893,8 @@ mod tests {
                 "projection_ns",
                 "reason",
                 "serialized_bytes",
+                "skeleton_bytes_written",
+                "skeleton_bytes_written_missing_reason",
                 "succeeded"
             ]
         );
@@ -1843,6 +1907,10 @@ mod tests {
                 || !value.is_string()));
         assert_eq!(sample["chunks_written_missing_reason"], "backend:blob");
         assert_eq!(sample["chunk_bytes_written_missing_reason"], "backend:blob");
+        assert_eq!(
+            sample["skeleton_bytes_written_missing_reason"],
+            "backend:blob"
+        );
     }
 
     #[test]

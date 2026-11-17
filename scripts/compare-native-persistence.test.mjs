@@ -1,4 +1,4 @@
-// Fork-local (Monoptah). Synthetic schema-v2 runs only; no database or Rust build.
+// Fork-local (Monoptah). Synthetic schema-v3 runs only; no database or Rust build.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -59,8 +59,10 @@ function run(written = 1000, scenario = "append-1m", mode = "blob") {
       blocks_written: native ? 1 : 6,
       chunks_written: native ? 2 : null,
       chunk_bytes_written: native ? 65536 : null,
+      skeleton_bytes_written: native ? 256 : null,
       chunks_written_missing_reason: native ? null : "backend:blob",
       chunk_bytes_written_missing_reason: native ? null : "backend:blob",
+      skeleton_bytes_written_missing_reason: native ? null : "backend:blob",
     },
   }));
   const metrics = {
@@ -69,6 +71,7 @@ function run(written = 1000, scenario = "append-1m", mode = "blob") {
     lock_wait_ns: null, lock_held_ns: null,
     blocks_written: native ? 1 : 6, chunks_written: native ? 2 : null,
     chunk_bytes_written: native ? 65536 : null,
+    skeleton_bytes_written: native ? 256 : null,
   };
   const idleConversion = {
     attempted: false, completed: false, elapsed_ns: null,
@@ -80,7 +83,7 @@ function run(written = 1000, scenario = "append-1m", mode = "blob") {
     io_before: 10, io_after: 10, process_written_bytes: 0, database_bytes: 4096, wal_bytes: 0,
   };
   return {
-    schema_version: 2, scenario, status: "complete", incomplete_reasons: [],
+    schema_version: 3, scenario, status: "complete", incomplete_reasons: [],
     backend: native
       ? { kind: "native_chunks", mode_version: 1 }
       : { kind: "blob", mode_version: null },
@@ -210,7 +213,7 @@ test("missing_counts_are_not_zero", () => {
   assert.equal(metric(result, "whole_run_process_written_bytes").after, null);
   assert.equal(result.cases[0].experiment_cost.pair_process_lifetime_written_bytes, null);
   const valid = compareRuns(run(), run(100));
-  for (const path of ["summary.totals.lock_wait_ns", "summary.max.lock_held_ns", "ui_response_ns", "summary.p95_ns", "samples.0.values.chunks_written", "samples.0.values.chunk_bytes_written", "summary.totals.chunk_bytes_written"]) {
+  for (const path of ["summary.totals.lock_wait_ns", "summary.max.lock_held_ns", "ui_response_ns", "summary.p95_ns", "samples.0.values.chunks_written", "samples.0.values.chunk_bytes_written", "summary.totals.chunk_bytes_written", "samples.0.values.skeleton_bytes_written", "summary.totals.skeleton_bytes_written", "summary.max.skeleton_bytes_written"]) {
     assert.equal(metric(valid, path).before, null);
     assert.equal(metric(valid, path).improvement_rate, null);
     assert.ok(metric(valid, path).missing_reason);
@@ -393,7 +396,7 @@ test("rejects missing fields, wrong shapes, unsafe numbers and unknown schema wi
 
 test("exposes totals, maxima, stage sizes and sample measurements without mixing units", () => {
   const result = compareRuns(run(), run(100));
-  for (const key of [...metricNames, "blocks_written", "chunks_written", "chunk_bytes_written"]) {
+  for (const key of [...metricNames, "blocks_written", "chunks_written", "chunk_bytes_written", "skeleton_bytes_written"]) {
     assert.ok(metric(result, `summary.totals.${key}`));
     assert.ok(metric(result, `summary.max.${key}`));
   }
@@ -407,27 +410,32 @@ test("exposes totals, maxima, stage sizes and sample measurements without mixing
   assert.equal(metric(result, "samples.0.values.blocks_written").before, 6);
 });
 
-test("v2 only: a v1 input is rejected on either side with schema_version field-path reasons", () => {
-  const v1 = (written) => {
-    const r = run(written);
-    r.schema_version = 1;
-    delete r.backend;
-    delete r.stages.conversion;
+test("v3 only: v1 and v2 inputs are rejected on either side with schema_version reasons", () => {
+  const legacy = (version) => {
+    const r = run();
+    r.schema_version = version;
     for (const s of r.samples) {
-      delete s.values.blocks_written;
-      delete s.values.chunks_written;
-      delete s.values.chunk_bytes_written;
-      delete s.values.chunks_written_missing_reason;
-      delete s.values.chunk_bytes_written_missing_reason;
+      delete s.values.skeleton_bytes_written;
+      delete s.values.skeleton_bytes_written_missing_reason;
     }
-    for (const kind of ["totals", "max"]) {
-      for (const key of ["blocks_written", "chunks_written", "chunk_bytes_written"]) delete r.summary[kind][key];
+    for (const kind of ["totals", "max"]) delete r.summary[kind].skeleton_bytes_written;
+    if (version === 1) {
+      delete r.backend;
+      delete r.stages.conversion;
+      for (const s of r.samples) {
+        for (const key of ["blocks_written", "chunks_written", "chunk_bytes_written", "chunks_written_missing_reason", "chunk_bytes_written_missing_reason"]) delete s.values[key];
+      }
+      for (const kind of ["totals", "max"]) {
+        for (const key of ["blocks_written", "chunks_written", "chunk_bytes_written"]) delete r.summary[kind][key];
+      }
     }
     return r;
   };
-  rejected(v1(), run(100), "before.schema_version");
-  rejected(run(), v1(100), "after.schema_version");
-  rejected(v1(), v1(100), "schema_version");
+  for (const version of [1, 2]) {
+    rejected(legacy(version), run(100), "before.schema_version");
+    rejected(run(), legacy(version), "after.schema_version");
+    rejected(legacy(version), legacy(version), "schema_version");
+  }
 });
 
 test("accepts the batch-2 shape: a blob before paired with a native_chunks after", () => {
@@ -466,6 +474,75 @@ test("rejects backend mode lies, same-kind mode mismatches and native reason lie
   const reasonLie = run(100, "append-1m", "native_chunks");
   reasonLie.samples[0].values.chunks_written_missing_reason = "backend:blob";
   rejected(run(100, "append-1m", "native_chunks"), reasonLie, "chunks_written");
+});
+
+test("v3 exposes skeleton counters with backend reasons, totals and maxima", () => {
+  const result = compareRuns(run(), run(100, "append-1m", "native_chunks"));
+  assert.equal(result.comparable, true, JSON.stringify(result.reasons));
+  assert.deepEqual(metric(result, "samples.0.values.skeleton_bytes_written"), {
+    before: null, after: 256, absolute_difference: null, improvement_rate: null, missing_reason: "backend:blob",
+  });
+  assert.equal(metric(result, "summary.totals.skeleton_bytes_written").after, 1280);
+  assert.equal(metric(result, "summary.max.skeleton_bytes_written").after, 256);
+  assert.equal(metric(result, "summary.totals.chunk_bytes_written").after, 327680);
+  const before = run(1000, "append-1m", "native_chunks");
+  const after = run(100, "append-1m", "native_chunks");
+  for (const s of after.samples) s.values.skeleton_bytes_written = 0;
+  after.summary.totals.skeleton_bytes_written = 0;
+  after.summary.max.skeleton_bytes_written = 0;
+  const zero = compareRuns(before, after);
+  assert.equal(zero.comparable, true, JSON.stringify(zero.reasons));
+  assert.deepEqual(metric(zero, "summary.totals.skeleton_bytes_written"), {
+    before: 1280, after: 0, absolute_difference: -1280, improvement_rate: 1, missing_reason: null,
+  });
+});
+
+test("rejects native null counters and blob numeric counters even with consistent summaries", () => {
+  for (const key of ["chunks_written", "chunk_bytes_written", "skeleton_bytes_written"]) {
+    const native = run(100, "append-1m", "native_chunks");
+    for (const s of native.samples) {
+      s.values[key] = null;
+      s.values[`${key}_missing_reason`] = "backend:blob";
+    }
+    native.summary.totals[key] = null;
+    native.summary.max[key] = null;
+    rejected(run(1000, "append-1m", "native_chunks"), native, `samples.0.values.${key}`);
+    const blob = run(100);
+    for (const s of blob.samples) {
+      s.values[key] = 1;
+      s.values[`${key}_missing_reason`] = null;
+    }
+    blob.summary.totals[key] = blob.samples.length;
+    blob.summary.max[key] = 1;
+    rejected(run(), blob, `samples.0.values.${key}`);
+  }
+});
+
+test("requires skeleton fields and rejects invalid numbers, reasons and lying summaries", () => {
+  for (const mode of ["blob", "native_chunks"]) {
+    const baseline = () => run(100, "append-1m", mode);
+    for (const key of ["skeleton_bytes_written", "skeleton_bytes_written_missing_reason"]) {
+      const after = baseline();
+      delete after.samples[0].values[key];
+      rejected(baseline(), after, `samples.0.values.${key}`);
+    }
+    for (const kind of ["totals", "max"]) {
+      const missing = baseline();
+      delete missing.summary[kind].skeleton_bytes_written;
+      rejected(baseline(), missing, `summary.${kind}.skeleton_bytes_written`);
+      const lying = baseline();
+      lying.summary[kind].skeleton_bytes_written = mode === "blob" ? 0 : 9999;
+      rejected(baseline(), lying, `summary.${kind}.skeleton_bytes_written`);
+    }
+    const reasonLie = baseline();
+    reasonLie.samples[0].values.skeleton_bytes_written_missing_reason = mode === "blob" ? null : "backend:blob";
+    rejected(baseline(), reasonLie, "samples.0.values.skeleton_bytes_written");
+  }
+  for (const value of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1, "256"]) {
+    const after = run(100, "append-1m", "native_chunks");
+    after.samples[0].values.skeleton_bytes_written = value;
+    rejected(run(1000, "append-1m", "native_chunks"), after, "samples.0.values.skeleton_bytes_written");
+  }
 });
 
 test("refuses to pair a supplemental run on either side, from manifest or report label", () => {

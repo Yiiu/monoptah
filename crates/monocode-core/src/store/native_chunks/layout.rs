@@ -18,14 +18,12 @@
 //!   (serialized JSON never contains a raw control byte, and a whole element
 //!   always starts with `{`), so the splice concatenates it without the
 //!   separating comma. Row-boundary chunks remain the norm.
-//! - A block member whose serialized value alone exceeds the target — a long
-//!   answer's `text`, a tool's `nativeInput`/`detail` — is stripped from the
-//!   skeleton, so the `native_blocks` row stays small. `text` is marked with
-//!   [`TEXT_SENTINEL`] and restored by joining the block's leading row group
-//!   (the projection splits it at row boundaries, so the join is exact — and
-//!   the writer verifies the join before stripping). Tool payload members are
-//!   marked with [`PAYLOAD_PLACEHOLDER`] and restored from segmented copies in
-//!   `native_payloads`, substituted in the order their placeholders appear.
+//! - Oversized string values, including nested captions and unknown metadata,
+//!   are stripped from the skeleton into segmented `native_payloads`. The root
+//!   block ID stays inline for indexing. Plain `text` exactly recoverable from
+//!   the leading row group uses [`TEXT_SENTINEL`]; other strings use
+//!   [`PAYLOAD_PLACEHOLDER`], substituted in serialization order. This bounds
+//!   giant string copies, not arbitrary keys or containers of small values.
 use crate::transcript::Row;
 use rusqlite::Connection;
 
@@ -161,11 +159,104 @@ pub(crate) struct StoredForm {
     pub payloads: Vec<String>,
 }
 
-/// Build one block's full stored form, stripping members whose serialized
-/// value alone exceeds [`CHUNK_TARGET_BYTES`] so the `native_blocks` row
-/// stays bounded. A block without giant members stores exactly the bytes
-/// [`block_skeleton`] produces today.
+/// Strip strings larger than [`CHUNK_TARGET_BYTES`] at any nested location,
+/// except the root block ID used by the writer. Small blocks retain their raw
+/// representation. Large keys or containers of small values can still be large.
 pub(crate) fn store_block_form(
+    value: &serde_json::Value,
+    raw: &str,
+    rows: &[Row],
+) -> Result<StoredForm, String> {
+    refuse_reserved_markers(raw)?;
+    let has_giant = value.as_object().is_some_and(|object| {
+        object
+            .iter()
+            .any(|(key, member)| key != "id" && contains_giant_string(member))
+    });
+    if !has_giant {
+        let (skeleton, elements) = block_skeleton(raw, rows)?;
+        return Ok(StoredForm {
+            skeleton,
+            elements,
+            payloads: Vec::new(),
+        });
+    }
+    let mut stripped = value.clone();
+    if value["text"].as_str().is_some_and(|text| {
+        text.len() > CHUNK_TARGET_BYTES && text_matches_leading_rows(text, rows)
+    }) {
+        stripped["text"] = serde_json::Value::String(TEXT_SENTINEL.into());
+    }
+    let mut payloads = Vec::new();
+    for (key, member) in stripped.as_object_mut().unwrap() {
+        if key != "id" {
+            strip_giant_strings(member, &mut payloads)?;
+        }
+    }
+    let stripped_raw = serde_json::to_string(&stripped).map_err(|error| error.to_string())?;
+    let (skeleton, elements) = splice_skeleton(&stripped_raw, rows)?;
+    Ok(StoredForm {
+        skeleton,
+        elements,
+        payloads,
+    })
+}
+
+fn contains_giant_string(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(text) => text.len() > CHUNK_TARGET_BYTES,
+        serde_json::Value::Array(values) => values.iter().any(contains_giant_string),
+        serde_json::Value::Object(object) => object.values().any(contains_giant_string),
+        _ => false,
+    }
+}
+
+/// Traversal follows serde_json's serialization order, matching the reader's
+/// placeholder splice even when the payloads occur in nested arrays/objects.
+fn strip_giant_strings(
+    value: &mut serde_json::Value,
+    payloads: &mut Vec<String>,
+) -> Result<(), String> {
+    match value {
+        serde_json::Value::String(text) if text.len() > CHUNK_TARGET_BYTES => {
+            payloads.push(serde_json::to_string(text).map_err(|error| error.to_string())?);
+            *value = serde_json::Value::String(PAYLOAD_PLACEHOLDER.into());
+        }
+        serde_json::Value::Array(values) => {
+            for member in values {
+                strip_giant_strings(member, payloads)?;
+            }
+        }
+        serde_json::Value::Object(object) => {
+            for member in object.values_mut() {
+                strip_giant_strings(member, payloads)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Check the projection's inverse without allocating another giant joined copy.
+fn text_matches_leading_rows(mut text: &str, rows: &[Row]) -> bool {
+    if rows.is_empty() {
+        return false;
+    }
+    for (index, row) in rows.iter().enumerate() {
+        if index > 0 && row.first {
+            break;
+        }
+        let Some(rest) = text.strip_prefix(row.text.as_str()) else {
+            return false;
+        };
+        text = rest;
+    }
+    text.is_empty()
+}
+
+/// The original mode-1 canonical form, retained for strict export verification
+/// of blocks saved before oversized display and metadata strings were stripped.
+pub(super) fn legacy_store_block_form(
     value: &serde_json::Value,
     raw: &str,
     rows: &[Row],
@@ -202,15 +293,7 @@ fn strip_giant_members(
     // not a plain split of its text (an interjection's serialized note, a
     // hidden draft with no rows) keeps its text inline.
     let strip_text = value["text"].as_str().is_some_and(|text| {
-        text.len() > CHUNK_TARGET_BYTES && !rows.is_empty() && {
-            let end = rows
-                .iter()
-                .skip(1)
-                .position(|row| row.first)
-                .map_or(rows.len(), |position| position + 1);
-            let joined: String = rows[..end].iter().map(|row| row.text.as_str()).collect();
-            joined == text
-        }
+        text.len() > CHUNK_TARGET_BYTES && text_matches_leading_rows(text, rows)
     });
     let mut tool_members: Vec<&str> = Vec::new();
     for (key, member) in value["tool"].as_object().into_iter().flatten() {

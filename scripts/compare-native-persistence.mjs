@@ -1,14 +1,14 @@
-// Fork-local (Monoptah). Compares two transcript_save_probe schema-v2 results.
+// Fork-local (Monoptah). Compares two transcript_save_probe schema-v3 results.
 import { readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const STAGES = ["setup", "conversion", "hot", "final_save", "checkpoint", "close", "restart"];
 const SCENARIOS = ["append-1m", "append-10m", "append-40m", "same-value", "early-tool", "large-tool", "long-answer", "parallel"];
-const METRICS = ["history_bytes_read", "serialized_bytes", "changed_rows", "commit_count", "projection_ns", "encoding_ns", "commit_ns", "save_ns", "lock_wait_ns", "lock_held_ns", "blocks_written", "chunks_written", "chunk_bytes_written"];
-// Chunk counters exist only on the chunked backend; null carries the blob reason.
-const CHUNK_COUNTERS = ["chunks_written", "chunk_bytes_written"];
-const NEW_COUNTERS = ["blocks_written", "chunks_written", "chunk_bytes_written"];
+const METRICS = ["history_bytes_read", "serialized_bytes", "changed_rows", "commit_count", "projection_ns", "encoding_ns", "commit_ns", "save_ns", "lock_wait_ns", "lock_held_ns", "blocks_written", "chunks_written", "chunk_bytes_written", "skeleton_bytes_written"];
+// Native write counters are numeric on native_chunks, null with a reason on blob.
+const NATIVE_COUNTERS = ["chunks_written", "chunk_bytes_written", "skeleton_bytes_written"];
+const NEW_COUNTERS = ["blocks_written", ...NATIVE_COUNTERS];
 const INTEGRITY_FLAGS = ["initial_fixture_matches", "rows_match", "completed_history_match", "unknown_metadata_match", "receipts_match", "queue_match", "restart_match", "sqlite_ok"];
 const RETAINED_HASHES = ["completed_history_sha256", "unknown_metadata_sha256", "receipts_sha256", "queue_sha256"];
 const BUDGET = 536870912;
@@ -40,7 +40,7 @@ const object = (fields) => (v, path, reasons) => {
 const reason = field((v) => v === "routine" || v === "final", "save reason");
 const backendReason = field((v) => v === "backend:blob", "backend:blob reason");
 const metricFields = Object.fromEntries(METRICS.map((key) => [key,
-  key.startsWith("lock_") ? literal(null) : CHUNK_COUNTERS.includes(key) ? nullable(count) : count,
+  key.startsWith("lock_") ? literal(null) : NATIVE_COUNTERS.includes(key) ? nullable(count) : count,
 ]));
 const backend = object({
   kind: field((v) => v === "blob" || v === "native_chunks", "storage backend kind"),
@@ -62,6 +62,7 @@ const sample = object({
   process_written_bytes: nullable(count), values: nullable(object({
     ...Object.fromEntries(Object.entries(metricFields).filter(([key]) => key !== "save_ns")),
     reason, succeeded: boolean,
+    skeleton_bytes_written_missing_reason: nullable(backendReason),
     chunks_written_missing_reason: nullable(backendReason),
     chunk_bytes_written_missing_reason: nullable(backendReason),
   })),
@@ -72,7 +73,7 @@ const stage = object({
   database_bytes: nullable(count), wal_bytes: nullable(count),
 });
 const runSchema = object({
-  schema_version: literal(2),
+  schema_version: literal(3),
   scenario: nullable(field((v) => SCENARIOS.includes(v), "scenario ID")),
   status: field((v) => ["complete", "incomplete", "skipped"].includes(v), "run status"),
   incomplete_reasons: array(field((v) => typeof v === "string" && /^[a-z][a-z0-9_]*$/.test(v), "fixed reason code")),
@@ -213,13 +214,15 @@ function validateRun(run, side, reasons) {
     }
     check(s.started_ms >= s.logical_ms && s.completed_ms >= s.started_ms, path, "invalid event timing");
     check(s.values?.succeeded === true, `${path}.values`, "sample failed or values unavailable");
-    // blocks_written is populated on both backends; a null chunk counter must
-    // carry exactly the blob backend's missing reason, never none.
+    // blocks_written is populated on both backends. Native-only counters
+    // must match the declared backend as well as their explicit missing reason.
     check(isCount(s.values?.blocks_written), `${path}.values.blocks_written`, "blocks written unavailable");
-    for (const key of CHUNK_COUNTERS) {
-      const missing = s.values?.[key] == null;
-      check(missing ? s.values?.[`${key}_missing_reason`] === "backend:blob" : s.values?.[`${key}_missing_reason`] == null,
-        `${path}.values.${key}`, "chunk counter and missing reason disagree");
+    for (const key of NATIVE_COUNTERS) {
+      const blob = run.backend.kind === "blob";
+      check(blob ? s.values?.[key] === null : isCount(s.values?.[key]),
+        `${path}.values.${key}`, "counter contradicts storage backend");
+      check(s.values?.[`${key}_missing_reason`] === (blob ? "backend:blob" : null),
+        `${path}.values.${key}`, "counter and missing reason disagree");
     }
     if (run.backend.kind === "blob" && m) {
       // No declared workload operation adds or removes a block, so the blob
@@ -268,9 +271,9 @@ function measurement(before, after, path, comparable) {
   const a = get(before, path);
   const b = get(after, path);
   const known = isCount(a) && isCount(b);
-  // A chunk counter absent because that side ran the blob backend, and an
+  // A native counter absent because that side ran the blob backend, and an
   // unattempted conversion stage, carry their own explicit reasons.
-  const blobMissing = CHUNK_COUNTERS.some((key) => path.endsWith(`.${key}`))
+  const blobMissing = NATIVE_COUNTERS.some((key) => path.endsWith(`.${key}`))
     && [[before, a], [after, b]].some(([run, value]) => value == null && get(run, "backend.kind") === "blob");
   const conversionIdle = path.startsWith("stages.conversion")
     && [[before, a], [after, b]].some(([run, value]) => value == null && !get(run, "stages.conversion.attempted"));

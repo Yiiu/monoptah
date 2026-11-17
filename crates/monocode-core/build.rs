@@ -74,7 +74,10 @@ fn main() {
         files.sort_unstable();
         files.dedup();
         let mut args = vec!["diff", "HEAD", "--binary", "--"];
-        args.extend(files.iter().copied());
+        // Expanding the source list into arguments exceeds Windows' command-line
+        // limit (already > 52k characters). Directory pathspecs keep this bounded
+        // and conservatively include any tracked metadata changes in the scope.
+        args.extend(scope);
         if let Some(patch) = output(root, "git", &args) {
             diff.update(patch);
         } else {

@@ -1004,7 +1004,7 @@ impl Store {
         if self.remote_session(session)?.is_some() {
             return Err("Remote transcripts are owned by the host".into());
         }
-        self.shared_blocks(session)
+        self.shared_stored_blocks(session)
     }
     /// Store a session's whole block list through its active backend: the
     /// chunked writer for a chunked session (its `blocks_json` stays
@@ -1024,7 +1024,7 @@ impl Store {
         if self.shared.is_none() {
             return Err("Stored blocks exist only in the desktop schema".into());
         }
-        self.shared_store_blocks(session, blocks)
+        self.shared_store_blocks_atomic(session, blocks)
     }
     pub fn load(&self, session: i64) -> Result<Transcript, String> {
         if let Some(remote) = self.remote_session(session)? {

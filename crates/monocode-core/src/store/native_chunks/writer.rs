@@ -112,16 +112,19 @@ impl Clone for BlockUpdate {
 }
 
 /// What one sparse flush did: the session revision after the commit, and the
-/// block/chunk write counters `SaveSample` records and the probe's v2 samples
+/// block/chunk write counters `SaveSample` records and the probe's v3 samples
 /// report. `chunks_written` and `chunk_bytes_written` count only the chunks
-/// (and payload segments) whose bytes were written, not the block's whole
-/// payload.
+/// (and payload segments) whose bytes were written. `skeleton_bytes_written`
+/// counts the skeleton JSON supplied to block upserts, including unchanged
+/// skeletons submitted again with a changed block. Their sum is transcript JSON
+/// bytes, excluding scalar metadata, indexes and SQLite page/WAL overhead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SparseFlush {
     pub session_revision: i64,
     pub blocks_written: u64,
     pub chunks_written: u64,
     pub chunk_bytes_written: u64,
+    pub skeleton_bytes_written: u64,
 }
 
 /// Every way a sparse flush refuses or fails. Distinct refusals — unknown
@@ -211,6 +214,7 @@ pub(crate) fn block_index(
     conn: &Connection,
     session_id: &str,
 ) -> rusqlite::Result<Vec<StoredBlockIndex>> {
+    super::session_storage_mode(conn, session_id)?;
     let mut stmt = conn.prepare(
         "SELECT block_seq,block_id,first_row,row_count,block_revision
          FROM native_blocks WHERE session_id=?1 ORDER BY block_seq",
@@ -239,6 +243,7 @@ pub(crate) fn session_revision(
     if !super::has_native_sessions(conn)? {
         return Ok(None);
     }
+    super::session_storage_mode(conn, session_id)?;
     conn.query_row(
         "SELECT session_revision FROM native_sessions WHERE session_id=?1",
         [session_id],
@@ -306,6 +311,7 @@ pub(crate) fn flush_sparse_tx(
         blocks_written: 0,
         chunks_written: 0,
         chunk_bytes_written: 0,
+        skeleton_bytes_written: 0,
     };
     // Where the next appended block may land; tail growth moves this forward.
     let mut tail_extent = total_rows;
@@ -350,7 +356,7 @@ pub(crate) fn flush_sparse_tx(
                 &mut stats,
             )?;
             tail_extent += planned;
-            next_append_seq += 1;
+            next_append_seq = block.block_seq + 1;
             continue;
         };
         // The block must sit exactly where the plan placed it; anything else
@@ -435,6 +441,7 @@ pub(crate) fn replace_blocks_tx(
         blocks_written: 0,
         chunks_written: 0,
         chunk_bytes_written: 0,
+        skeleton_bytes_written: 0,
     };
     let mut deleted = false;
     for stored in &index {
@@ -647,6 +654,7 @@ fn write_block(
         ],
     )?;
     stats.blocks_written += 1;
+    stats.skeleton_bytes_written += update.skeleton.len() as u64;
     Ok(())
 }
 

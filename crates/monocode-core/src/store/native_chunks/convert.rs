@@ -14,14 +14,16 @@
 //! block re-stores to its exact stored form) and deletes the native copy in
 //! the same transaction that restores the blob, so a stale native copy can
 //! never sit behind a Blob marker and resurrect if the marker flips again.
-use super::layout::{pack_payload_segments, pack_stored_chunks, CHUNK_TARGET_BYTES};
+use super::layout::{
+    legacy_store_block_form, pack_payload_segments, pack_stored_chunks, StoredForm,
+    CHUNK_TARGET_BYTES,
+};
 use super::writer::{replace_blocks_tx, BlockUpdate};
 use super::{
     iter_full_history, marker_mode_version, page_rows, session_storage_mode, store_block_form,
     StorageMode,
 };
-use crate::store::shared::blocks;
-use crate::store::shared::handle;
+use crate::store::shared::{blocks, handle, HistoryRevision};
 use rusqlite::{Connection, OptionalExtension};
 use std::path::PathBuf;
 
@@ -35,6 +37,8 @@ pub struct ConversionReport {
     pub blocks: u64,
     pub chunks: u64,
     pub bytes_written: u64,
+    /// The revision committed by this conversion, before any subsequent writer.
+    pub session_revision: i64,
 }
 
 /// Every way a conversion refuses. Distinct refusals — a session that is not
@@ -128,6 +132,8 @@ pub(crate) enum ConversionStage {
 std::thread_local! {
     static FAIL_NEXT_STAGE: std::cell::RefCell<Option<ConversionStage>> =
         const { std::cell::RefCell::new(None) };
+    static AFTER_BACKUP_COPY: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Arm a one-shot failure at a conversion stage (test only).
@@ -167,8 +173,10 @@ const BACKUP_BUSY_PAUSE: std::time::Duration = std::time::Duration::from_millis(
 pub(crate) fn convert_session_to_native(
     conn: &mut Connection,
     session_id: &str,
+    expected: Option<HistoryRevision>,
 ) -> Result<ConversionReport, ConversionError> {
     // Refuse before touching anything: the session must be an ordinary blob.
+    let source_version: i64 = conn.query_row("PRAGMA data_version", [], |row| row.get(0))?;
     let committed: Option<String> = conn
         .query_row(
             "SELECT blocks_json FROM sessions WHERE id=?1",
@@ -185,9 +193,16 @@ pub(crate) fn convert_session_to_native(
     if indexed_history(conn, session_id)? {
         return Err(ConversionError::IndexedHistory);
     }
-    take_consistency_backup(conn, session_id, &committed)?;
+    let backup = take_consistency_backup(conn, session_id, &committed)?;
     conn.execute_batch("BEGIN IMMEDIATE")?;
-    match convert_tx(conn, session_id, &committed) {
+    match convert_tx(
+        conn,
+        session_id,
+        &committed,
+        source_version,
+        expected,
+        backup,
+    ) {
         Ok(report) => {
             // The chunk-build stage: every block, chunk and payload segment is
             // written but uncommitted.
@@ -221,6 +236,9 @@ fn convert_tx(
     conn: &Connection,
     session_id: &str,
     backed_up: &str,
+    source_version: i64,
+    expected: Option<HistoryRevision>,
+    backup: Option<ConsistencyBackup>,
 ) -> Result<ConversionReport, ConversionError> {
     // BEGIN IMMEDIATE holds the write lock, so these re-reads see exactly the
     // state the conversion builds on.
@@ -235,14 +253,20 @@ fn convert_tx(
         [session_id],
         |row| row.get(0),
     )?;
-    if raw != backed_up {
+    let current_version: i64 = conn.query_row("PRAGMA data_version", [], |row| row.get(0))?;
+    if raw != backed_up || current_version != source_version {
         return Err(ConversionError::Backup(
-            "the conversation changed while its backup was taken; retry the conversion".into(),
+            "the database changed while its backup was taken; retry the conversion".into(),
         ));
     }
     let blocks: Vec<serde_json::Value> = serde_json::from_str(&raw).map_err(|error| {
         ConversionError::Refused(format!("the stored blob is not valid JSON: {error}"))
     })?;
+    if expected.is_some_and(|revision| !revision.matches(&blocks)) {
+        return Err(ConversionError::Refused(
+            "the conversation changed since it was loaded; reopen it before converting".into(),
+        ));
+    }
     // Render every block's stored form before writing anything, so a refusal
     // (a reserved marker, a block carrying its own `rows` member) refuses the
     // whole session up front — never one block, never partially.
@@ -262,12 +286,22 @@ fn convert_tx(
             payloads: form.payloads,
         });
     }
-    // The marker lands first, at revision 0, and the blocks go through the
-    // writer's own full-replace path — the canonical packing the anchored
-    // rewrite on every later save assumes, never a hand-rolled chunk layout.
+    // Only the attempt that still owns this source snapshot may replace the
+    // recovery point. A late failed attempt must not publish an older backup.
+    if let Some(backup) = backup {
+        backup.publish()?;
+    }
+    // A conversion starts a fresh revision range. Reusing zero would let a
+    // stale native handle match again after downgrade/reconversion (ABA).
+    // Keep 62 random bits and ample headroom for subsequent increments.
+    let initial_revision = (rand::random::<u64>() & ((1_u64 << 62) - 1)) as i64;
     conn.execute(
-        "INSERT INTO native_sessions(session_id,mode_version,session_revision) VALUES(?1,?2,0)",
-        rusqlite::params![session_id, i64::from(super::NATIVE_CHUNKS_MODE_VERSION)],
+        "INSERT INTO native_sessions(session_id,mode_version,session_revision) VALUES(?1,?2,?3)",
+        rusqlite::params![
+            session_id,
+            i64::from(super::NATIVE_CHUNKS_MODE_VERSION),
+            initial_revision
+        ],
     )?;
     #[cfg(test)]
     {
@@ -275,12 +309,13 @@ fn convert_tx(
             return Err(ConversionError::Interrupted(ConversionStage::Marker));
         }
     }
-    let flush = replace_blocks_tx(conn, session_id, 0, &updates)
+    let flush = replace_blocks_tx(conn, session_id, initial_revision, &updates)
         .map_err(|error| ConversionError::Writer(error.to_string()))?;
     Ok(ConversionReport {
         blocks: flush.blocks_written,
         chunks: flush.chunks_written,
         bytes_written: flush.chunk_bytes_written,
+        session_revision: flush.session_revision,
     })
 }
 
@@ -296,7 +331,23 @@ fn convert_tx(
 pub(crate) fn export_downgrade_to_blob(
     conn: &mut Connection,
     session_id: &str,
-) -> Result<(), String> {
+    expected_revision: Option<i64>,
+) -> Result<HistoryRevision, String> {
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    let snapshot = downgrade_tx(&tx, session_id, expected_revision)?;
+    tx.commit().map_err(|error| error.to_string())?;
+    Ok(snapshot)
+}
+
+fn downgrade_tx(
+    conn: &Connection,
+    session_id: &str,
+    expected_revision: Option<i64>,
+) -> Result<HistoryRevision, String> {
+    // Another handle may already have exported and removed the native copy.
+    // Check after acquiring the write lock, before interpreting native rows.
     if matches!(
         session_storage_mode(conn, session_id).map_err(|error| error.to_string())?,
         StorageMode::Blob
@@ -305,20 +356,10 @@ pub(crate) fn export_downgrade_to_blob(
             "This conversation has no chunked-storage marker; there is nothing to downgrade".into(),
         );
     }
-    conn.execute_batch("BEGIN IMMEDIATE")
-        .map_err(|error| error.to_string())?;
-    match downgrade_tx(conn, session_id) {
-        Ok(()) => conn
-            .execute_batch("COMMIT")
-            .map_err(|error| error.to_string()),
-        Err(error) => {
-            let _ = conn.execute_batch("ROLLBACK");
-            Err(error)
-        }
+    let revision = super::session_revision(conn, session_id).map_err(|error| error.to_string())?;
+    if expected_revision.is_some_and(|expected| revision != Some(expected)) {
+        return Err("This conversation changed in another window. Reopen it before downgrading; its data was preserved.".into());
     }
-}
-
-fn downgrade_tx(conn: &Connection, session_id: &str) -> Result<(), String> {
     let mut blocks = Vec::new();
     for block in iter_full_history(conn, session_id) {
         blocks.push(block?);
@@ -347,17 +388,22 @@ fn downgrade_tx(conn: &Connection, session_id: &str) -> Result<(), String> {
         let (skeleton, chunks, payloads) =
             super::writer::stored_payload(conn, session_id, stored.block_seq)
                 .map_err(|error| error.to_string())?;
-        let same = form.skeleton == skeleton
-            && pack_stored_chunks(&form.elements, CHUNK_TARGET_BYTES) == chunks
-            && form.payloads.len() == payloads.len()
-            && form
-                .payloads
-                .iter()
-                .zip(&payloads)
-                .all(|(payload, stored)| {
-                    pack_payload_segments(payload, CHUNK_TARGET_BYTES).concat() == *stored
-                });
-        if !same {
+        let same_form = |form: &StoredForm| {
+            form.skeleton == skeleton
+                && pack_stored_chunks(&form.elements, CHUNK_TARGET_BYTES) == chunks
+                && form.payloads.len() == payloads.len()
+                && form
+                    .payloads
+                    .iter()
+                    .zip(&payloads)
+                    .all(|(payload, stored)| {
+                        pack_payload_segments(payload, CHUNK_TARGET_BYTES).concat() == *stored
+                    })
+        };
+        // Mode 1 already supports placeholders at arbitrary JSON locations.
+        // A block written before expanded stripping must still export without
+        // a normalization save; require an exact canonical match in either form.
+        if !same_form(&form) && !same_form(&legacy_store_block_form(block, &raw, &rows)?) {
             return Err(format!(
                 "Restart-equality verification failed: block {} of this conversation would not \
                  re-store to its stored form. The downgrade was refused and the native content \
@@ -415,7 +461,7 @@ fn downgrade_tx(conn: &Connection, session_id: &str) -> Result<(), String> {
         )
         .map_err(|error| error.to_string())?;
     }
-    Ok(())
+    Ok(HistoryRevision::of(&blocks))
 }
 
 /// Whether the sessions table has one column.
@@ -449,24 +495,64 @@ fn indexed_history(conn: &Connection, session_id: &str) -> rusqlite::Result<bool
     )
 }
 
+/// A complete, verified snapshot awaiting publication by its conversion.
+#[derive(Debug)]
+struct ConsistencyBackup {
+    pending: tempfile::NamedTempFile,
+    backup: PathBuf,
+}
+
+impl ConsistencyBackup {
+    fn publish(self) -> Result<(), ConversionError> {
+        let Self { pending, backup } = self;
+        let backup_error =
+            |reason: String| ConversionError::Backup(format!("{reason} at {}", backup.display()));
+        // An externally opened recovery database must be closed before its
+        // standalone snapshot can safely replace this name.
+        for sidecar in [
+            backup.with_extension("backup-wal"),
+            backup.with_extension("backup-shm"),
+        ] {
+            if sidecar.exists() {
+                return Err(backup_error(
+                    "the retained backup has SQLite sidecars; close it before retrying".into(),
+                ));
+            }
+        }
+        let published = pending
+            .persist(&backup)
+            .map_err(|error| backup_error(error.to_string()))?;
+        published
+            .sync_all()
+            .map_err(|error| backup_error(error.to_string()))?;
+        #[cfg(unix)]
+        std::fs::File::open(
+            backup
+                .parent()
+                .ok_or_else(|| backup_error("no backup directory".into()))?,
+        )
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| backup_error(error.to_string()))?;
+        Ok(())
+    }
+}
+
 /// A consistent backup of the whole database, beside the database file, taken
 /// through SQLite's online backup API from the committed state — never a
-/// filesystem copy of a live WAL database. The deterministic name is per
-/// session, so a retried conversion overwrites its own backup and concurrent
-/// conversions of different sessions keep one each. There is no app-wide
-/// backup location today (the store layer keeps none), so this documents the
-/// convention it installs: `<database>.pre-native-<session-handle>.backup`.
-/// The backup is kept after a successful conversion — it is the recovery
-/// point, not a temporary.
+/// filesystem copy of a live WAL database. One verified backup per session is
+/// retained as `<database>.pre-native-<session-handle>.backup`. Each attempt is
+/// built in a separate temporary file beside it; only a closed, verified and
+/// synced snapshot replaces the previous recovery point, atomically. A failed
+/// copy or verification never deletes or overwrites the retained backup.
 fn take_consistency_backup(
     conn: &Connection,
     session_id: &str,
     committed_blob: &str,
-) -> Result<(), ConversionError> {
+) -> Result<Option<ConsistencyBackup>, ConversionError> {
     let Some(database) = main_database_path(conn)? else {
         // An in-memory or temporary database has nothing durable to protect;
         // the transaction below is still fully atomic.
-        return Ok(());
+        return Ok(None);
     };
     let backup = PathBuf::from(format!(
         "{}.pre-native-{}.backup",
@@ -475,17 +561,27 @@ fn take_consistency_backup(
     ));
     let backup_error =
         |reason: String| ConversionError::Backup(format!("{reason} at {}", backup.display()));
-    // A leftover backup from an earlier attempt (or its sidecar files) is
-    // removed first, so every attempt writes a complete fresh copy.
-    for stale in [
+    // Never attach old WAL sidecars to the new snapshot at publication.
+    // An externally opened recovery database must be closed first.
+    for sidecar in [
         backup.with_extension("backup-wal"),
         backup.with_extension("backup-shm"),
-        backup.clone(),
     ] {
-        let _ = std::fs::remove_file(stale);
+        if sidecar.exists() {
+            return Err(backup_error(
+                "the retained backup has SQLite sidecars; close it before retrying".into(),
+            ));
+        }
     }
+    let parent = database
+        .parent()
+        .ok_or_else(|| backup_error("no database directory".into()))?;
+    let pending = tempfile::Builder::new()
+        .prefix(".native-backup-")
+        .tempfile_in(parent)
+        .map_err(|error| backup_error(error.to_string()))?;
     let mut destination =
-        Connection::open(&backup).map_err(|error| backup_error(error.to_string()))?;
+        Connection::open(pending.path()).map_err(|error| backup_error(error.to_string()))?;
     {
         use rusqlite::backup::Backup;
         let copy =
@@ -508,7 +604,34 @@ fn take_consistency_backup(
             "the backup does not hold this conversation's committed blob".into(),
         ));
     }
-    Ok(())
+    let integrity: String = destination
+        .query_row("PRAGMA quick_check", [], |row| row.get(0))
+        .map_err(|error| backup_error(error.to_string()))?;
+    if integrity != "ok" {
+        return Err(backup_error(
+            "the backup failed SQLite integrity verification".into(),
+        ));
+    }
+    // Publish a standalone database, with no WAL whose name could be left
+    // behind by the rename. This changes only the backup's journal mode.
+    destination
+        .pragma_update(None, "journal_mode", "DELETE")
+        .map_err(|error| backup_error(error.to_string()))?;
+    destination
+        .close()
+        .map_err(|(_, error)| backup_error(error.to_string()))?;
+    pending
+        .as_file()
+        .sync_all()
+        .map_err(|error| backup_error(error.to_string()))?;
+    #[cfg(test)]
+    {
+        let hook = AFTER_BACKUP_COPY.with(|hook| hook.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+    Ok(Some(ConsistencyBackup { pending, backup }))
 }
 
 /// The main database's file path, or None for in-memory and temporary
@@ -526,4 +649,133 @@ fn main_database_path(conn: &Connection) -> Result<Option<PathBuf>, ConversionEr
         .and_then(|(_, file)| file)
         .filter(|file| !file.is_empty() && file != ":memory:")
         .map(PathBuf::from))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Store;
+
+    #[test]
+    fn review_downgrade_rechecks_mode_inside_the_transaction() {
+        let store = Store::open_monocode(std::path::Path::new(":memory:")).unwrap();
+        let raw = r#"[{"id":"p","role":"user","text":"Keep"}]"#;
+        store.conn.execute(
+            "INSERT INTO sessions(id,cwd,harness,model,runtime_mode,title,blocks_json,created_at,updated_at)
+             VALUES('plain','synthetic','codex','synthetic','supervised','Synthetic',?1,1,1)", [raw],
+        ).unwrap();
+        let tx = store.conn.unchecked_transaction().unwrap();
+        // Another window has already downgraded before this transaction began.
+        assert!(downgrade_tx(&tx, "plain", None).is_err());
+        let saved: String = tx
+            .query_row(
+                "SELECT blocks_json FROM sessions WHERE id='plain'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(saved, raw);
+    }
+
+    #[test]
+    fn review_late_backup_cannot_replace_a_newer_conversion_recovery_point() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backup-race.db");
+        let mut a = Store::open_monocode(&path).unwrap();
+        let first = r#"[{"id":"p","role":"user","text":"First"}]"#;
+        let latest = r#"[{"id":"p","role":"user","text":"Latest"}]"#;
+        a.conn.execute(
+            "INSERT INTO sessions(id,cwd,harness,model,runtime_mode,title,blocks_json,created_at,updated_at)
+             VALUES('recovery','synthetic','codex','synthetic','supervised','Synthetic',?1,1,1)", [first],
+        ).unwrap();
+        let id = a.resolve_session_id("recovery").unwrap();
+        let other_path = path.clone();
+        AFTER_BACKUP_COPY.set(Some(Box::new(move || {
+            let mut b = Store::open_monocode(&other_path).unwrap();
+            b.conn
+                .execute(
+                    "UPDATE sessions SET blocks_json=?1 WHERE id='recovery'",
+                    [latest],
+                )
+                .unwrap();
+            let other = b.resolve_session_id("recovery").unwrap();
+            b.convert_session_to_chunked(other).unwrap();
+        })));
+        assert!(a.convert_session_to_chunked(id).is_err());
+        let backup = PathBuf::from(format!(
+            "{}.pre-native-{}.backup",
+            path.display(),
+            handle("recovery")
+        ));
+        let saved: String = Connection::open(&backup)
+            .unwrap()
+            .query_row(
+                "SELECT blocks_json FROM sessions WHERE id='recovery'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            saved, latest,
+            "a late old snapshot must not replace the winning conversion's backup"
+        );
+    }
+
+    #[test]
+    fn review_failed_backup_preserves_previous_verified_recovery_point() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backup.db");
+        let store = Store::open_monocode(&path).unwrap();
+        let first = r#"[{"id":"p","role":"user","text":"First"}]"#;
+        let latest = r#"[{"id":"p","role":"user","text":"Latest"}]"#;
+        store.conn.execute(
+            "INSERT INTO sessions(id,cwd,harness,model,runtime_mode,title,blocks_json,created_at,updated_at)
+             VALUES('recovery','synthetic','codex','synthetic','supervised','Synthetic',?1,1,1)",
+            [first],
+        ).unwrap();
+        take_consistency_backup(&store.conn, "recovery", first)
+            .unwrap()
+            .unwrap()
+            .publish()
+            .unwrap();
+        let backup = PathBuf::from(format!(
+            "{}.pre-native-{}.backup",
+            path.display(),
+            handle("recovery")
+        ));
+        let saved_blob = || {
+            let conn = Connection::open(&backup).unwrap();
+            conn.query_row(
+                "SELECT blocks_json FROM sessions WHERE id='recovery'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(saved_blob(), first);
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET blocks_json=?1 WHERE id='recovery'",
+                [latest],
+            )
+            .unwrap();
+        // A concurrent change makes verification fail. The unverified copy
+        // must not replace the previous verified recovery point.
+        let error = take_consistency_backup(&store.conn, "recovery", first).unwrap_err();
+        assert!(matches!(error, ConversionError::Backup(_)), "{error}");
+        assert_eq!(saved_blob(), first);
+        take_consistency_backup(&store.conn, "recovery", latest)
+            .unwrap()
+            .unwrap()
+            .publish()
+            .unwrap();
+        assert_eq!(saved_blob(), latest);
+        let retained = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".backup"))
+            .count();
+        assert_eq!(retained, 1, "only the latest verified backup is retained");
+    }
 }

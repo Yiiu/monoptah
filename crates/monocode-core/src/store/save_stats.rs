@@ -15,6 +15,8 @@ pub enum SaveReason {
 pub struct SaveSample {
     pub reason: SaveReason,
     pub history_bytes_read: u64,
+    /// Attempted block/queue JSON encoding bytes, including unchanged or
+    /// rolled-back work. This is not a committed-write counter.
     pub serialized_bytes: u64,
     pub changed_rows: usize,
     pub commit_count: u64,
@@ -30,7 +32,11 @@ pub struct SaveSample {
     /// same-value or failed native save genuinely writes none.
     pub blocks_written: u64,
     pub chunks_written: u64,
+    /// Committed chunk and payload-segment JSON bytes; excludes skeletons.
     pub chunk_bytes_written: u64,
+    /// Committed skeleton JSON bytes. Together with `chunk_bytes_written`,
+    /// counts native transcript JSON, excluding scalar/index/WAL overhead.
+    pub skeleton_bytes_written: u64,
 }
 
 /// Connection-local settings used to pair synthetic measurements. Reading these
@@ -123,7 +129,18 @@ impl SaveStats {
     }
 
     pub(super) fn finish(&self, succeeded: bool) {
-        self.update(|sample| sample.succeeded = succeeded);
+        self.update(|sample| {
+            sample.succeeded = succeeded;
+            if !succeeded {
+                // Inner writers can report before their caller commits. Keep
+                // attempted work, but rollback cannot claim committed writes.
+                sample.blocks_written = 0;
+                sample.chunks_written = 0;
+                sample.chunk_bytes_written = 0;
+                sample.skeleton_bytes_written = 0;
+                sample.commit_count = 0;
+            }
+        });
         self.active.set(false);
     }
 
@@ -147,6 +164,63 @@ mod tests {
         stats.update(|sample| sample.history_bytes_read += 100);
         assert_eq!(stats.take().unwrap().history_bytes_read, 10);
         assert!(stats.take().is_none());
+    }
+
+    #[test]
+    fn rollback_clears_committed_writes_but_keeps_attempted_work() {
+        let mut store =
+            super::super::Store::open_monocode(std::path::Path::new(":memory:")).unwrap();
+        store.prefer_chunked_storage(true).unwrap();
+        let id = store.create("codex", "/project").unwrap().id;
+        let original = vec![serde_json::json!({
+            "id":"answer", "role":"assistant", "text":"Before", "sentAt":1,
+            "futureMetadata":{"keep":true}
+        })];
+        store.store_blocks(id, &original).unwrap();
+        let mut changed = original.clone();
+        changed[0]["text"] = serde_json::json!("中文".repeat(1024));
+        store.save_stats.begin(SaveReason::Routine);
+        store.fail_next_save_commit_for_test().unwrap();
+        assert!(store.store_blocks(id, &changed).is_err());
+        let attempted = store.save_stats.sample.borrow().as_ref().unwrap().clone();
+        // The inner writer reported real upserts before the outer commit was
+        // refused. This is the path that must not leak committed counters.
+        assert!(attempted.blocks_written > 0);
+        assert!(attempted.chunks_written > 0);
+        assert!(attempted.chunk_bytes_written > 0);
+        assert!(attempted.skeleton_bytes_written > 0);
+        assert!(attempted.serialized_bytes > 0);
+        store.save_stats.finish(false);
+        let failed = store.take_save_sample().unwrap();
+        assert!(!failed.succeeded);
+        assert_eq!(failed.blocks_written, 0);
+        assert_eq!(failed.chunks_written, 0);
+        assert_eq!(failed.chunk_bytes_written, 0);
+        assert_eq!(failed.skeleton_bytes_written, 0);
+        assert_eq!(failed.commit_count, 0);
+        assert_eq!(failed.history_bytes_read, attempted.history_bytes_read);
+        assert_eq!(failed.serialized_bytes, attempted.serialized_bytes);
+        assert_eq!(failed.projection, attempted.projection);
+        assert_eq!(failed.encoding, attempted.encoding);
+        assert_eq!(failed.commit, attempted.commit);
+        assert_eq!(store.stored_blocks(id).unwrap(), original);
+        store.save_stats.begin(SaveReason::Routine);
+        store.store_blocks(id, &changed).unwrap();
+        store.save_stats.finish(true);
+        let retried = store.take_save_sample().unwrap();
+        assert!(retried.succeeded);
+        assert!(retried.skeleton_bytes_written > 0);
+        assert!(retried.chunk_bytes_written > 0);
+        assert_eq!(store.stored_blocks(id).unwrap(), changed);
+    }
+
+    #[test]
+    fn failed_sample_does_not_retain_a_provisional_commit_count() {
+        let stats = SaveStats::default();
+        stats.begin(SaveReason::Routine);
+        stats.update(|sample| sample.commit_count = 1);
+        stats.finish(false);
+        assert_eq!(stats.take().unwrap().commit_count, 0);
     }
 
     #[test]
@@ -175,6 +249,7 @@ mod tests {
                 "projection",
                 "reason",
                 "serialized_bytes",
+                "skeleton_bytes_written",
                 "succeeded"
             ]
         );
