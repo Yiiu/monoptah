@@ -13,6 +13,7 @@ import {
   parseTitle,
   prNumberOf,
   previousTag,
+  pullRequestPath,
   renderNotes,
   resolveSince,
 } from "./native-release-notes.mjs";
@@ -176,6 +177,20 @@ test("the rendered notes keep the heading checkNotes needs and the constant sect
   assert.ok(!empty.includes("###"));
 });
 
+test("download notes advertise Yiiu GitHub releases without an unavailable Homebrew cask", () => {
+  const text = renderNotes({ version: "0.54.0", previous: "0.53.4", groups: [], highlights: "" });
+  assert.ok(text.includes("[Yiiu/monoptah releases](https://github.com/Yiiu/monoptah/releases)"));
+  assert.doesNotMatch(text, /hhoangg|homebrew/i);
+  assert.match(text, /- macOS Apple silicon: app archive and ZIP\./);
+  assert.match(text, /- Linux x86_64: AppImage, DEB and RPM/);
+  assert.match(text, /- Windows x86_64: NSIS installer\./);
+});
+
+test("the PR API path targets Yiiu/monoptah", () => {
+  assert.equal(pullRequestPath(7), "repos/Yiiu/monoptah/pulls/7");
+  assert.doesNotMatch(pullRequestPath(7), /hhoangg/i);
+});
+
 // A fake runner over a table keyed by the command line.
 function runnerFor(table) {
   const calls = [];
@@ -189,7 +204,7 @@ function runnerFor(table) {
 }
 const LOG = "git log --first-parent -z --format=%H%n%s%n%b native-v0.53.3..HEAD";
 const record = (sha, subject, body = "") => `${sha}\n${subject}\n${body}\0`;
-const pull = (n) => `gh api repos/hhoangg/monoptah/pulls/${n} --jq {title: .title, labels: [.labels[].name]}`;
+const pull = (n) => `gh api repos/Yiiu/monoptah/pulls/${n} --jq {title: .title, labels: [.labels[].name]}`;
 
 test("generateNotes reads commits, squash and merge PR numbers, and PR titles and labels", () => {
   const { run, calls } = runnerFor({

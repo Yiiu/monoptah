@@ -1,8 +1,56 @@
 # Monoptah Native release flow
 
 How `npm run native:release:mac -- X.Y.Z` and `.github/workflows/native-release-monoptah.yml`
-fit together, what runs in parallel, and what to do when a step fails. The short version is in
-"Releasing the native app" in `CLAUDE.md`.
+release **Yiiu/monoptah**, what runs in parallel, and what to do when a step fails. The short
+version is in "Releasing the native app" in `CLAUDE.md`.
+
+## Repository configuration
+
+- Release APIs, generated notes and package URLs target `Yiiu/monoptah`. The signed Native
+  feed is `https://github.com/Yiiu/monoptah/releases/download/native-latest/latest.json`.
+- The Native public key is recorded in `scripts/native-updater.json` and in the release
+  workflow. Tooling tests and the workflow's plan job require both copies to match. The local
+  Mac release does not read `src-tauri/tauri.conf.json`; Tauri keeps its existing identity.
+- Repository Actions secrets `TAURI_SIGNING_PRIVATE_KEY` and
+  `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` contain the matching encrypted Native private key and
+  password. Only the `publish` job receives them. Keep an offline backup of both; GitHub
+  cannot return a secret after upload. Do not regenerate the key after shipping this channel:
+  installed clients trust the pinned public key.
+- Homebrew is optional and disabled until **both** repository variable
+  `HOMEBREW_TAP_REPOSITORY` (`owner/repository`) and secret `HOMEBREW_TAP_TOKEN` are configured.
+  The tap must already contain `Casks/monoptah-native.rb`; its token needs Contents read/write
+  on that tap. No step defaults to another maintainer's tap, and the download notes do not
+  advertise an unconfigured cask.
+- Every configured push URL of the Mac checkout's `origin` must target `Yiiu/monoptah`.
+  The script checks `git remote get-url --push --all origin` and rejects any different
+  destination before starting builds or workflows. Use ordinary GitHub HTTPS or SSH remotes
+  without embedded credentials.
+
+## First release from this fork
+
+Inherited `native-v*` tags contain pull-request numbers from the previous repository. For the
+first Yiiu release, explicitly start the notes at the last inherited commit, before this fork's
+PR #1. Otherwise the script could query a previous maintainer's PR number in this repository.
+From a clean, current `main` on an Apple silicon Mac with Xcode 26+, Metal tools, Rust,
+cargo-nextest, Node and authenticated `gh`:
+
+```bash
+git switch main
+git pull --ff-only origin main
+npm ci
+# Replace X.Y.Z with the chosen plain release version.
+npm run native:release:mac -- X.Y.Z --since 408567cde36243ec361ee0a68e3bcba00abbfdb8
+```
+
+After the first Yiiu tag exists, later releases use `npm run native:release:mac -- X.Y.Z`
+without `--since`. A merge starts validation CI; it does not publish a release. The script
+requires green `native.yml` for the exact merged `main` commit before tagging. A tag push
+alone does not start the fork release workflow; the script dispatches it explicitly.
+
+Existing binaries distributed by the previous repository keep their old feed and public key.
+Install a Yiiu release manually once to join this update channel. Subsequent updates use the
+Yiiu feed and its independent key.
+
 
 ## Timeline
 
@@ -34,7 +82,7 @@ script early.
 - Commits: `git log --first-parent -z` since then (NUL-separated, so no commit text can break
   the parse). The PR number comes from a squash subject
   `title (#N)` or a merge subject `Merge pull request #N from ...`. The title and labels come
-  from `gh api repos/hhoangg/monoptah/pulls/N`. There is no fallback to the commit subject (a
+  from `gh api repos/Yiiu/monoptah/pulls/N`. There is no fallback to the commit subject (a
   squash subject can be edited at merge time, a merge subject has no title), so a gh failure
   is an error. A commit without a PR number uses its subject and has no number.
 - Sections by the Conventional Commits type of the title: Breaking changes (a `!` in the
@@ -116,11 +164,11 @@ version (a feed never goes back to an older version).
 | Where it stops | What is left | What to do |
 |---|---|---|
 | Precondition, notes, toolchain check | Nothing | Fix what the message says, run the script again. |
-| `native:check`, build, package, HEAD moved, tree dirty, CI red, CI wait timeout | Nothing is tagged. The script cancels the early run and says so; if the cancel fails it prints `gh run cancel ID --repo hhoangg/monoptah` | Fix it and run the script again. After a CI timeout, run it again when CI is done: the native:check stamp makes the rerun fast. `--ci-timeout MINUTES` waits longer. |
+| `native:check`, build, package, HEAD moved, tree dirty, CI red, CI wait timeout | Nothing is tagged. The script cancels the early run and says so; if the cancel fails it prints `gh run cancel ID --repo Yiiu/monoptah` | Fix it and run the script again. After a CI timeout, run it again when CI is done: the native:check stamp makes the rerun fast. `--ci-timeout MINUTES` waits longer. |
 | `git tag` | Nothing was pushed; early run cancelled | Check git status, run the script again. |
 | `git push` of the tag | The tag may be on origin | If not, `git tag -d` and run again (cancel the early run first). If it is, create the release by hand with the printed command; the early run keeps waiting up to 120 minutes and continues by itself. |
 | `gh release create` | Tag on origin, release missing or partial | Create the release or upload the missing files (never replace an uploaded file). The early run continues. |
-| Dispatch after the release | Tag and release exist, no running workflow | `gh workflow run native-release-monoptah.yml --repo hhoangg/monoptah --ref main -f tag=native-vX.Y.Z` (safe to repeat). |
+| Dispatch after the release | Tag and release exist, no running workflow | `gh workflow run native-release-monoptah.yml --repo Yiiu/monoptah --ref main -f tag=native-vX.Y.Z` (safe to repeat). |
 | A CI package job fails | Release holds only the macOS files | Re-run the failed jobs, or dispatch with the tag only. Nothing more is published until all platforms are in. |
 | Ctrl-C or SIGTERM while the script waits (CI wait, run watching) | Before the tag the early run is cancelled and "Nothing was tagged" is printed; after the push the recovery is printed. Exit 130 | Run the script again (before the tag) or follow the printed commands. |
 | Ctrl-C between two child processes | Nothing is cleaned up | Before the tag: the early run fails by itself at its 120 minute wait and nothing is published; cancel it to save the minutes. After the tag: check `gh release view native-vX.Y.Z` and continue as above. |

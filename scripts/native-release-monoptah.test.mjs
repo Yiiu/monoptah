@@ -15,6 +15,7 @@ import {
   ciRunsPath,
   ciVerdict,
   readCiRuns,
+  REPOSITORY,
   CI_RUNS_JQ,
   checkPlanned,
   downloadBase,
@@ -94,13 +95,18 @@ test("asset names follow the cask and release layout", () => {
   });
 });
 
+test("release downloads target Yiiu/monoptah", () => {
+  assert.equal(REPOSITORY, "Yiiu/monoptah");
+  assert.equal(downloadBase("0.34.0"), "https://github.com/Yiiu/monoptah/releases/download/native-v0.34.0");
+});
+
 test("the manifest lists every target on the versioned release URL", () => {
   const result = manifest();
   assert.equal(result.app_id, "com.monoptah.native");
   assert.equal(result.channel, "native-preview");
   assert.equal(result.version, "0.34.0");
   assert.deepEqual(Object.keys(result.platforms).sort(), [...TARGETS].sort());
-  const base = "https://github.com/hhoangg/monoptah/releases/download/native-v0.34.0/";
+  const base = "https://github.com/Yiiu/monoptah/releases/download/native-v0.34.0/";
   assert.deepEqual(result.platforms["darwin-aarch64-app"], {
     url: `${base}MonoptahNative_0.34.0_aarch64.app.tar.gz`,
     signature: "signed-darwin-aarch64-app",
@@ -109,6 +115,10 @@ test("the manifest lists every target on the versioned release URL", () => {
   assert.equal(result.platforms["linux-x86_64-deb"].url, `${base}monoptah-native_0.34.0_amd64.deb`);
   assert.equal(result.platforms["linux-x86_64-rpm"].url, `${base}${RPM}`);
   assert.equal(result.platforms["windows-x86_64-nsis"].url, `${base}MonoptahNative_0.34.0_x64-setup.exe`);
+  for (const platform of Object.values(result.platforms)) {
+    assert.ok(platform.url.startsWith(base));
+    assert.doesNotMatch(platform.url, /hhoangg/i);
+  }
 });
 
 test("the platform table covers exactly the feed targets and the release file count", () => {
@@ -412,6 +422,8 @@ signingTest("signing produces a feed and package signature that verify with the 
   assert.equal(parsed.notes, "# Monoptah Native 0.34.0\n\nFirst release.\n");
   assert.deepEqual(Object.keys(parsed.platforms).sort(), [...TARGETS].sort());
   for (const [target, entry] of Object.entries(parsed.platforms)) {
+    assert.ok(entry.url.startsWith("https://github.com/Yiiu/monoptah/releases/download/native-v0.34.0/"));
+    assert.doesNotMatch(entry.url, /hhoangg/i);
     const filename = decodeURIComponent(entry.url.split("/").at(-1));
     assert.ok(
       minisignVerify(publicKey, entry.signature, await readFile(join(dist, filename))),
@@ -597,7 +609,8 @@ function gateIo(answers) {
 
 test("the runs path has no status filter and asks for 100 runs", () => {
   const path = ciRunsPath(SHA40);
-  assert.equal(path, `repos/hhoangg/monoptah/actions/workflows/native.yml/runs?head_sha=${SHA40}&event=push&branch=main&per_page=100`);
+  assert.equal(path, `repos/Yiiu/monoptah/actions/workflows/native.yml/runs?head_sha=${SHA40}&event=push&branch=main&per_page=100`);
+  assert.doesNotMatch(path, /hhoangg/i);
   assert.ok(!path.includes("status="));
   assert.ok(ciRunsPath(SHA40, "o/r").startsWith("repos/o/r/"));
 });
@@ -628,6 +641,7 @@ test("ciGate passes on the first read", async () => {
   const { io, calls } = gateIo([answer([ciRun("completed", "success", 5)])]);
   await ciGate(io, SHA40, { attempts: 6, sleepMs: 1 });
   assert.equal(calls.reads.length, 1);
+  assert.deepEqual(calls.reads[0], ["gh", "api", `repos/Yiiu/monoptah/actions/workflows/native.yml/runs?head_sha=${SHA40}&event=push&branch=main&per_page=100`, "--jq", CI_RUNS_JQ]);
   assert.equal(calls.sleeps, 0);
   assert.ok(calls.logs.some((l) => /run 5 \(success\)/.test(l)));
 });
