@@ -4,6 +4,17 @@ This repository is a fork of [`hardbeat920/monocode`](https://github.com/hardbea
 renamed **Monoptah**. It tracks upstream and merges from it regularly, while carrying
 fork-local changes that are never offered back upstream.
 
+## Git conventions
+
+Full rules and examples: [`docs/git-conventions.md`](docs/git-conventions.md).
+
+- Types (branch, commit, PR): `feat`, `fix`, `perf`, `refactor`, `test`, `docs`, `build`, `ci`, `chore`, `revert`.
+- Branch: `<type>/<issue#>-<short-slug>` or `<type>/<short-slug>`, lowercase, about 40 chars. Rename an app-made `mc/...` branch with `git branch -m` before the first push.
+- Commit: `<type>(<scope>): <summary>` (imperative, at most 72 chars, no period), English. A body (why and what) is required for `feat` and `fix`; add `Refs: #N` or `Fixes: #N` when there is an issue. One buildable change per commit.
+- PR titles become native release-note lines (`feat`, `fix`, `perf` are listed; label a PR `user-visible` to include `docs`, `chore`, `ci`, `test`, `build`, `refactor`), so write them for users.
+- PR: title in the commit format; the body fills every section of `.github/pull_request_template.md`, keeping its headings. Merge with squash, except upstream-sync PRs, which use a merge commit.
+- Never commit to `main`, never force-push a branch with an open PR, never commit secrets or realistic-looking fake tokens.
+
 ## After every merge from upstream
 
 Upstream keeps adding links, menu items, dialog copy and docs that say "MonoCode" and
@@ -167,7 +178,8 @@ Releases are native only for now, see "Releasing the native app". The Tauri work
 so pushes, pull requests and `v*` tags start nothing. Keep that when merging from upstream.
 
 To cut a Tauri release anyway: `npm run set-version -- X.Y.Z`, add a `CHANGELOG.md` section,
-commit as `Release vX.Y.Z`, push the tag, then run `gh workflow run release.yml --ref vX.Y.Z`.
+merge that through a PR titled `chore(release): vX.Y.Z`, tag the merged commit `vX.Y.Z` and push
+the tag, then run `gh workflow run release.yml --ref vX.Y.Z`.
 That workflow builds macOS, Linux and Windows, signs the updater bundles with the
 `TAURI_SIGNING_PRIVATE_KEY` secret, and publishes a GitHub Release with `latest.json`.
 
@@ -193,7 +205,10 @@ in `host/VERSION` as `X.Y.Z+monoptah` (semver build metadata marks the fork flav
 
 1. `npm run host:release -- X.Y.Z` (plain `X.Y.Z`): needs a clean tree, writes `host/VERSION`,
    commits "Release Monoptah Host X.Y.Z" and creates the tag `host-vX.Y.Z`. It never pushes; it
-   prints the push commands for you to review and run.
+   prints the push commands for you to review and run. To keep the git conventions (no commits
+   to main, squash merges), set `host/VERSION` to `X.Y.Z+monoptah` in a PR titled
+   `chore(release): Monoptah Host X.Y.Z` instead, then run the script on the up-to-date main:
+   with the version already recorded it only tags HEAD. Push only the tag, not HEAD.
 2. Pushing the tag starts `.github/workflows/host-release-monoptah.yml`. It checks the tag
    against `host/VERSION`, refuses when the release already exists, builds every target of
    `npm run host:package -- --all` (Linux and macOS `.tar.gz`, Windows `.zip`, asset names keep
@@ -230,28 +245,33 @@ code or tests gated to macOS, also run the tests you touched on macOS. `npm run 
 before every release. How often to run which check while developing is in "Developing the
 native app".
 
-1. Edit `docs/native/monoptah-release-notes.md` (its first line must be
-   `# Monoptah Native X.Y.Z`) and merge it into main through a PR.
-2. Wait for `native.yml` on main to pass (Linux and Windows only now). Its `release-cache` job
-   seeds the Linux and Windows build caches that the release reads (a miss is only slower).
-3. From a clean checkout of main on the Mac, run `npm run native:release:mac -- X.Y.Z`
-   (plain `X.Y.Z`, no pre-release form; add `--dry-run` first to do everything except tag,
-   push and publish). `scripts/native-release-macos-local.mjs` checks that you are on an
-   up-to-date main with no tracked changes, that the notes heading matches, that the tag and
-   release do not exist and that `native.yml` passed for HEAD; checks for macOS SDK 26 and the
-   Metal compiler; runs `npm run native:check`; builds and packages macOS; pushes the tag
-   `native-vX.Y.Z`; creates the release with the three macOS files; and dispatches
-   `.github/workflows/native-release-monoptah.yml`. A passing `native:check` is remembered per
-   commit and `rustc -V` in `crates/monocode-gpui/target/.native-check-stamp.json`, so a real
-   run after a dry run of the same commit skips it; add `--recheck` to run it again. If a step
-   after the tag push fails it prints what was left behind and how to continue; if you are
-   interrupted during publishing, check the tag and release state with `gh release view`.
-4. The workflow checks the CI gate again, builds Linux, Windows and the rpm (AlmaLinux 10
-   container, cache seeded from main by `release-cache-rpm`), signs every updater package in one `publish` job on Ubuntu with
-   `TAURI_SIGNING_PRIVATE_KEY`, verifies them with the app's own verifier, publishes, and bumps
-   the cask. The signing key exists on CI only; the local script never reads it, and it never
-   needs the `.sig` of the macOS package. The workflow has no tag trigger (the tag is pushed
-   before the macOS files are uploaded) and refuses a release that lacks the macOS files.
+How to release (timeline, notes rules, recovery and stuck runs: [`docs/native/release-flow.md`](docs/native/release-flow.md)):
+
+1. **No notes PR.** Release notes are generated from the titles of the PRs merged since the
+   previous `native-v*` tag (see `docs/git-conventions.md`, "Releases"). Optional highlights:
+   `--notes FILE`, or `docs/native/monoptah-release-notes.md` with first line
+   `# Monoptah Native X.Y.Z` for this version. Pick X.Y.Z by semver: `feat` is minor, `fix` and
+   `perf` are patch, a `BREAKING CHANGE` is major.
+2. **One command**, from an up-to-date `main` on the Mac, right after the last PR merges:
+   `npm run native:release:mac -- X.Y.Z` (plain `X.Y.Z`; options `--since REF`, `--notes FILE`,
+   `--recheck`, `--ci-timeout MINUTES`). Preconditions and the notes are checked first.
+3. **In parallel.** The script dispatches `native-release-monoptah.yml` for the commit (the
+   early run), so Linux, Windows and rpm build while the Mac runs `npm run native:check` (about
+   20 minutes, remembered per commit and `rustc -V` in
+   `crates/monocode-gpui/target/.native-check-stamp.json`), builds and packages. It waits for a
+   green `native.yml` on main for HEAD only right before tagging (default 60 minutes). Any
+   failure before the tag leaves nothing tagged or published and cancels the early run: fix it
+   and run the script again.
+4. **Publishing.** The script tags, pushes `native-vX.Y.Z` and creates the release with the three
+   macOS files and the notes as body. The early run (or a fresh one) then signs every updater
+   package in one `publish` job on Ubuntu (the signing key exists on CI only, the local script
+   never reads it), verifies, publishes, and bumps the cask.
+5. **`--dry-run` is optional**: a real run is safe on its own because every check happens before
+   the tag. Use it to test changes to the script.
+6. **If something fails** the script prints the exact commands (`gh run cancel ID`, and
+   `gh workflow run native-release-monoptah.yml --ref main -f tag=native-vX.Y.Z`). Never re-run
+   `native:release:mac` for an existing tag: it refuses. A run queued with no job for 10 minutes
+   is cancelled and replaced by the script.
 
 The release page and the macOS zip are public as soon as the script creates the release, and
 they stay macOS-only if the workflow fails. The in-app feed and the cask change only at the
@@ -270,14 +290,12 @@ end, when `publish` and `homebrew` succeed. The workflow publishes:
   `linux-x86_64-rpm` and `windows-x86_64-nsis`, and it is never replaced by an older version.
 
 Every platform is required: if a CI package job fails, nothing more is published. Re-run the
-workflow (`gh workflow run native-release-monoptah.yml --ref main -f tag=native-vX.Y.Z`, or
-re-run the failed jobs). Published assets are never replaced: a platform whose files are all
-on the release is not rebuilt (its files are downloaded and signed again) and one with no
-files is built, but never macOS. A platform with only some files published fails the `plan`
-job: delete that platform's published assets (files and `.sig`) by hand, then re-run. Do not
-re-run `native:release:mac` for an existing tag: it refuses. The signed files and feed are
-also kept as a workflow artifact. The Linux and Windows packages use upstream's
-`scripts/package-native.mjs`.
+failed jobs or dispatch the workflow again with the tag only. Published assets are never
+replaced: a platform whose files are all on the release is not rebuilt (its files are
+downloaded and signed again) and one with no files is built, but never macOS. A platform with
+only some files published fails the `plan` job: delete that platform's published assets (files
+and `.sig`) by hand, then re-run. The signed files and feed are also kept as a workflow
+artifact. The Linux and Windows packages use upstream's `scripts/package-native.mjs`.
 
 The `homebrew` job only bumps `Casks/monoptah-native.rb` in the tap (macOS only; Linux and
 Windows have no package-manager entry), it does not create it: add that file (modelled on
@@ -285,8 +303,8 @@ Windows have no package-manager entry), it does not create it: add that file (mo
 `HOMEBREW_TAP_TOKEN` is set. While it is unset, bump the cask by hand with
 `scripts/update-homebrew-cask.sh` and the sha from the `MonoptahNative_<version>_aarch64.zip.sha256`
 asset. The fork scripts are `scripts/native-release-macos-local.mjs`,
-`scripts/package-native-monoptah.mjs` (also the asset table for every platform) and
-`scripts/native-release-monoptah.mjs`.
+`scripts/native-release-notes.mjs`, `scripts/package-native-monoptah.mjs` (also the asset table
+for every platform) and `scripts/native-release-monoptah.mjs`.
 
 Things to keep true after merging from upstream or changing repo settings:
 
@@ -298,3 +316,9 @@ Things to keep true after merging from upstream or changing repo settings:
   to the release the local script created.
 - `native.yml` and `native-release-monoptah.yml` must not use a macOS runner. The
   `MONOPTAH_MACOS_RUNNER` repository variable is unused now and can be deleted.
+- Every job in `native.yml` and `native-release-monoptah.yml` keeps a `timeout-minutes`.
+- `native-release-monoptah.yml` keeps its per-tag concurrency group (`native-monoptah-release-<tag>`)
+  and the `native-monoptah-publish` group on the `publish` job. Do not turn on `cancel-in-progress`
+  there, and do not go back to one global group: the early run waits up to 2 hours for the tag.
+- The workflow runs its helper scripts from the `release-tools/` checkout of the dispatched ref, not from the built commit, so the tag-only recovery works for older tags.
+- Only the `publish` job may see the signing key or have `contents: write`.

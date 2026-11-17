@@ -26,6 +26,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// How long a sign-in showing the code field may sit idle after the app returns
+/// to the front before it is reset.
+const CODE_PROMPT_GRACE: Duration = Duration::from_secs(90);
 pub(crate) struct Shared(pub Entity<Accounts>);
 impl Global for Shared {}
 pub(crate) fn get(cx: &App) -> Option<Entity<Accounts>> {
@@ -187,6 +190,8 @@ fn read_credential(profile: &Profile) -> Option<CredentialState> {
 enum AuthMethod {
     Keep,
     Browser,
+    /// Browser sign-in finished by pasting the code the hosted page shows.
+    BrowserCode,
     SetupToken,
     ApiKey,
 }
@@ -210,12 +215,35 @@ struct SignIn {
     kind: Kind,
     profile: Profile,
     action: AuthAction,
+    mode: accounts::SignInMode,
     surface: Surface,
     cancel: Arc<AtomicBool>,
     complete: bool,
     error: Option<String>,
     adding: Option<Account>,
     started: Instant,
+    /// Set once the CLI asks for a pasted verification code.
+    code: Option<CodePrompt>,
+}
+/// The "paste the code from your browser" step of a running sign-in. The URL
+/// and the pasted text live only here, in memory: never logged, copied or saved.
+struct CodePrompt {
+    /// The hosted code page, only ever a URL that passed `manual_sign_in_url`.
+    url: Option<String>,
+    /// The app already opened `url` for this attempt (code mode opens it once).
+    opened: bool,
+    /// Counts the user's actions on this prompt (submit, rejection, edits), so
+    /// a reset timer started before one of them does not cancel a sign-in
+    /// that is in use.
+    interactions: u64,
+    input: Entity<Input>,
+    sender: std::sync::mpsc::Sender<String>,
+    /// A code was sent and the CLI has not answered yet.
+    checking: bool,
+    error: Option<String>,
+    focused: bool,
+    _submit: Subscription,
+    _changed: Subscription,
 }
 struct Picker {
     kind: Kind,
@@ -242,6 +270,9 @@ pub(crate) struct Accounts {
     store: Database,
     editor: Option<Editor>,
     signin: Option<SignIn>,
+    /// Bumped whenever the app is reactivated or deactivated, so a reset timer
+    /// started by an earlier return to the app does nothing.
+    reactivation: u64,
     pub error: Option<String>,
     working: bool,
     pub mask_emails: bool,
@@ -298,6 +329,7 @@ impl Accounts {
             identity_generation: Default::default(),
             editor: None,
             signin: None,
+            reactivation: 0,
             error: None,
             working: false,
             mask_emails: true,
@@ -817,6 +849,7 @@ impl Accounts {
                     kind,
                     &account.id.clone(),
                     AuthAction::SignIn,
+                    accounts::SignInMode::Browser,
                     Some(account),
                     cx,
                 ),
@@ -832,6 +865,7 @@ impl Accounts {
         kind: Kind,
         id: &str,
         action: AuthAction,
+        mode: accounts::SignInMode,
         adding: Option<Account>,
         cx: &mut Context<Self>,
     ) {
@@ -848,20 +882,39 @@ impl Accounts {
             .as_ref()
             .filter(|_| adding.is_some())
             .map_or(Surface::Settings, |editor| editor.surface);
-        self.start_auth(kind, id, action, adding, surface, cx);
+        self.start_auth(kind, id, action, mode, adding, surface, cx);
     }
     pub(crate) fn begin_footer_auth(&mut self, kind: Kind, id: &str, cx: &mut Context<Self>) {
+        self.begin_footer_auth_with(kind, id, accounts::SignInMode::Browser, cx);
+    }
+    pub(crate) fn begin_footer_auth_with(
+        &mut self,
+        kind: Kind,
+        id: &str,
+        mode: accounts::SignInMode,
+        cx: &mut Context<Self>,
+    ) {
         if kind == Kind::Claude && self.uses_claude_token(id) {
             cx.emit(AccountEvent::Manage);
             return;
         }
-        self.start_auth(kind, id, AuthAction::SignIn, None, Surface::Footer, cx);
+        self.start_auth(
+            kind,
+            id,
+            AuthAction::SignIn,
+            mode,
+            None,
+            Surface::Footer,
+            cx,
+        );
     }
+    #[allow(clippy::too_many_arguments)]
     fn start_auth(
         &mut self,
         kind: Kind,
         id: &str,
         action: AuthAction,
+        mode: accounts::SignInMode,
         adding: Option<Account>,
         surface: Surface,
         cx: &mut Context<Self>,
@@ -896,12 +949,14 @@ impl Accounts {
             kind,
             profile: profile.clone(),
             action,
+            mode,
             surface,
             cancel: cancel.clone(),
             complete: false,
             error: None,
             adding,
             started: Instant::now(),
+            code: None,
         });
         if self.has_modal_auth() {
             cx.emit(AccountEvent::AuthStarted);
@@ -911,14 +966,40 @@ impl Accounts {
                 .input
                 .update(cx, |input, _| input.set_read_only(true));
         }
+        let (progress_tx, progress_rx) = async_channel::unbounded();
+        let (code_tx, codes) = std::sync::mpsc::channel();
+        let io = (action == AuthAction::SignIn && accounts::accepts_pasted_code(kind)).then(|| {
+            accounts::AuthIo {
+                codes,
+                progress: Arc::new(move |event| {
+                    let _ = progress_tx.try_send(event);
+                }),
+            }
+        });
         let work = cx.background_executor().spawn(async move {
             if action == AuthAction::SignOut {
                 accounts::stop_processes(kind, &profile);
             }
-            let result = accounts::authenticate(kind, &profile, action, cancel);
+            let result = accounts::authenticate_with(kind, &profile, action, cancel, io, mode);
             monocode_core::catalog::invalidate(kind, &profile);
             result
         });
+        let progress_request = request.clone();
+        cx.spawn(async move |this, cx| {
+            while let Ok(event) = progress_rx.recv().await {
+                let sender = code_tx.clone();
+                let attempt = progress_request.clone();
+                if this
+                    .update(cx, |this, cx| {
+                        this.sign_in_progress(&attempt, sender, event, cx)
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
         cx.spawn(async move |this, cx| {
             let result = work.await;
             let _ = this.update(cx, |this, cx| {
@@ -933,6 +1014,7 @@ impl Accounts {
                 if signin.surface != Surface::Footer || signin.adding.is_some() {
                     this.working = false;
                 }
+                signin.code = None;
                 if let Some(editor) = &this.editor {
                     editor
                         .input
@@ -1054,7 +1136,9 @@ impl Accounts {
     /// waiting. A finished login reaches the CLI within a second or two, so if
     /// it is still waiting after a short grace the browser was closed or
     /// abandoned: reset to Sign in instead of waiting out the CLI's 10 minutes.
-    pub(crate) fn app_reactivated(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn app_reactivated(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.reactivation += 1;
+        let generation = self.reactivation;
         let Some(signin) = &self.signin else {
             return;
         };
@@ -1065,19 +1149,42 @@ impl Accounts {
         {
             return;
         }
+        // The CLI shows its code prompt right away, so a prompt does not mean the
+        // user is pasting. Allow a long grace for a user who went to copy a code.
+        let grace = if signin.code.is_some() {
+            CODE_PROMPT_GRACE
+        } else {
+            Duration::from_secs(5)
+        };
         let attempt = signin.cancel.clone();
-        cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(Duration::from_secs(5)).await;
-            let _ = this.update(cx, |this, cx| {
-                let waiting = this.signin.as_ref().is_some_and(|s| {
-                    Arc::ptr_eq(&s.cancel, &attempt) && !s.complete && s.error.is_none()
-                });
+        let seen = signin.code.as_ref().map_or(0, |p| p.interactions);
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(grace).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                let focused = |p: &CodePrompt| p.input.read(cx).focus_handle(cx).is_focused(window);
+                let waiting = this.reactivation == generation
+                    && window.is_window_active()
+                    && this.signin.as_ref().is_some_and(|s| {
+                        Arc::ptr_eq(&s.cancel, &attempt)
+                            && !s.complete
+                            && s.error.is_none()
+                            && s.code.as_ref().is_none_or(|p| {
+                                !p.checking
+                                    && p.interactions == seen
+                                    && p.input.read(cx).content.is_empty()
+                                    && !focused(p)
+                            })
+                    });
                 if waiting {
                     this.cancel_auth(cx);
                 }
             });
         })
         .detach();
+    }
+    /// The app left the front: any pending reset timer is void.
+    pub(crate) fn app_deactivated(&mut self) {
+        self.reactivation += 1;
     }
 }
 impl Drop for Accounts {

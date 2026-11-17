@@ -1,26 +1,27 @@
-//! The Cloud workspaces dialog opened from the project menu's "Cloud workspaces…" item (next to
-//! "Cloud settings…"), and what the shell does with its Stop and Delete: adds its busy view (a copy),
-//! and on a delete forgets the sessions of the deleted workspace in the window and the Sub-agents
-//! panel. The dialog stays open while a stop or delete runs, so the result always gets here.
+//! The Cloud workspaces side drawer, opened from the cloud chip at the right end of the footer
+//! (the only way in: the project menu no longer has an item for it), and what the shell does with
+//! its Stop and Delete: adds its busy view (a copy), and on a delete forgets the sessions of the
+//! deleted workspace in the window and the Sub-agents panel. The drawer (see [`crate::drawer`])
+//! slides in from the right and out again when it closes (Escape, a click outside and Close all
+//! take the same animated path, [`Shell::close_cloud_workspaces`]); it stays open while a stop or
+//! delete runs, so the result always gets here.
 use super::*;
 use crate::cloud_workspaces_dialog::{self, CloudWorkspacesDialog};
+use crate::drawer::{Close, DrawerState};
+
+/// The drawer's width in points (it narrows in a small window, see [`crate::drawer::fit_width`]).
+const DRAWER_WIDTH: f32 = 560.;
+/// Where the drawer draws, the same layer the cloud dialogs use.
+const DRAWER_PRIORITY: usize = 60;
 
 pub(super) struct OpenCloudWorkspaces {
     pub(super) view: Entity<CloudWorkspacesDialog>,
+    /// Open, or sliding out until the shell drops this.
+    drawer: DrawerState,
     _events: Subscription,
 }
 
 impl Shell {
-    pub(super) fn open_cloud_workspaces(
-        &mut self,
-        path: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let env = cloud_workspaces_dialog::Env::system(self.store.clone());
-        self.open_cloud_workspaces_with(path, env, window, cx);
-    }
-
     pub(super) fn open_cloud_workspaces_with(
         &mut self,
         path: String,
@@ -30,6 +31,17 @@ impl Shell {
     ) {
         self.close_menu(cx);
         self.close_preview(cx);
+        // A drawer for this project that is sliding out comes back in from where it is, with the
+        // state it had, instead of being replaced by a fresh one that jumps to the edge.
+        if let Some(open) = &mut self.cloud_workspaces
+            && open.drawer.is_closing()
+            && open.view.read(cx).project() == path
+        {
+            open.drawer.reopen(cx);
+            window.focus(&open.view.focus_handle(cx), cx);
+            cx.notify();
+            return;
+        }
         let name = self.project_label(&path);
         let view = cx.new(|cx| CloudWorkspacesDialog::new(path, name, env, cx));
         let dialog = view.clone();
@@ -67,6 +79,7 @@ impl Shell {
         window.focus(&view.focus_handle(cx), cx);
         self.cloud_workspaces = Some(OpenCloudWorkspaces {
             view,
+            drawer: DrawerState::open(cx),
             _events: events,
         });
         cx.notify();
@@ -78,16 +91,38 @@ impl Shell {
         chip.update(cx, |chip, cx| chip.changed(cx));
     }
 
-    /// Closes the dialog, unless a stop or delete is running: closing would drop the dialog and
-    /// the subscription that carries the result back here, and the window would keep sessions of
-    /// a workspace that is gone.
+    /// Closes the drawer: it slides out, then is dropped ([`Self::cloud_workspaces_gone`]). Not
+    /// while a stop or delete is running: closing would drop the dialog and the subscription that
+    /// carries the result back here, and the window would keep sessions of a workspace that is
+    /// gone. A close while it already slides out is ignored. Focus goes back to the workspace
+    /// at once, so the sliding drawer takes no keys either.
     pub(super) fn close_cloud_workspaces(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(open) = &self.cloud_workspaces {
-            if open.view.read(cx).working() {
-                return;
-            }
+        let Some(open) = &mut self.cloud_workspaces else {
+            return;
+        };
+        if open.view.read(cx).working() {
+            return;
+        }
+        match open
+            .drawer
+            .close(cx, |this, cx| this.cloud_workspaces_gone(cx))
+        {
+            Close::Ignored => return,
+            Close::Now => self.cloud_workspaces = None,
+            Close::Started => {}
+        }
+        self.focus_workspace(window, cx);
+        cx.notify();
+    }
+
+    /// The slide-out ended: drop the drawer, unless it was opened again meanwhile.
+    fn cloud_workspaces_gone(&mut self, cx: &mut Context<Self>) {
+        if self
+            .cloud_workspaces
+            .as_ref()
+            .is_some_and(|open| open.drawer.is_closing())
+        {
             self.cloud_workspaces = None;
-            self.focus_workspace(window, cx);
             cx.notify();
         }
     }
@@ -97,6 +132,9 @@ impl Shell {
         let Some(open) = &self.cloud_workspaces else {
             return;
         };
+        if !open.drawer.is_open() {
+            return;
+        }
         // A running stop or delete keeps the dialog open; `close_cloud_workspaces` checks that.
         if !open.view.update(cx, |dialog, cx| dialog.cancel_confirm(cx)) {
             self.close_cloud_workspaces(window, cx);
@@ -121,23 +159,30 @@ impl Shell {
         }
     }
 
-    pub(super) fn cloud_workspaces_modal(
+    pub(super) fn cloud_workspaces_drawer(
         &self,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let view = self.cloud_workspaces.as_ref()?.view.clone();
-        // The shared cloud dialog frame: a barrier (the window behind gets no hover, click or
-        // scroll) and the modal surface.
-        Some(self.cloud_modal_sized(
-            "cloud-workspaces-modal",
-            view,
-            60,
-            640.,
-            |this, window, cx| this.cloud_workspaces_escape(window, cx),
-            window,
-            cx,
-        ))
+        let open = self.cloud_workspaces.as_ref()?;
+        let view = open.view.clone();
+        let weak = cx.weak_entity();
+        Some(
+            crate::drawer::drawer(
+                "cloud-workspaces-drawer",
+                DRAWER_WIDTH,
+                DRAWER_PRIORITY,
+                &open.drawer,
+                view,
+                // A press on the scrim acts like Escape: it leaves the delete confirmation first.
+                move |window, cx| {
+                    let _ = weak.update(cx, |this, cx| this.cloud_workspaces_escape(window, cx));
+                },
+                window,
+                cx,
+            )
+            .into_any_element(),
+        )
     }
 }
 
@@ -148,10 +193,12 @@ mod tests {
     use gpui::{TestAppContext, WindowHandle};
     use monocode_core::cloud_sessions::{CloudBackendKind, CloudRef, CloudSessions};
 
-    #[gpui::test]
-    fn the_menu_entry_opens_the_dialog_and_escape_closes_it(cx: &mut TestAppContext) {
-        let (window, _, _) = crate::shell::tests::window(cx);
-        let w = fixtures::world_in(window.read_with(cx, |s, _| s.store.clone()).unwrap());
+    /// Opens the drawer on the fixture world, with motion off so it rests at once.
+    fn open_drawer(
+        window: &WindowHandle<Shell>,
+        w: &fixtures::World,
+        cx: &mut TestAppContext,
+    ) -> gpui::VisualTestContext {
         let env = Env {
             api: Some(w.api.clone()),
             store: w.store.clone(),
@@ -163,16 +210,111 @@ mod tests {
             })
             .unwrap();
         cx.run_until_parked();
+        let mut visual = gpui::VisualTestContext::from_window((*window).into(), cx);
+        visual.refresh().unwrap();
+        visual.run_until_parked();
+        visual
+    }
+
+    fn drawer_open(window: &WindowHandle<Shell>, visual: &gpui::VisualTestContext) -> bool {
         window
-            .update(cx, |shell, window, cx| {
-                shell.cloud_workspaces_escape(window, cx);
-                assert!(shell.cloud_workspaces.is_none());
-            })
-            .unwrap();
+            .read_with(visual, |shell, _| shell.cloud_workspaces.is_some())
+            .unwrap()
     }
 
     #[gpui::test]
-    fn the_footer_chip_follows_the_local_project_of_a_cloud_session_and_opens_the_dialog(
+    fn the_drawer_rests_against_the_right_edge_and_has_the_dialogs_content(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (window, _, _) = crate::shell::tests::window(cx);
+        let w = fixtures::world_in(window.read_with(cx, |s, _| s.store.clone()).unwrap());
+        let mut visual = open_drawer(&window, &w, cx);
+        let size = visual.update(|window, _| window.viewport_size());
+        let panel = visual
+            .debug_bounds("cloud-workspaces-drawer")
+            .expect("the drawer");
+        assert_eq!(panel.right(), size.width - gpui::px(crate::drawer::INSET));
+        assert_eq!(panel.size.width, gpui::px(DRAWER_WIDTH));
+        assert_eq!(
+            panel.size.height,
+            size.height - gpui::px(2. * crate::drawer::INSET)
+        );
+        // The same view the dialog showed: its frame, close button and loaded summary.
+        for selector in [
+            "cloud-workspaces-dialog",
+            "cloud-ws-close",
+            "cloud-workspaces-summary",
+        ] {
+            let at = visual
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector}"));
+            assert!(
+                panel.contains(&at.center()),
+                "{selector} is inside the drawer"
+            );
+        }
+        // Not a centred dialog: the left of the window stays free for the scrim.
+        assert!(panel.origin.x > size.width / 2.);
+    }
+
+    #[gpui::test]
+    fn escape_the_scrim_and_the_close_button_each_close_the_drawer(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (window, _, _) = crate::shell::tests::window(cx);
+        let w = fixtures::world_in(window.read_with(cx, |s, _| s.store.clone()).unwrap());
+
+        // Escape, through the keyboard: the drawer holds the focus.
+        let mut visual = open_drawer(&window, &w, cx);
+        visual.simulate_keystrokes("escape");
+        visual.run_until_parked();
+        assert!(!drawer_open(&window, &visual), "Escape closes it");
+        visual.refresh().unwrap();
+        assert!(visual.debug_bounds("cloud-workspaces-drawer").is_none());
+        drop(visual);
+
+        // A click on the dimmed area outside the panel.
+        let mut visual = open_drawer(&window, &w, cx);
+        let scrim = visual
+            .debug_bounds("cloud-workspaces-drawer-scrim")
+            .expect("the scrim");
+        assert_eq!(
+            scrim.size,
+            visual.update(|window, _| window.viewport_size())
+        );
+        visual.simulate_click(
+            gpui::point(gpui::px(30.), gpui::px(30.)),
+            Default::default(),
+        );
+        visual.run_until_parked();
+        assert!(!drawer_open(&window, &visual), "the scrim closes it");
+        drop(visual);
+
+        // A click on the panel itself does not close it; its Close button does.
+        let mut visual = open_drawer(&window, &w, cx);
+        let panel = visual
+            .debug_bounds("cloud-workspaces-drawer")
+            .expect("the drawer");
+        visual.simulate_click(
+            gpui::point(
+                panel.origin.x + gpui::px(40.),
+                panel.bottom() - gpui::px(40.),
+            ),
+            Default::default(),
+        );
+        visual.run_until_parked();
+        assert!(drawer_open(&window, &visual), "a click inside stays inside");
+        let close = visual
+            .debug_bounds("cloud-ws-close")
+            .expect("Close")
+            .center();
+        visual.simulate_click(close, Default::default());
+        visual.run_until_parked();
+        assert!(!drawer_open(&window, &visual), "Close closes it");
+    }
+
+    #[gpui::test]
+    fn the_footer_chip_follows_the_local_project_of_a_cloud_session_and_opens_the_drawer(
         cx: &mut TestAppContext,
     ) {
         let (window, _, _) = crate::shell::tests::window(cx);
@@ -202,6 +344,17 @@ mod tests {
                 shell.update_usage_provider(cx);
             })
             .unwrap();
+        // Hidden (nothing listed yet), the chip adds nothing to the footer: no chip, and the
+        // Terminal button still ends the group, with no separator or gap left after it.
+        let hidden_terminal = {
+            let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+            visual.refresh().unwrap();
+            visual.run_until_parked();
+            assert!(visual.debug_bounds("cloud-status-chip").is_none());
+            visual
+                .debug_bounds("footer-terminal")
+                .expect("the terminal button is in the footer row")
+        };
         chip.update(cx, |chip, cx| {
             assert_eq!(chip.project(), w.checkout.path());
             chip.set_env(env, cx);
@@ -210,7 +363,8 @@ mod tests {
         cx.run_until_parked();
         assert!(chip.read_with(cx, |chip, _| chip.visible()));
 
-        // Clicking it opens the same dialog the menu item opens.
+        // Clicking it opens the drawer. It is the last item of the terminal controls group,
+        // right after the Terminal button.
         let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
         visual.refresh().unwrap();
         visual.run_until_parked();
@@ -218,6 +372,53 @@ mod tests {
             .debug_bounds("cloud-status-chip")
             .expect("the chip is in the footer")
             .center();
+        let footer = visual.debug_bounds("usage-footer").expect("the footer");
+        let terminal = visual
+            .debug_bounds("footer-terminal")
+            .expect("the terminal button is in the footer row");
+        let chip_bounds = visual.debug_bounds("cloud-status-chip").unwrap();
+        assert!(
+            chip_bounds.left() >= footer.right(),
+            "{footer:?} {chip_bounds:?}"
+        );
+        // Directly right of Terminal: the group's gap, its separator, the gap again.
+        assert_eq!(
+            chip_bounds.left() - terminal.right(),
+            GROUP_STEP,
+            "{terminal:?} {chip_bounds:?}"
+        );
+        // The group did not move: the chip ends where Terminal ended while the chip was hidden.
+        assert_eq!(
+            chip_bounds.right(),
+            hidden_terminal.right(),
+            "{hidden_terminal:?} {chip_bounds:?}"
+        );
+        // It reads like the Terminal button beside it: the same text size (so the same line
+        // box), the same height and the same vertical centre.
+        let chip_label = visual
+            .debug_bounds("cloud-status-chip-label")
+            .expect("the chip's label");
+        let terminal_label = visual
+            .debug_bounds("footer-terminal-label")
+            .expect("the Terminal button's label");
+        assert_eq!(
+            chip_label.size.height, terminal_label.size.height,
+            "{chip_label:?} {terminal_label:?}"
+        );
+        assert_eq!(
+            chip_bounds.size.height, terminal.size.height,
+            "{chip_bounds:?} {terminal:?}"
+        );
+        assert_eq!(
+            chip_bounds.center().y,
+            terminal.center().y,
+            "{chip_bounds:?} {terminal:?}"
+        );
+        assert_eq!(
+            chip_label.center().y,
+            terminal_label.center().y,
+            "{chip_label:?} {terminal_label:?}"
+        );
         window
             .read_with(&visual, |shell, _| {
                 assert!(shell.cloud_workspaces.is_none())
@@ -231,13 +432,179 @@ mod tests {
                 assert!(open.view.read(cx).view().is_some(), "and it loaded");
             })
             .unwrap();
-        // Escape closes it, as for the menu entry.
+        visual.refresh().unwrap();
+        assert!(visual.debug_bounds("cloud-workspaces-drawer").is_some());
+        // Escape closes it.
         window
             .update(&mut visual, |shell, window, cx| {
                 shell.cloud_workspaces_escape(window, cx);
-                assert!(shell.cloud_workspaces.is_none());
+                assert!(!shell.cloud_workspaces.as_ref().unwrap().drawer.is_open());
             })
             .unwrap();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(400));
+        cx.run_until_parked();
+        window
+            .read_with(cx, |shell, _| assert!(shell.cloud_workspaces.is_none()))
+            .unwrap();
+    }
+
+    /// With motion on, every way of closing slides the drawer out first: it stays rendered and
+    /// keeps blocking the window until the slide-out has run, then it is dropped.
+    #[gpui::test]
+    fn escape_the_scrim_and_close_each_slide_the_drawer_out_before_dropping_it(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, _, _) = crate::shell::tests::window(cx);
+        let w = fixtures::world_in(window.read_with(cx, |s, _| s.store.clone()).unwrap());
+        let slide_out = std::time::Duration::from_millis(400);
+
+        for how in ["escape", "scrim", "close"] {
+            let mut visual = open_drawer(&window, &w, cx);
+            visual.executor().advance_clock(slide_out);
+            visual.run_until_parked();
+            match how {
+                "escape" => visual.simulate_keystrokes("escape"),
+                "scrim" => visual.simulate_click(
+                    gpui::point(gpui::px(30.), gpui::px(30.)),
+                    Default::default(),
+                ),
+                _ => {
+                    let close = visual
+                        .debug_bounds("cloud-ws-close")
+                        .expect("Close")
+                        .center();
+                    visual.simulate_click(close, Default::default());
+                }
+            }
+            visual.run_until_parked();
+            visual.refresh().unwrap();
+            assert!(drawer_open(&window, &visual), "{how}: still sliding out");
+            assert!(
+                visual.debug_bounds("cloud-workspaces-drawer").is_some(),
+                "{how}: still rendered"
+            );
+            // Another Escape or click while it leaves changes nothing.
+            visual.simulate_keystrokes("escape");
+            visual.simulate_click(
+                gpui::point(gpui::px(30.), gpui::px(30.)),
+                Default::default(),
+            );
+            visual.run_until_parked();
+            assert!(
+                drawer_open(&window, &visual),
+                "{how}: ignored while closing"
+            );
+
+            visual.executor().advance_clock(slide_out);
+            visual.run_until_parked();
+            visual.refresh().unwrap();
+            assert!(!drawer_open(&window, &visual), "{how}: dropped after");
+            assert!(visual.debug_bounds("cloud-workspaces-drawer").is_none());
+        }
+    }
+
+    #[gpui::test]
+    fn opening_again_while_it_slides_out_keeps_the_same_drawer(cx: &mut TestAppContext) {
+        let (window, _, _) = crate::shell::tests::window(cx);
+        let w = fixtures::world_in(window.read_with(cx, |s, _| s.store.clone()).unwrap());
+        let env = Env {
+            api: Some(w.api.clone()),
+            store: w.store.clone(),
+        };
+        let mut visual = open_drawer(&window, &w, cx);
+        visual
+            .executor()
+            .advance_clock(std::time::Duration::from_millis(400));
+        visual.run_until_parked();
+        window
+            .update(&mut visual, |shell, window, cx| {
+                shell.close_cloud_workspaces(window, cx);
+                assert!(!shell.cloud_workspaces.as_ref().unwrap().drawer.is_open());
+            })
+            .unwrap();
+        let view = window
+            .read_with(&visual, |s, _| {
+                s.cloud_workspaces.as_ref().unwrap().view.clone()
+            })
+            .unwrap();
+        window
+            .update(&mut visual, |shell, window, cx| {
+                shell.open_cloud_workspaces_with(w.checkout.path(), env, window, cx);
+                let open = shell.cloud_workspaces.as_ref().unwrap();
+                assert!(open.drawer.is_open());
+                assert_eq!(open.view, view, "the same dialog, not a fresh one");
+            })
+            .unwrap();
+        visual
+            .executor()
+            .advance_clock(std::time::Duration::from_millis(400));
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        assert!(drawer_open(&window, &visual), "the removal was cancelled");
+        assert!(visual.debug_bounds("cloud-workspaces-drawer").is_some());
+    }
+
+    /// From the right edge of one footer group item to the left edge of the next: the group's gap,
+    /// the separator (its margins and hairline), the gap again.
+    const GROUP_STEP: gpui::Pixels =
+        gpui::px(2. * crate::shell::terminal_dock::FOOTER_GAP + 3. + 1. + 3.);
+
+    #[gpui::test]
+    fn the_footer_chip_follows_the_running_terminals_chip_in_both_layouts(cx: &mut TestAppContext) {
+        let (window, w, chip) = window_with_chip(cx);
+        let project = w.checkout.path();
+        window
+            .update(cx, |shell, window, cx| {
+                shell.workspace.add_project(&project);
+                shell.select_project(project.clone(), window, cx);
+            })
+            .unwrap();
+        chip_reports(&chip, &project, cx);
+        // A terminal of the project runs a process: its chip replaces the Terminal button.
+        window
+            .update(cx, |shell, window, cx| {
+                shell.new_terminal(window, cx);
+                for t in &shell.terminals[&project] {
+                    t.update(cx, |t, _| t.foreground = Some("sleep".into()));
+                }
+                cx.notify();
+            })
+            .unwrap();
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        for boxy in [false, true] {
+            window
+                .update(&mut visual, |shell, _, cx| {
+                    shell.workspace.new_layout_boxy = boxy;
+                    cx.notify();
+                })
+                .unwrap();
+            visual.refresh().unwrap();
+            visual.run_until_parked();
+            visual.refresh().unwrap();
+            assert!(
+                visual.debug_bounds("footer-terminal").is_none(),
+                "boxy {boxy}: the running chip replaces Terminal"
+            );
+            let running = visual
+                .debug_bounds("footer-running-terminals")
+                .unwrap_or_else(|| panic!("boxy {boxy}: the running-terminals chip"));
+            let cloud = visual
+                .debug_bounds("cloud-status-chip")
+                .unwrap_or_else(|| panic!("boxy {boxy}: the cloud chip"));
+            assert_eq!(
+                cloud.left() - running.right(),
+                GROUP_STEP,
+                "boxy {boxy}: {running:?} {cloud:?}"
+            );
+            // The same footer button: the same height on the same line.
+            assert_eq!(
+                (cloud.size.height, cloud.center().y),
+                (running.size.height, running.center().y),
+                "boxy {boxy}: {running:?} {cloud:?}"
+            );
+            assert_eq!(cloud.size.height, gpui::px(20.), "boxy {boxy}");
+        }
     }
 
     /// A window whose footer chip reads the fixtures' fake `gh` and `sbx` (never the real ones).
@@ -573,8 +940,14 @@ mod tests {
         window
             .update(cx, |shell, window, cx| {
                 shell.cloud_workspaces_escape(window, cx);
-                assert!(shell.cloud_workspaces.is_none());
+                assert!(!shell.cloud_workspaces.as_ref().unwrap().drawer.is_open());
             })
+            .unwrap();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(400));
+        cx.run_until_parked();
+        window
+            .read_with(cx, |shell, _| assert!(shell.cloud_workspaces.is_none()))
             .unwrap();
     }
 }

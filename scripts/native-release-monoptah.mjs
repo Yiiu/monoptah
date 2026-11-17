@@ -7,13 +7,21 @@
 // {"payload": base64(manifest JSON), "signature": <tauri signer signature>}.
 //
 // usage (MONOCODE_NATIVE_VERSION must be set for all but feed-supersedes):
-//   node scripts/native-release-monoptah.mjs plan [published-names-file]
+//   node scripts/native-release-monoptah.mjs plan [--defer-macos] [--check-planned] [published-names-file]
 //       prints step output lines: matrix (JSON, the platforms still to build
 //       except rpm), rpm (true/false), build_any (true/false) and reuse (the
 //       published filenames to download instead of building, space separated).
 //       Fails when macOS would have to be built: its files are built on the
 //       maintainer's Mac (npm run native:release:mac) and must already be on
 //       the release.
+//       --defer-macos is for a run that starts before the release exists: the
+//       macOS files are not all published yet, so macOS is left out of the
+//       matrix without failing (the await-release job waits for them).
+//       --check-planned (env PLANNED_MATRIX, PLANNED_RPM) compares the result
+//       with an earlier plan and fails when they build different platforms.
+//   node scripts/native-release-monoptah.mjs macos-ready <assets-json-file>
+//       prints "true" when the release assets (the JSON list from the GitHub
+//       API) hold all macOS files in state "uploaded", else "false"
 //   node scripts/native-release-monoptah.mjs records <dir>
 //       writes artifacts-<kind>-<arch>.json for every platform whose assets are
 //       in <dir> but that has no metadata file yet (used when a re-run signs the
@@ -24,6 +32,12 @@
 //       prints how many files release-files.json must list
 //   node scripts/native-release-monoptah.mjs feed-supersedes <new> [existing]
 //       prints "true" when <new> should replace <existing> as the rolling feed
+//   node scripts/native-release-monoptah.mjs ci-gate <sha>
+//       env: GH_TOKEN, GITHUB_REPOSITORY (MONOCODE_NATIVE_VERSION is not needed)
+//       requires a native.yml push run on main with conclusion "success" for
+//       <sha>. Reads the unfiltered run list (never status=success: GitHub's
+//       filtered index can miss successful runs for hours) and retries up to 6
+//       reads, 20 s apart, while nothing is visible yet or a run is pending.
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { readFile, readdir, writeFile } from "node:fs/promises";
@@ -187,7 +201,7 @@ export async function prepareMonoptahRelease(
 // one of its files is already on the release; those files are reused (never
 // rebuilt or replaced) so the cask pin and the feed keep describing published
 // bytes. A platform with only some of its files published is an error. `published` is the list of asset names on the existing release.
-export function planBuilds(version, published = []) {
+export function planBuilds(version, published = [], { deferMacos = false } = {}) {
   releaseVersion(version);
   const matrix = [];
   let rpm = false;
@@ -200,6 +214,9 @@ export function planBuilds(version, published = []) {
       reuse.push(...found.flat());
       continue;
     }
+    // The macOS files come from the maintainer's Mac while the run is already
+    // going; they are not built here and the await-release job waits for them.
+    if (deferMacos && platform.kind === "macos") continue;
     // Some files published, some not: rebuilding would produce bytes that differ
     // from the published ones, and only missing names are uploaded, so the feed
     // and the cask checksum would describe files the release does not serve.
@@ -221,6 +238,28 @@ export function planBuilds(version, published = []) {
       });
   }
   return { matrix, rpm, buildAny: matrix.length > 0 || rpm, reuse };
+}
+
+// True when the release carries every macOS file, each one fully uploaded.
+// `assets` is the list from the GitHub API: [{ name, state }].
+export function macosFilesReady(version, assets) {
+  const platform = PLATFORMS.find((p) => p.kind === "macos");
+  return platform.assets(version).every(({ pattern }) => {
+    const found = assets.filter((asset) => pattern.test(asset.name));
+    return found.length === 1 && found[0].state === "uploaded";
+  });
+}
+
+// The await-release job plans again after the macOS files arrived. It must
+// build exactly what the first plan built: a platform that became published in
+// between (another run) would be built here and also downloaded, and one that
+// is newly missing would never be built.
+export function checkPlanned(planned, now) {
+  const kinds = (plan) => [...plan.matrix.map((e) => e.kind), ...(plan.rpm ? ["rpm"] : [])].sort().join(",");
+  if (kinds(planned) !== kinds(now))
+    throw new Error(
+      `The platforms to build changed since the plan job ran (planned: ${kinds(planned) || "none"}, now: ${kinds(now) || "none"}). Another run probably published a platform. Nothing was published; check the release assets and start the workflow again.`,
+    );
 }
 
 // The workflow never builds macOS: the release must already carry its files.
@@ -283,6 +322,80 @@ export function feedSupersedes(newFeed, existingFeed = null) {
   return compare(feedVersion(newFeed), existing) >= 0;
 }
 
+// ---- native.yml gate (shared by the workflow and native-release-macos-local.mjs) ----
+
+// The native.yml push runs on main for a commit, in any state. No status filter:
+// GitHub's `status=success` filtered index returned no runs for a run that had
+// succeeded, for hours. The conclusion is judged from the unfiltered list.
+export function ciRunsPath(sha, repository = REPOSITORY) {
+  return `repos/${repository}/actions/workflows/native.yml/runs?head_sha=${sha}&event=push&branch=main&per_page=100`;
+}
+export const CI_RUNS_JQ =
+  "{total: .total_count, runs: [.workflow_runs[] | {id: .id, status: .status, conclusion: .conclusion, url: .html_url}]}";
+
+// "success" when any run succeeded, "pending" while a run is not completed or
+// none exists yet (it may not have been created), "failed" when every run
+// completed and none succeeded. The runs API returns each run's latest attempt:
+// a rerun that failed after an earlier success reads as a failure, and a rerun
+// in progress reads as pending.
+export function ciVerdict(runs) {
+  if (runs.some((run) => run.conclusion === "success")) return "success";
+  if (runs.length === 0 || runs.some((run) => run.status !== "completed")) return "pending";
+  return "failed";
+}
+
+const describeRun = (run) => `run ${run.id} (${run.status === "completed" ? run.conclusion : run.status}) ${run.url}`;
+export const describeCi = (runs) =>
+  runs.length === 0 ? "no native.yml run found yet" : runs.map(describeRun).join("; ");
+
+// Reads the runs through `capture`; { runs } or { error }. A list that holds
+// fewer runs than the total is an error, never judged, unless it already holds
+// a successful run (enough to decide, whatever the missing runs are).
+export function readCiRuns(capture, sha, repository = REPOSITORY) {
+  const result = capture("gh", ["api", ciRunsPath(sha, repository), "--jq", CI_RUNS_JQ]);
+  if (result.status !== 0) return { error: (result.stderr || result.error?.message || "gh failed").trim() };
+  try {
+    const answer = JSON.parse(result.stdout);
+    if (!Array.isArray(answer?.runs) || !Number.isInteger(answer.total)) throw new Error("not a run list");
+    if (answer.total > answer.runs.length && !answer.runs.some((run) => run.conclusion === "success"))
+      throw new Error(`truncated list: ${answer.runs.length} of ${answer.total} runs`);
+    return { runs: answer.runs };
+  } catch (error) {
+    return { error: `unreadable answer (${error.message})` };
+  }
+}
+
+export const CI_GATE_ATTEMPTS = 6;
+export const CI_GATE_SLEEP_MS = 20_000;
+
+// Requires a successful native.yml run for `sha`. Retries read errors and
+// pending states (including no run yet) so that a short lag does not fail a
+// release; fails at once when every run finished without success. io:
+// { capture, sleep, log }.
+export async function ciGate(io, sha, { repository = REPOSITORY, attempts = CI_GATE_ATTEMPTS, sleepMs = CI_GATE_SLEEP_MS } = {}) {
+  let last = "no read made";
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const read = readCiRuns(io.capture, sha, repository);
+    if (read.error !== undefined) {
+      last = `could not read the native.yml runs (${read.error})`;
+    } else {
+      const verdict = ciVerdict(read.runs);
+      if (verdict === "success") {
+        io.log(`native.yml passed for ${sha}: ${describeCi(read.runs.filter((r) => r.conclusion === "success"))}`);
+        return;
+      }
+      if (verdict === "failed")
+        throw new Error(`native.yml has no successful push run on main for commit ${sha}: ${describeCi(read.runs)}`);
+      last = `native.yml has no successful push run on main for commit ${sha} yet: ${describeCi(read.runs)}`;
+    }
+    if (attempt < attempts) {
+      io.log(`${last}; retrying in ${sleepMs / 1000} s (${attempt}/${attempts}).`);
+      await io.sleep(sleepMs);
+    }
+  }
+  throw new Error(`${last} (after ${attempts} reads)`);
+}
+
 if (
   process.argv[1] &&
   import.meta.url === pathToFileURL(resolve(process.argv[1])).href
@@ -290,19 +403,28 @@ if (
   const [command, first, second] = process.argv.slice(2);
   if (command === "sign" && first && second) {
     await prepareMonoptahRelease(first, second);
+  } else if (command === "macos-ready" && first) {
+    const assets = JSON.parse(await readFile(first, "utf8"));
+    console.log(String(macosFilesReady(process.env.MONOCODE_NATIVE_VERSION, assets)));
   } else if (command === "plan") {
+    const flags = process.argv.slice(3).filter((arg) => arg.startsWith("--"));
+    const file = process.argv.slice(3).find((arg) => !arg.startsWith("--"));
+    const version = process.env.MONOCODE_NATIVE_VERSION;
     const published =
-      first && existsSync(first)
-        ? (await readFile(first, "utf8"))
+      file && existsSync(file)
+        ? (await readFile(file, "utf8"))
             .split("\n")
             .map((line) => line.trim())
             .filter(Boolean)
         : [];
-    const plan = requireReused(
-      planBuilds(process.env.MONOCODE_NATIVE_VERSION, published),
-      "macos",
-      process.env.MONOCODE_NATIVE_VERSION,
-    );
+    const deferMacos = flags.includes("--defer-macos");
+    const planned = planBuilds(version, published, { deferMacos });
+    const plan = deferMacos ? planned : requireReused(planned, "macos", version);
+    if (flags.includes("--check-planned"))
+      checkPlanned(
+        { matrix: JSON.parse(process.env.PLANNED_MATRIX ?? "[]"), rpm: process.env.PLANNED_RPM === "true" },
+        plan,
+      );
     console.log(`matrix=${JSON.stringify(plan.matrix)}`);
     console.log(`rpm=${plan.rpm}`);
     console.log(`build_any=${plan.buildAny}`);
@@ -315,9 +437,24 @@ if (
     const existing =
       second && existsSync(second) ? await readFile(second, "utf8") : null;
     console.log(String(feedSupersedes(await readFile(first, "utf8"), existing)));
+  } else if (command === "ci-gate" && first) {
+    try {
+      await ciGate(
+        {
+          capture: (cmd, args) => spawnSync(cmd, args, { encoding: "utf8" }),
+          sleep: (ms) => new Promise((done) => setTimeout(done, ms)),
+          log: (line) => console.log(line),
+        },
+        first,
+        { repository: process.env.GITHUB_REPOSITORY || REPOSITORY },
+      );
+    } catch (error) {
+      console.error(error.message);
+      process.exit(1);
+    }
   } else {
     console.error(
-      "usage: native-release-monoptah.mjs plan [published-file] | records <dir> | sign <dir> <notes-file> | file-count | feed-supersedes <new> [existing]",
+      "usage: native-release-monoptah.mjs plan [--defer-macos] [--check-planned] [published-file] | macos-ready <assets-json> | records <dir> | sign <dir> <notes-file> | file-count | feed-supersedes <new> [existing] | ci-gate <sha>",
     );
     process.exit(2);
   }

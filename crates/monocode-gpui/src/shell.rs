@@ -330,6 +330,9 @@ pub(crate) fn bind_keys(cx: &mut App) {
 /// that Linux tests get from server decorations.
 #[cfg(target_os = "windows")]
 const WINDOWS_CONTROLS: bool = cfg!(not(test));
+/// Whether the project menu lists "Telegram…". Hidden until Telegram is in use; the dialog, its
+/// "telegram" menu action and the bridge stay in place, so flipping this brings the item back.
+const SHOW_TELEGRAM_MENU_ITEM: bool = false;
 
 pub(crate) fn client_controls_width(window: &Window) -> f32 {
     #[cfg(target_os = "linux")]
@@ -6383,18 +6386,15 @@ impl Shell {
                         .into(),
                 ];
                 if !path.starts_with(monocode_core::remote::REMOTE_PATH_PREFIX) {
-                    items.push(
-                        MenuAction::new("telegram", "Telegram…")
-                            .icon("paper-plane")
-                            .into(),
-                    );
+                    if SHOW_TELEGRAM_MENU_ITEM {
+                        items.push(
+                            MenuAction::new("telegram", "Telegram…")
+                                .icon("paper-plane")
+                                .into(),
+                        );
+                    }
                     items.push(
                         MenuAction::new("cloud-settings", "Cloud settings…")
-                            .icon("cloud-upload")
-                            .into(),
-                    );
-                    items.push(
-                        MenuAction::new("cloud-workspaces", "Cloud workspaces…")
                             .icon("cloud-upload")
                             .into(),
                     );
@@ -6602,8 +6602,6 @@ impl Shell {
                     self.open_telegram_dialog(path, window, cx);
                 } else if action == "cloud-settings" {
                     self.open_cloud_settings(path, None, window, cx);
-                } else if action == "cloud-workspaces" {
-                    self.open_cloud_workspaces(path, window, cx);
                 } else if action == "archive" {
                     self.archive_project(&path, window, cx);
                 } else if action == "delete" {
@@ -9469,6 +9467,17 @@ impl Render for Shell {
             self.window_active = window.is_window_active();
             self.sync_cloud_chip_window(cx);
             let chip = self.usage_footer.read(cx).cloud_chip().clone();
+            // The chip is an item of the footer's terminal controls group, which the shell lays
+            // out: showing or hiding it redraws the shell. Its other changes redraw only itself.
+            let mut chip_shown = chip.read(cx).visible();
+            self.observations
+                .push(cx.observe(&chip, move |_, chip, cx| {
+                    let shown = chip.read(cx).visible();
+                    if shown != chip_shown {
+                        chip_shown = shown;
+                        cx.notify();
+                    }
+                }));
             self.observations.push(cx.subscribe_in(
                 &chip,
                 window,
@@ -9533,11 +9542,14 @@ impl Render for Shell {
                 .push(cx.observe_window_activation(window, |this, window, cx| {
                     if !window.is_window_active() {
                         this.close_preview(cx);
+                        if let Some(center) = crate::accounts::get(cx) {
+                            center.update(cx, |center, _| center.app_deactivated());
+                        }
                     } else {
                         this.resume_git(cx);
                         this.check_github_star(true, cx);
                         if let Some(center) = crate::accounts::get(cx) {
-                            center.update(cx, |center, cx| center.app_reactivated(cx));
+                            center.update(cx, |center, cx| center.app_reactivated(window, cx));
                         }
                     }
                 }));
@@ -10183,7 +10195,7 @@ impl Render for Shell {
             .children(self.telegram_topic_modal(window, cx))
             .children(self.cloud_settings_modal(window, cx))
             .children(self.fix_terminal_modal(window, cx))
-            .children(self.cloud_workspaces_modal(window, cx))
+            .children(self.cloud_workspaces_drawer(window, cx))
             .children(self.cloud_move_modal(window, cx))
             .children(self.delete_modal(window, cx))
             .children(self.cloud_archive_modal(window, cx))

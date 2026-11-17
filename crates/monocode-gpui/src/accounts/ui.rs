@@ -108,12 +108,46 @@ impl Accounts {
                         ))
                     })
                     .child(if self.working {
-                        "Waiting for browser…"
+                        if self.code_mode_running() {
+                            "Waiting for code…"
+                        } else {
+                            "Waiting for browser…"
+                        }
                     } else {
                         "Sign in and add account"
                     })
-                    .on_click(cx.listener(|this, _, _, cx| this.submit_editor(cx))),
+                    .on_click(cx.listener(|this, _, _, cx| this.submit_footer_editor(false, cx))),
                 )
+                .when(super::token::offers_code_sign_in(editor.kind), |d| {
+                    d.child(
+                        secondary_button(
+                            "save-account-edit-with-code",
+                            "Sign in with code",
+                            false,
+                            self.working || editor.input.read(cx).content.trim().is_empty(),
+                        )
+                        .mt_2()
+                        .h_8()
+                        .w_full()
+                        .rounded_lg()
+                        .justify_center()
+                        .text_size(px(11.))
+                        .child("Sign in with code")
+                        .on_click(
+                            cx.listener(|this, _, _, cx| this.submit_footer_editor(true, cx)),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .mt_1()
+                            .px_1()
+                            .text_size(px(10.))
+                            .line_height(px(16.))
+                            .text_color(content(0.4))
+                            .child("Opens a page that shows a code to paste back here."),
+                    )
+                })
+                .children(self.inline_code_entry(cx))
                 .children(self.error.as_ref().map(|error| {
                     div()
                         .mt_2()
@@ -131,8 +165,15 @@ impl Accounts {
         let auth = editor.auth;
         let disabled = self.working || !ready;
         let label = if self.working && (adding || options) {
-            if options && auth != super::AuthMethod::Browser {
+            if options
+                && !matches!(
+                    auth,
+                    super::AuthMethod::Browser | super::AuthMethod::BrowserCode
+                )
+            {
                 "Saving…"
+            } else if auth == super::AuthMethod::BrowserCode {
+                "Waiting for code…"
             } else {
                 "Waiting for browser…"
             }
@@ -246,7 +287,11 @@ impl Accounts {
                     .child(submit),
             )
             .children(self.auth_menu_popover(cx));
-        div().child(row).children(secret).into_any_element()
+        div()
+            .child(row)
+            .children(secret)
+            .children(self.inline_code_entry(cx))
+            .into_any_element()
     }
 
     pub(crate) fn settings_rows(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -997,6 +1042,7 @@ impl Render for Accounts {
         let complete = signin.complete;
         let failed = signin.error.is_some();
         let action = signin.action;
+        let signin_mode = signin.mode;
         let title = if complete {
             format!(
                 "Signed {} {}",
@@ -1009,6 +1055,8 @@ impl Render for Accounts {
             )
         } else if failed {
             "Authentication required".into()
+        } else if signin_mode == accounts::SignInMode::Code {
+            "Waiting for code…".into()
         } else {
             "Waiting for browser…".into()
         };
@@ -1024,6 +1072,14 @@ impl Render for Accounts {
                 .and_then(|e| e.previous_focus.clone())
                 .or_else(|| window.focused(cx));
             window.focus(&self.dialog_focus, cx);
+        }
+        // Bring the code field forward once, so the user can paste right away.
+        if self.has_modal_auth()
+            && let Some(prompt) = self.signin.as_mut().and_then(|s| s.code.as_mut())
+            && !prompt.focused
+        {
+            prompt.focused = true;
+            window.focus(&prompt.input.read(cx).focus_handle(cx), cx);
         }
         div()
             .absolute()
@@ -1088,7 +1144,11 @@ impl Render for Accounts {
                             .child(if complete {
                                 "You can retry your last message now."
                             } else {
-                                "The provider CLI opens its browser to complete sign-in."
+                                if signin_mode == accounts::SignInMode::Code {
+                                    "Sign in in your browser, then paste the code shown there."
+                                } else {
+                                    "The provider CLI opens its browser to complete sign-in."
+                                }
                             }),
                     )
                     .child(
@@ -1098,6 +1158,8 @@ impl Render for Accounts {
                                 "Continue"
                             } else if failed {
                                 "Retry sign-in"
+                            } else if signin_mode == accounts::SignInMode::Code {
+                                "Waiting for code"
                             } else {
                                 "Waiting for browser"
                             },
@@ -1109,6 +1171,8 @@ impl Render for Accounts {
                             "Continue"
                         } else if failed {
                             "Retry sign-in"
+                        } else if signin_mode == accounts::SignInMode::Code {
+                            "Waiting for code…"
                         } else {
                             "Waiting for browser…"
                         })
@@ -1117,11 +1181,19 @@ impl Render for Accounts {
                                 if complete {
                                     this.close_auth(window, cx);
                                 } else if failed {
-                                    this.begin_auth(kind, &retry_id, action, adding.clone(), cx);
+                                    this.begin_auth(
+                                        kind,
+                                        &retry_id,
+                                        action,
+                                        signin_mode,
+                                        adding.clone(),
+                                        cx,
+                                    );
                                 }
                             },
                         )),
                     )
+                    .children(self.code_entry("provider-signin", true, cx))
                     .children(error.map(|error| {
                         div()
                             .id("provider-signin-error")
@@ -1145,7 +1217,7 @@ impl Accounts {
         self.close_auth(window, cx);
         true
     }
-    fn close_auth(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn close_auth(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.cancel_auth(cx);
         if let Some(focus) = self.previous_focus.take() {
             window.focus(&focus, cx);
