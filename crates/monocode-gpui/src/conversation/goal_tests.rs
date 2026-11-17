@@ -107,7 +107,7 @@ fn goal_state_reads_the_last_row(cx: &mut TestAppContext) {
 #[gpui::test]
 fn goal_pill_clear_launches_the_raw_command(cx: &mut TestAppContext) {
     let window = conversation(cx);
-    let view = window.clone();
+    let view = window;
     window
         .update(cx, |view, _, cx| {
             view.transcript.update(cx, |v, cx| {
