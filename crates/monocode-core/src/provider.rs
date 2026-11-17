@@ -18,14 +18,15 @@ use std::time::{Duration, Instant};
 mod acp;
 mod commands;
 pub use commands::{
-    compact, discover_commands, native_invocation, native_prompt, prepare_prompt, supports_compact,
-    NativeCommand, NativeSubcommand,
+    compact, discover_commands, is_advertised_command, native_invocation, native_prompt,
+    prepare_prompt, supports_compact, NativeCommand, NativeSubcommand,
 };
 mod attachments;
 mod compaction;
 pub(crate) mod devin;
 mod discovery;
 mod follow_up;
+mod goal;
 mod kind;
 mod lifecycle;
 mod limits;
@@ -105,6 +106,7 @@ pub enum Event {
         custom_type: String,
         severity: Option<String>,
     },
+    Goal(crate::transcript::GoalNotice),
     ConfigChanged {
         model: Option<String>,
         model_settings: HashMap<String, String>,
@@ -879,6 +881,14 @@ impl Protocol {
                             .filter(|b| b["type"] == "text")
                             .filter_map(|b| b["text"].as_str())
                             .collect::<String>();
+                        // The CLI's own goal notices arrive as synthetic
+                        // assistant rows; they are state, not conversation.
+                        if v["message"]["model"] == "<synthetic>" {
+                            if let Some(notice) = goal::goal_notice(&text) {
+                                events.push(Event::Goal(notice));
+                                return Ok(events);
+                            }
+                        }
                         self.text(&self.claude_message.to_string(), &text, true, &mut events);
                     }
                     "user" => {
@@ -1953,6 +1963,36 @@ mod tests {
             model: None,
             settings: Default::default(),
         })
+    }
+    #[test]
+    fn synthetic_goal_rows_become_goal_events() {
+        let mut out = Vec::new();
+        let mut p = protocol(Kind::Claude);
+        let events = p
+            .frame(
+                json!({"type":"assistant","message":{"role":"assistant","model":"<synthetic>",
+                    "content":[{"type":"text","text":"Goal set: reply with ok"}]}}),
+                &mut out,
+            )
+            .unwrap();
+        let Event::Goal(notice) = events.iter().find(|e| matches!(e, Event::Goal(_))).unwrap()
+        else {
+            panic!("no goal event")
+        };
+        assert_eq!(notice.phase, crate::transcript::GoalPhase::Set);
+        assert_eq!(notice.condition.as_deref(), Some("reply with ok"));
+        assert!(!events.iter().any(|e| matches!(e, Event::Text(_))));
+
+        let mut p = protocol(Kind::Claude);
+        let events = p
+            .frame(
+                json!({"type":"assistant","message":{"role":"assistant","model":"group/never-stuck",
+                    "content":[{"type":"text","text":"Goal set: reply with ok"}]}}),
+                &mut out,
+            )
+            .unwrap();
+        assert!(events.iter().any(|e| matches!(e, Event::Text(_))));
+        assert!(!events.iter().any(|e| matches!(e, Event::Goal(_))));
     }
     #[test]
     fn codex_file_changes_retain_every_edited_path() {

@@ -17,6 +17,8 @@ mod composer_shelf;
 mod edit_last_turn;
 mod follow_up;
 pub(crate) mod git_actions;
+#[cfg(test)]
+mod goal_tests;
 mod history;
 mod mobile;
 mod mono;
@@ -67,6 +69,7 @@ pub(crate) use mobile::{
 pub(crate) use mono::QueueChanged as MonoQueueChanged;
 pub(crate) use mono::Submitted as MonoSubmitted;
 pub(crate) use mono::{TurnEnd, WorkflowTurn};
+use monocode_core::transcript::{GoalNotice, GoalPhase};
 use monocode_core::{
     agent::{AccessMode, Approval, Control, Decision, Settings},
     catalog::{self, Model},
@@ -327,6 +330,9 @@ pub(crate) struct Conversation {
     branch_anchor: AnchorSlot,
     context_anchor: AnchorSlot,
     composer_anchor: AnchorSlot,
+    goal_anchor: AnchorSlot,
+    /// The goal pill's full-condition popover is open.
+    goal_open: bool,
     composer_motion: ComposerMotion,
     narrow: bool,
     // A split or review pane sits beside this chat; only then does a narrow
@@ -816,6 +822,8 @@ impl Conversation {
             account_anchor: AnchorSlot::default(),
             workspace_anchor: AnchorSlot::default(),
             git_action_anchor: AnchorSlot::default(),
+            goal_anchor: AnchorSlot::default(),
+            goal_open: false,
             session_edits: Vec::new(),
             session_git: Default::default(),
             session_unpushed: false,
@@ -1295,6 +1303,179 @@ impl Conversation {
         self.settings.account.id != monocode_core::accounts::DEFAULT
             && crate::accounts::get(cx)
                 .is_some_and(|center| !center.read(cx).book.exists(kind, &self.settings.account.id))
+    }
+    /// The session goal the pill above the composer shows: the last `goal`
+    /// row wins, so a resumed session recovers its state from the transcript
+    /// alone, and a cleared or achieved one shows nothing. The condition comes
+    /// from the most recent `Goal set` row; checkins and pauses carry none.
+    fn goal_state(&self, cx: &gpui::App) -> Option<(GoalPhase, String)> {
+        let rows = self.transcript.read(cx).source_rows();
+        let last = rows.iter().rev().find(|row| row.role == "goal")?;
+        let notice = serde_json::from_str::<GoalNotice>(&last.text).ok()?;
+        let phase = match notice.phase {
+            GoalPhase::Set | GoalPhase::Checkin => GoalPhase::Set,
+            GoalPhase::Paused => GoalPhase::Paused,
+            GoalPhase::Cleared | GoalPhase::Achieved | GoalPhase::Error => return None,
+        };
+        let condition = rows
+            .iter()
+            .rev()
+            .filter(|row| row.role == "goal")
+            .filter_map(|row| serde_json::from_str::<GoalNotice>(&row.text).ok())
+            .find(|notice| notice.phase == GoalPhase::Set)
+            .and_then(|notice| notice.condition)
+            .unwrap_or_default();
+        Some((phase, condition))
+    }
+    /// The active goal as a capsule above the composer, in the stroked-pill
+    /// family of the Commit shelf: a breathing accent dot while the goal
+    /// steers turns, the condition, and a `×` that clears the goal through
+    /// the same raw-command passthrough that set it. No goal, no pill and no
+    /// reserved space.
+    fn goal_pill(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (phase, condition) = self.goal_state(cx)?;
+        let paused = phase == GoalPhase::Paused;
+        let shown: String = condition.chars().take(48).collect();
+        let truncated = condition.chars().count() > 48;
+        let label = if paused {
+            "目标 · 已暂停 · "
+        } else {
+            "目标 · "
+        };
+        let breath = if paused {
+            None
+        } else {
+            Some(crate::pulse::looping(
+                gpui::ElementId::Name("goal-pill-breath".into()),
+                std::time::Duration::from_millis(2_000),
+                crate::pulse::Rate::Low,
+                move |phase| {
+                    // The same slow swell the background clock's dot uses.
+                    let breath = 0.5 - 0.5 * (phase * std::f32::consts::TAU).cos();
+                    let accent = accent_color();
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .size(px(12.))
+                        .rounded_full()
+                        .bg(accent.opacity(0.22 * (1. - breath)))
+                        .child(
+                            div()
+                                .size(px(6.))
+                                .rounded_full()
+                                .bg(accent.opacity(0.6 + 0.4 * breath)),
+                        )
+                },
+            ))
+        };
+        Some(
+            div()
+                .mb(px(6.))
+                .px(px(12.))
+                .flex()
+                .items_center()
+                .child(self.goal_anchor.probe())
+                .child(
+                    div()
+                        .id("goal-state")
+                        .debug_selector(|| "goal-state".into())
+                        .role(Role::Button)
+                        .aria_label(format!("目标：{condition}"))
+                        .cursor_pointer()
+                        .h(px(26.))
+                        .max_w(px(320.))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .pl(px(10.))
+                        .pr(px(4.))
+                        .rounded_full()
+                        .border_1()
+                        .border_color(content(0.1))
+                        .text_size(px(12.))
+                        .text_color(content(0.7))
+                        .hover(|s| {
+                            s.border_color(content(0.2))
+                                .bg(content(0.06))
+                                .text_color(content(1.))
+                        })
+                        .when_some(breath, |d, breath| d.child(breath))
+                        .when(paused, |d| {
+                            d.child(
+                                div()
+                                    .size(px(7.))
+                                    .flex_shrink_0()
+                                    .rounded_full()
+                                    .bg(warning_color()),
+                            )
+                        })
+                        .child(div().min_w_0().truncate().child(format!(
+                            "{label}{shown}{}",
+                            if truncated { "…" } else { "" }
+                        )))
+                        .child(
+                            div()
+                                .id("goal-clear")
+                                .debug_selector(|| "goal-clear".into())
+                                .role(Role::Button)
+                                .aria_label("Clear the goal")
+                                .cursor_pointer()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .size(px(18.))
+                                .rounded_full()
+                                .text_color(content(0.5))
+                                .hover(|s| s.bg(content(0.12)).text_color(content(0.85)))
+                                .child(icon("close", 10.))
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                    // Keep the press from opening the pill's popover.
+                                    cx.stop_propagation();
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.goal_open = false;
+                                    this.launch_prompt("/goal clear".into(), cx);
+                                })),
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.goal_open = !this.goal_open;
+                            cx.notify();
+                        })),
+                )
+                .into_any_element(),
+        )
+    }
+    /// The full goal condition, opened by clicking the pill body.
+    fn goal_popover(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.goal_open {
+            return None;
+        }
+        let (_, condition) = self.goal_state(cx)?;
+        let this = cx.entity().downgrade();
+        Some(
+            popover("goal-condition", Anchor::Slot(self.goal_anchor.clone()))
+                .side(Side::Top)
+                .width(380.)
+                .on_dismiss(move |_, cx| {
+                    let _ = this.update(cx, |this, cx| {
+                        this.goal_open = false;
+                        cx.notify();
+                    });
+                })
+                .child(
+                    div()
+                        .id("goal-condition-text")
+                        .p_3()
+                        .text_size(px(12.5))
+                        .line_height(px(20.))
+                        .text_color(content(0.8))
+                        .max_h(px(200.))
+                        .overflow_y_scroll()
+                        .child(condition),
+                )
+                .into_any_element(),
+        )
     }
     fn launch_prompt(&mut self, prompt: String, cx: &mut Context<Self>) {
         if self.reset_in_progress() {
@@ -3145,6 +3326,8 @@ impl Conversation {
             .children(self.remote_notice(cx))
             .children(self.cloud_sync_notice(cx))
             .children(self.move_notice(cx))
+            .children(self.goal_pill(cx))
+            .children(self.goal_popover(cx))
             .child(self.cloud_start_panel(cx))
             .child(self.message_queue(window, cx))
             .children(if self.is_remote() { None } else { self.auth_notice(cx) })
