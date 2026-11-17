@@ -80,6 +80,7 @@ mod pane_layout;
 mod pane_motion;
 mod panel_root;
 mod particle_text;
+mod persistence_log;
 mod phase_tile;
 mod pickers;
 mod popover;
@@ -119,6 +120,7 @@ mod today;
 mod traffic_lights;
 mod transcript;
 mod tui_session;
+mod ui_store_saves;
 mod usage_footer;
 mod visuals;
 #[cfg(test)]
@@ -129,11 +131,14 @@ mod worktree_switcher;
 
 #[cfg(target_os = "macos")]
 use gpui::KeyBinding;
-use gpui::{App, TitlebarOptions, WindowOptions, actions, point, prelude::*, px, size};
+use gpui::{App, Global, TitlebarOptions, WindowOptions, actions, point, prelude::*, px, size};
 use monocode_core::{store::Store, transcript::Transcript};
 use std::{
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Instant,
 };
 /// libmalloc keeps freed large spans dirty, so startup decodes and image churn
@@ -143,32 +148,69 @@ use std::{
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 actions!(application, [Quit]);
+
+/// One quit at a time: a second request while the first is still draining the
+/// accepted setting saves would strand its drain watcher. A failed drain resets
+/// the latch so quitting can be attempted again. It lives on the App (there is
+/// one App per process) so tests, which each build their own App, cannot trip
+/// each other's quit.
+#[derive(Default)]
+struct QuitGate(AtomicBool);
+
+impl Global for QuitGate {}
+
 fn quit(cx: &mut App) {
     if notifications::updater::defer_quit(cx) {
         return;
     }
-    // Before the processes die, so workflow runs leave their files as they are (the next start
-    // interrupts them) instead of failing nodes whose commands were killed.
-    monos::begin_quit(cx);
-    let shutdown = cx
-        .background_executor()
-        .spawn(async { monocode_core::process::shutdown_all() });
-    cx.spawn(async move |cx| {
-        shutdown.await;
-        cx.update(|cx| cx.quit());
-    })
-    .detach();
+    quit_after_saving(cx, |cx| cx.quit());
 }
 
 /// Quit, then relaunch the same app once this process has exited.
 fn restart(cx: &mut App) {
+    quit_after_saving(cx, App::restart);
+}
+
+/// Quit and restart both drain the accepted UI setting saves before anything is
+/// torn down: `monos::begin_quit` and the process shutdown are irreversible for
+/// this process, while a failed drain keeps the app, its providers and its
+/// windows alive with the save error still visible. The UI thread never waits.
+fn quit_after_saving(cx: &mut App, finish: impl FnOnce(&mut App) + 'static) {
+    if cx
+        .default_global::<QuitGate>()
+        .0
+        .swap(true, Ordering::SeqCst)
+    {
+        return;
+    }
+    let Some(saver) = ui_store_saves::inbox_saver(cx) else {
+        stop_processes(cx, finish);
+        return;
+    };
+    let drained = saver.drain();
+    cx.spawn(async move |cx| {
+        if !matches!(drained.recv().await, Ok(Ok(()))) {
+            cx.update(|cx| cx.global::<QuitGate>().0.store(false, Ordering::SeqCst));
+            // The Inbox keeps showing the save error, and the saver takes saves
+            // again, so the user can retry by quitting once more.
+            eprintln!("Not quitting: saving the inbox state is still failing");
+            return;
+        }
+        cx.update(|cx| stop_processes(cx, finish));
+    })
+    .detach();
+}
+
+/// Before the processes die, so workflow runs leave their files as they are (the next start
+/// interrupts them) instead of failing nodes whose commands were killed.
+fn stop_processes(cx: &mut App, finish: impl FnOnce(&mut App) + 'static) {
     monos::begin_quit(cx);
     let shutdown = cx
         .background_executor()
         .spawn(async { monocode_core::process::shutdown_all() });
     cx.spawn(async move |cx| {
         shutdown.await;
-        cx.update(|cx| cx.restart());
+        cx.update(|cx| finish(cx));
     })
     .detach();
 }
@@ -374,6 +416,14 @@ fn main() {
             .unwrap_or(std::path::Path::new("."))
             .join("checkpoints"),
     );
+    // New ordinary local sessions use the chunked backend (batch 2, spec
+    // rollout order: new sessions before any conversion of existing ones).
+    // Existing sessions stay blobs until a per-need conversion; terminal
+    // sessions are excluded by the store itself.
+    if let Err(error) = db.prefer_chunked_storage(true) {
+        eprintln!("Cannot enable chunked storage for new sessions: {error}");
+        std::process::exit(1);
+    }
     // Docker accounts: every `sbx` and sandbox ssh of a project that names an account gets
     // that account's token from here. Installed once, over this database's credentials.
     monocode_core::docker_accounts::install_system(&db);
@@ -476,6 +526,8 @@ fn main() {
             #[cfg(target_os = "macos")]
             memory_log::start(cx);
             frame_log::start(cx);
+            persistence_log::start(cx);
+            ui_store_saves::install(db.clone(), cx);
             gpu_trim::start(cx);
             #[cfg(target_os = "macos")]
             hang_watchdog::start(database.with_file_name("gpui-hangs"), cx);
@@ -709,5 +761,93 @@ mod native_tests {
                 });
             })
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod persistence_safety_tests {
+    use super::*;
+    use crate::ui_store_saves::test_support::HeldStore;
+    use gpui::TestAppContext;
+    use std::{path::Path, sync::Arc};
+
+    fn memory_store() -> crate::runtime::Database {
+        Arc::new(Mutex::new(Store::open(Path::new(":memory:")).unwrap()))
+    }
+
+    fn inbox_setting(store: &crate::runtime::Database) -> Option<String> {
+        store
+            .lock()
+            .unwrap()
+            .setting(ui_store_saves::INBOX_KEY)
+            .unwrap()
+    }
+
+    #[gpui::test]
+    fn quit_waits_for_latest_setting(cx: &mut TestAppContext) {
+        let store = memory_store();
+        cx.update(|cx| {
+            ui_store_saves::install(store.clone(), cx);
+            ui_store_saves::inbox_saver(cx)
+                .unwrap()
+                .save_latest("latest".into())
+                .unwrap();
+        });
+        let held = HeldStore::hold(&store);
+        let mut restarted = cx.expect_restart();
+        cx.update(restart);
+        // Nothing has relaunched yet: the drain is waiting on the held Store.
+        // (A pending restart reads as `Ok(None)`; `Err` would mean the
+        // restart sender was dropped without relaunching.)
+        assert_eq!(
+            restarted.try_recv(),
+            Ok(None),
+            "the relaunch started before the drain finished"
+        );
+        assert!(held.release());
+        cx.run_until_parked();
+        assert!(
+            matches!(restarted.try_recv(), Ok(Some(_))),
+            "the relaunch happened only after the save"
+        );
+        assert_eq!(inbox_setting(&store).as_deref(), Some("latest"));
+    }
+
+    #[gpui::test]
+    fn failed_drain_keeps_app_open(cx: &mut TestAppContext) {
+        let store = memory_store();
+        store
+            .lock()
+            .unwrap()
+            .fail_next_save_commit_for_test()
+            .unwrap();
+        cx.update(|cx| {
+            ui_store_saves::install(store.clone(), cx);
+            ui_store_saves::inbox_saver(cx)
+                .unwrap()
+                .save_latest("unsaved".into())
+                .unwrap();
+        });
+        let mut restarted = cx.expect_restart();
+        cx.update(restart);
+        cx.run_until_parked();
+        // No relaunch: the process, its providers and its windows stayed alive.
+        assert_eq!(
+            restarted.try_recv(),
+            Ok(None),
+            "a failed drain must keep the app open"
+        );
+        assert_eq!(inbox_setting(&store), None);
+        // The saver takes saves again, so quitting can be attempted again.
+        cx.update(|cx| {
+            assert!(
+                ui_store_saves::inbox_saver(cx)
+                    .unwrap()
+                    .save_latest("retry".into())
+                    .is_ok()
+            );
+        });
+        cx.run_until_parked();
+        assert_eq!(inbox_setting(&store).as_deref(), Some("retry"));
     }
 }

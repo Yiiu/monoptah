@@ -9,6 +9,9 @@
 # will likely look very different (and much more reasonable).
 # See Cargo.toml.orig for the original contents.
 
+# Keep this path dependency independent of enclosing worktree workspaces.
+[workspace]
+
 [package]
 edition = "2018"
 name = "portable-pty"

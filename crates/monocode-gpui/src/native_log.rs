@@ -158,9 +158,10 @@ fn recorded_target(target: &str) -> bool {
 /// (occlusion, resize, file drop and its frame probe), which describe the
 /// state around a freeze and are otherwise lost.
 fn wanted(level: log::Level, target: &str) -> bool {
-    recorded_target(target)
-        && (level <= log::Level::Warn
-            || (level == log::Level::Info && target.split("::").next() == Some("gpui_macos")))
+    (target == crate::persistence_log::TARGET && level <= log::Level::Info)
+        || recorded_target(target)
+            && (level <= log::Level::Warn
+                || (level == log::Level::Info && target.split("::").next() == Some("gpui_macos")))
 }
 
 fn format_line(record: &log::Record) -> String {
@@ -189,6 +190,20 @@ pub(crate) fn install(directory: &Path) {
 /// Writes one warn line from the watchdog thread.
 pub(crate) fn warn(message: &str) {
     log::warn!(target: "ui_watchdog", "{message}");
+}
+
+#[cfg(test)]
+mod persistence_safety_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_only_the_exact_numeric_persistence_target() {
+        assert!(wanted(log::Level::Info, crate::persistence_log::TARGET));
+        assert!(!wanted(log::Level::Debug, crate::persistence_log::TARGET));
+        assert!(!wanted(log::Level::Info, "persistence_stats::payload"));
+        assert!(!wanted(log::Level::Warn, "persistence_stats::payload"));
+        assert!(!wanted(log::Level::Info, "monocode_core::store"));
+    }
 }
 
 #[cfg(test)]

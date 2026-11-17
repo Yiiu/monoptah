@@ -564,7 +564,7 @@ impl Inbox {
                                 this.state.seen.mark(item);
                             }
                         }
-                        this.save();
+                        this.save(cx);
                         cx.notify();
                     },
                 )),
@@ -2249,7 +2249,7 @@ impl Inbox {
         self.state.hidden_clickup_spaces.clear();
     }
     fn filters_changed(&mut self, refetch: bool, cx: &mut Context<Self>) {
-        self.save();
+        self.save(cx);
         if let Some(item) = self.visible_items(cx).first() {
             self.select(item.key(), cx);
         } else {
@@ -3011,7 +3011,7 @@ impl gpui::Render for Inbox {
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
                     if this.resize_start.take().is_some() {
-                        this.save();
+                        this.save(cx);
                         cx.notify();
                     }
                 }),
@@ -3020,7 +3020,7 @@ impl gpui::Render for Inbox {
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
                     if this.resize_start.take().is_some() {
-                        this.save();
+                        this.save(cx);
                         cx.notify();
                     }
                 }),
@@ -3036,6 +3036,7 @@ impl gpui::Render for Inbox {
                     .child(div().flex_1().min_w_0().min_h_0().child(detail)),
             )
             .when_some(self.error.clone(), |d, text| d.child(error(text)))
+            .when_some(self.save_error.clone(), |d, text| d.child(error(text)))
             .when(self.filters_open, |d| d.child(self.filters_menu(cx)))
             .when(self.connections_open, |d| d.child(self.connection_menu(cx)))
             .when(self.project_picker, |d| d.child(self.project_menu(cx)))
@@ -3079,26 +3080,38 @@ mod tests {
         }
     }
     fn fixture(cx: &mut TestAppContext) -> WindowHandle<Fixture> {
-        let window = cx.update(|cx| cx.open_window(WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(Bounds::new(point(px(0.), px(0.)), size(px(1100.), px(700.))))),
-            ..Default::default()
-        }, |_, cx| cx.new(|cx| {
-            let item = Item { provider: "github".into(), kind: "pr".into(), state: "open".into(), number: 7, ..Default::default() };
-            let inbox = cx.new(|cx| {
-                let store = Arc::new(Mutex::new(monocode_core::store::Store::open(std::path::Path::new(":memory:")).unwrap()));
-                let mut view = Inbox::new_inner(store, vec![], PathBuf::from("/private/tmp/inbox-regression"), false, cx);
-                view.snapshot.items = vec![item.clone()]; view.selected = Some(item.key());
-                view.details = Some(Details { body: "Description".into(), ..Default::default() });
-                let comments = (0..100).map(|ix| model::Comment {
-                    id: format!("comment-{ix}"), body: (0..30).map(|line| format!("### Finding {line}\n\nReview **retry handling** in `src/main.rs` before returning.\n\n")).collect(),
-                    created_at: format!("2026-10-22T08:{:02}:00Z", ix % 60), ..Default::default()
-                }).collect::<Vec<_>>();
-                view.comments = comments.iter().map(|comment| (comment.clone(), cx.new(|cx| document::InboxDocument::new(comment.body.clone(), PathBuf::from("/repo"), cx)))).collect();
-                view.thread = Some(Thread { comments, ..Default::default() });
-                view.rebuild_activity(); view
+        let store = Arc::new(Mutex::new(
+            monocode_core::store::Store::open(std::path::Path::new(":memory:")).unwrap(),
+        ));
+        let window = cx
+            .update(|cx| {
+                crate::ui_store_saves::install(store.clone(), cx);
+                cx.open_window(
+                    WindowOptions {
+                        window_bounds: Some(WindowBounds::Windowed(Bounds::new(point(px(0.), px(0.)), size(px(1100.), px(700.))))),
+                        ..Default::default()
+                    },
+                    |_, cx| {
+                        cx.new(|cx| {
+                            let item = Item { provider: "github".into(), kind: "pr".into(), state: "open".into(), number: 7, ..Default::default() };
+                            let inbox = cx.new(|cx| {
+                                let mut view = Inbox::new_inner(store, vec![], PathBuf::from("/private/tmp/inbox-regression"), false, cx);
+                                view.snapshot.items = vec![item.clone()]; view.selected = Some(item.key());
+                                view.details = Some(Details { body: "Description".into(), ..Default::default() });
+                                let comments = (0..100).map(|ix| model::Comment {
+                                    id: format!("comment-{ix}"), body: (0..30).map(|line| format!("### Finding {line}\n\nReview **retry handling** in `src/main.rs` before returning.\n\n")).collect(),
+                                    created_at: format!("2026-10-22T08:{:02}:00Z", ix % 60), ..Default::default()
+                                }).collect::<Vec<_>>();
+                                view.comments = comments.iter().map(|comment| (comment.clone(), cx.new(|cx| document::InboxDocument::new(comment.body.clone(), PathBuf::from("/repo"), cx)))).collect();
+                                view.thread = Some(Thread { comments, ..Default::default() });
+                                view.rebuild_activity(); view
+                            });
+                            Fixture { inbox, item }
+                        })
+                    },
+                )
+                .unwrap()
             });
-            Fixture { inbox, item }
-        })).unwrap());
         draw(window, cx);
         window
     }
@@ -3421,11 +3434,19 @@ mod tests {
         let window = fixture(cx);
         window
             .update(cx, |fixture, _, cx| {
-                fixture.inbox.update(cx, |inbox, _| {
+                fixture.inbox.update(cx, |inbox, cx| {
                     inbox.state.source = "clickup".into();
                     inbox.toggle_tracker_option("901".into());
-                    inbox.save();
-                    assert!(inbox.error.is_none());
+                    inbox.save(cx);
+                    assert!(inbox.save_error.is_none());
+                })
+            })
+            .unwrap();
+        // The saver commits on the background executor; the view only accepts it.
+        cx.run_until_parked();
+        window
+            .update(cx, |fixture, _, cx| {
+                fixture.inbox.update(cx, |inbox, _| {
                     let loaded = ViewState::load(&locked(&inbox.store).unwrap());
                     assert_eq!(loaded.hidden_clickup_spaces, ["901"]);
                     inbox.clear_tracker_filters();
@@ -3689,7 +3710,11 @@ mod tests {
     }
     #[gpui::test]
     fn the_list_draws_a_running_rows_spinner_and_tracks_its_scroll(cx: &mut TestAppContext) {
+        let store = Arc::new(Mutex::new(
+            monocode_core::store::Store::open(std::path::Path::new(":memory:")).unwrap(),
+        ));
         let window = cx.update(|cx| {
+            crate::ui_store_saves::install(store.clone(), cx);
             cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(Bounds::new(
@@ -3700,10 +3725,6 @@ mod tests {
                 },
                 |_, cx| {
                     let inbox = cx.new(|cx| {
-                        let store = Arc::new(Mutex::new(
-                            monocode_core::store::Store::open(std::path::Path::new(":memory:"))
-                                .unwrap(),
-                        ));
                         let mut view = Inbox::new_inner(
                             store,
                             vec![],

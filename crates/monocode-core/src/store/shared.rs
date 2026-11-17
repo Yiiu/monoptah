@@ -11,6 +11,7 @@ mod tests;
 mod window;
 pub use window::{HistoryPage, PAGE_TURNS};
 
+use super::native_chunks;
 use super::{Reminder, Session, Store};
 use crate::surface::Surface;
 use crate::{
@@ -36,9 +37,23 @@ pub(super) struct Shared {
     /// The first block sequence of each indexed Mono's row numbering.
     windows: RefCell<HashMap<i64, i64>>,
     queues: RefCell<HashMap<i64, String>>,
+    /// The chunked-storage revision each session was last read or written at.
+    /// A chunked save plans against this value and refuses when the stored
+    /// revision moved: the revision guard blob sessions get from
+    /// `snapshots`.
+    native_revisions: RefCell<HashMap<i64, i64>>,
+    /// Whether sessions this store creates opt into the chunked backend.
+    /// Off by default; the native runtime turns it on for the sessions it
+    /// owns. Terminal (TUI) sessions never opt in — their transcript stays a
+    /// desktop blob by contract.
+    native_creation: std::cell::Cell<bool>,
     account_source: RefCell<Option<crate::accounts::Book>>,
     preferences: std::sync::Arc<crate::desktop_preferences::DesktopPreferences>,
     read_only: bool,
+    /// The refusal every write path surfaces when a storage-mode marker in
+    /// this database claims a version newer than this build understands.
+    /// `None` when writes are allowed; reads never consult it.
+    storage_mode_refusal: Option<String>,
 }
 
 /// A revision guard, rather than another owned copy of every rich source block.
@@ -209,6 +224,18 @@ pub(super) fn project_turns(
 }
 
 impl Store {
+    fn save_encode<T: serde::Serialize>(&self, value: &T) -> Result<String, String> {
+        let started = std::time::Instant::now();
+        let result = encode(value);
+        self.save_stats.update(|sample| {
+            sample.encoding += started.elapsed();
+            if let Ok(raw) = &result {
+                sample.serialized_bytes += raw.len() as u64;
+            }
+        });
+        result
+    }
+
     /// Open the same sessions, notes and reminders as the desktop app. Only a
     /// brand-new file gets a schema; existing schema/data is not migrated.
     pub fn open_monocode(path: &Path) -> Result<Self, String> {
@@ -255,6 +282,10 @@ impl Store {
             sql(conn.execute_batch("PRAGMA journal_mode=WAL;"))?;
             let tx = sql(conn.unchecked_transaction())?;
             sql(tx.execute_batch(include_str!("shared_schema.sql")))?;
+            // The chunked backend lives in this same database, but only a
+            // brand-new file gains its tables: existing databases are
+            // validated, never altered at open.
+            sql(native_chunks::ensure_native_chunks_tables(&tx))?;
             sql(tx.commit())?;
         }
         let columns = sql(sql(conn.prepare("PRAGMA table_info(sessions)"))?
@@ -280,10 +311,16 @@ impl Store {
                 ));
             }
         }
+        // Open-time write barrier: a storage-mode marker newer than this build
+        // keeps the whole connection read-only. Reads stay available, and every
+        // write path surfaces the distinct UnsupportedStorageMode kind instead
+        // of silently writing the older format alongside the newer one.
+        let storage_mode_refusal = sql(native_chunks::unsupported_storage_mode_refusal(&conn))?;
         let (extras, extras_db) = settings::open(path, read_only)?;
         let store = Self {
             conn,
             path: path.into(),
+            save_stats: Default::default(),
             shared: Some(Shared {
                 columns,
                 ids: RefCell::new(HashMap::new()),
@@ -292,6 +329,8 @@ impl Store {
                 snapshots: RefCell::new(HashMap::new()),
                 windows: RefCell::new(HashMap::new()),
                 queues: RefCell::new(HashMap::new()),
+                native_revisions: RefCell::new(HashMap::new()),
+                native_creation: std::cell::Cell::new(false),
                 account_source: RefCell::new(None),
                 preferences: preferences.unwrap_or_else(|| {
                     std::sync::Arc::new(
@@ -302,6 +341,7 @@ impl Store {
                     )
                 }),
                 read_only,
+                storage_mode_refusal,
             }),
         };
         // Register only identities here. No blocks_json is read at startup.
@@ -414,7 +454,11 @@ impl Store {
         Ok(key)
     }
     pub(super) fn shared_writable(&self) -> Result<(), String> {
-        if self.shared.as_ref().unwrap().read_only {
+        let shared = self.shared.as_ref().unwrap();
+        if let Some(refusal) = &shared.storage_mode_refusal {
+            return Err(refusal.clone());
+        }
+        if shared.read_only {
             Err("This Monoptah store is read-only".into())
         } else {
             Ok(())
@@ -681,6 +725,20 @@ impl Store {
                     .into_iter()
                     .chain(tui.as_ref().map(|id| id as &dyn rusqlite::ToSql)),
             )))?;
+        // A new ordinary session may opt into the chunked backend at creation:
+        // the marker lands before any transcript row, so every later dispatch
+        // (load, save, search, move) sees one mode from the start. Terminal
+        // sessions never carry it — their transcript stays a desktop blob.
+        if self.shared.as_ref().unwrap().native_creation.get() && tui.is_none() {
+            sql(self.conn.execute(
+                "INSERT INTO native_sessions(session_id,mode_version,session_revision)
+                 VALUES(?1,?2,0)",
+                params![
+                    original,
+                    i64::from(native_chunks::NATIVE_CHUNKS_MODE_VERSION)
+                ],
+            ))?;
+        }
         Ok((
             Session {
                 id,
@@ -913,15 +971,7 @@ impl Store {
         self.shared_writable()?;
         let tx = sql(self.conn.unchecked_transaction())?;
         let mut blocks = self.shared_blocks(id)?;
-        if self
-            .shared
-            .as_ref()
-            .unwrap()
-            .snapshots
-            .borrow()
-            .get(&id)
-            .is_some_and(|revision| !revision.matches(&blocks))
-        {
+        if self.shared_history_moved(id, &blocks)? {
             return Err("This conversation changed in another window. Reopen it before saving; its data was preserved.".into());
         }
         let (session_provider, session_model): (String, String) = sql(self.conn.query_row(
@@ -1040,23 +1090,51 @@ impl Store {
             window: window.filter(|w| *w > 0).map(|w| w as u64),
         }))
     }
-    /// The blocks whose rows this store numbers: an indexed Mono's window, or
-    /// the whole history of one stored as a blob.
+    /// The blocks whose rows this store numbers: an indexed Mono's window, the
+    /// chunked backend's stored blocks, or the whole history of one stored as
+    /// a blob.
     pub(super) fn shared_blocks(&self, id: i64) -> Result<Vec<Value>, String> {
         let original = self.persisted_session_id(id)?;
         if let Some(from) = self.shared_window(id, &original)? {
-            self.shared_indexed_blocks(&original, from, i64::MAX)
-        } else {
-            let raw: String = sql(self.conn.query_row(
-                "SELECT blocks_json FROM sessions WHERE id=?1",
-                [original],
-                |r| r.get(0),
-            ))?;
-            parse(&raw)
+            return self.shared_indexed_blocks(&original, from, i64::MAX);
         }
+        // A chunked session's blocks live in the native tables; its blob stays
+        // the untouched fixture. Reading one block at a time keeps a long
+        // history from being held twice.
+        if !matches!(
+            native_chunks::session_storage_mode(&self.conn, &original).map_err(|e| e.to_string())?,
+            native_chunks::StorageMode::Blob
+        ) {
+            let mut blocks = Vec::new();
+            for block in native_chunks::iter_full_history(&self.conn, &original) {
+                blocks.push(block?);
+            }
+            return Ok(blocks);
+        }
+        let raw: String = sql(self.conn.query_row(
+            "SELECT blocks_json FROM sessions WHERE id=?1",
+            [original],
+            |r| r.get(0),
+        ))?;
+        self.save_stats
+            .update(|sample| sample.history_bytes_read += raw.len() as u64);
+        parse(&raw)
     }
     pub(super) fn shared_load(&self, id: i64) -> Result<Transcript, String> {
         let original = self.persisted_session_id(id)?;
+        // A chunked session's revision guard: the marker's revision at read
+        // time is what its next sparse save plans against, so a write from
+        // another window in between refuses instead of overwriting.
+        if let Some(revision) =
+            native_chunks::session_revision(&self.conn, &original).map_err(|e| e.to_string())?
+        {
+            self.shared
+                .as_ref()
+                .unwrap()
+                .native_revisions
+                .borrow_mut()
+                .insert(id, revision);
+        }
         if let Some(from) = self.shared_window(id, &original)? {
             // Project one source block at a time. A long Mono must not retain
             // a second complete JSON history alongside its display rows.
@@ -1087,6 +1165,17 @@ impl Store {
                 .insert(id, HistoryRevision(digest.finalize().into()));
             return Ok(Transcript { rows });
         }
+        // A chunked session's rows come from the stored block extents, in the
+        // absolute numbering the writer assigned; the revision seeded above is
+        // its save guard, so it gets no blob snapshot (a stale entry here would
+        // refuse its own writes).
+        if !matches!(
+            native_chunks::session_storage_mode(&self.conn, &original).map_err(|e| e.to_string())?,
+            native_chunks::StorageMode::Blob
+        ) {
+            let rows = native_chunks::page_rows(&self.conn, &original, 0, 1 << 40)?;
+            return Ok(Transcript { rows });
+        }
         let blocks = self.shared_blocks(id)?;
         let rows = blocks::project(&blocks)?;
         self.shared
@@ -1104,6 +1193,16 @@ impl Store {
             return Ok(());
         }
         let original = self.persisted_session_id(id)?;
+        // A chunked-mode session stores its blocks through the chunked writer
+        // instead of the desktop blob: turn receipts, follow-ups, rewind and
+        // cloud restores land here, and `blocks_json` stays the untouched
+        // fixture the session was created with.
+        if !matches!(
+            native_chunks::session_storage_mode(&self.conn, &original).map_err(|e| e.to_string())?,
+            native_chunks::StorageMode::Blob
+        ) {
+            return self.shared_store_blocks_native(id, &original, blocks);
+        }
         let (has_user, draft) = if let Some(from) = self.shared_window(id, &original)? {
             self.shared_store_indexed_blocks(&original, from, blocks)?;
             // Blocks before the window count too, and were never read.
@@ -1114,7 +1213,13 @@ impl Store {
                 |row| Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?)),
             ))?
         } else {
-            self.shared_patch(id, &[("blocks_json", json!(encode(&blocks)?))])?;
+            // The blob write itself refuses if a chunked marker appeared since
+            // the dispatch above (another window converted the session): the
+            // check rides inside the UPDATE, so the two backends can never
+            // fork one history. See `native_chunks::store_blob_blocks`.
+            let encoded = self.save_encode(&blocks)?;
+            self.shared_writable()?;
+            native_chunks::store_blob_blocks(&self.conn, &original, &encoded)?;
             (
                 blocks.iter().any(|b| b["role"] == "user"),
                 blocks
@@ -1129,6 +1234,104 @@ impl Store {
                 ("is_draft", json!(draft)),
             ],
         )
+    }
+
+    /// The chunked-mode full-replace store: the blob path's equivalent for
+    /// saves that re-derive the whole block list (turn receipts, follow-up
+    /// drafts, rewind after an edit, cloud restores). It runs inside the
+    /// caller's transaction, like the blob branch: unchanged blocks keep
+    /// their stored bytes (so a turn receipt rewrites only the block it
+    /// patches), and absolute row extents are recomputed only where the block
+    /// list itself changed — a truncated history renumbers later blocks
+    /// exactly as the blob re-derivation would.
+    fn shared_store_blocks_native(
+        &self,
+        id: i64,
+        original: &str,
+        blocks: &[Value],
+    ) -> Result<(), String> {
+        let current_revision = native_chunks::session_revision(&self.conn, original)
+            .map_err(|e| e.to_string())?
+            .ok_or("This session has no chunked-storage marker")?;
+        // The revision this store last read or wrote; a session first written
+        // through this entry (never loaded here) plans against what is stored.
+        let expected = self
+            .shared
+            .as_ref()
+            .unwrap()
+            .native_revisions
+            .borrow()
+            .get(&id)
+            .copied()
+            .unwrap_or(current_revision);
+        let started = std::time::Instant::now();
+        let mut updates = Vec::with_capacity(blocks.len());
+        for block in blocks {
+            updates.push(self.render_native_block(block)?);
+        }
+        let flush = native_chunks::replace_blocks_tx(&self.conn, original, expected, &updates)
+            .map_err(|e| e.to_string())?;
+        self.save_stats.update(|sample| {
+            sample.projection += started.elapsed();
+            sample.blocks_written = flush.blocks_written;
+            sample.chunks_written = flush.chunks_written;
+            sample.chunk_bytes_written = flush.chunk_bytes_written;
+        });
+        let has_user = blocks.iter().any(|b| b["role"] == "user");
+        let draft = blocks
+            .iter()
+            .any(|b| b["role"] == "user" && b["draft"] == true);
+        self.shared_patch(
+            id,
+            &[
+                ("has_user_message", json!(has_user)),
+                ("is_draft", json!(draft)),
+            ],
+        )?;
+        // Cached inside the caller's transaction: a failed commit leaves a
+        // higher cached revision, so the next save refuses (fail-closed)
+        // instead of writing under a revision that never landed.
+        self.shared
+            .as_ref()
+            .unwrap()
+            .native_revisions
+            .borrow_mut()
+            .insert(id, flush.session_revision);
+        Ok(())
+    }
+
+    /// Whether the stored history moved under this store since it was last
+    /// read or written: the blob guard (snapshot hash of the blocks) or the
+    /// chunked guard (stored session revision versus the one last seen). A
+    /// store that never read the session does not refuse.
+    fn shared_history_moved(&self, id: i64, blocks: &[Value]) -> Result<bool, String> {
+        let original = self.persisted_session_id(id)?;
+        if !matches!(
+            native_chunks::session_storage_mode(&self.conn, &original).map_err(|e| e.to_string())?,
+            native_chunks::StorageMode::Blob
+        ) {
+            let Some(current) = native_chunks::session_revision(&self.conn, &original)
+                .map_err(|e| e.to_string())?
+            else {
+                return Ok(false);
+            };
+            return Ok(self
+                .shared
+                .as_ref()
+                .unwrap()
+                .native_revisions
+                .borrow()
+                .get(&id)
+                .is_some_and(|seen| *seen != current));
+        }
+        Ok(self
+            .shared
+            .as_ref()
+            .unwrap()
+            .snapshots
+            .borrow()
+            .get(&id)
+            .is_some_and(|old| !old.matches(blocks)))
     }
     /// Replace the window's blocks, from sequence `from` on. Earlier blocks are
     /// outside every row index this store handed out, so they stay untouched.
@@ -1158,6 +1361,8 @@ impl Store {
             ))
         }))? {
             let (seq, id, raw) = sql(row)?;
+            self.save_stats
+                .update(|sample| sample.history_bytes_read += raw.len() as u64);
             old.insert(id, (seq, parse::<Value>(&raw)?));
         }
         let retained: HashSet<_> = blocks.iter().filter_map(|b| b["id"].as_str()).collect();
@@ -1233,7 +1438,7 @@ impl Store {
                 sql(self.conn.execute("INSERT INTO mono_blocks(session_id,seq,block_id,block_json,search_text,is_user,is_draft)
                     VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(session_id,seq) DO UPDATE SET block_json=excluded.block_json,
                     search_text=excluded.search_text,is_user=excluded.is_user,is_draft=excluded.is_draft",
-                    params![original,seq,id,encode(block)?,search,block["role"]=="user",block["draft"]==true]))?;
+                    params![original,seq,id,self.save_encode(block)?,search,block["role"]=="user",block["draft"]==true]))?;
             }
             if ix == 0
                 || after_handoff
@@ -1252,11 +1457,23 @@ impl Store {
     pub(super) fn shared_write_rows(
         &self,
         id: i64,
-        start: usize,
-        rows: &[Row],
+        ranges: &[(usize, &[Row])],
         message_id: Option<&str>,
     ) -> Result<(), String> {
         self.shared_writable()?;
+        if ranges.is_empty() {
+            return Ok(());
+        }
+        let original = self.persisted_session_id(id)?;
+        // Dispatch by storage mode: a chunked session saves sparsely, and the
+        // blob path below keeps its exact byte-for-byte behavior for every
+        // marker-less session.
+        if !matches!(
+            native_chunks::session_storage_mode(&self.conn, &original).map_err(|e| e.to_string())?,
+            native_chunks::StorageMode::Blob
+        ) {
+            return self.shared_write_rows_native(id, &original, ranges, message_id);
+        }
         let tx = sql(self.conn.unchecked_transaction())?;
         let current = self.shared_blocks(id)?;
         if self
@@ -1270,7 +1487,16 @@ impl Store {
         {
             return Err("This conversation changed in another window. Reopen it before saving; its data was preserved.".into());
         }
-        let mut next = blocks::merge(&current, start, rows)?;
+        let started = std::time::Instant::now();
+        let mut changed_rows = 0;
+        let mut next = current;
+        for (start, rows) in ranges {
+            next = blocks::merge_measured(&next, *start, rows, &mut changed_rows)?;
+        }
+        self.save_stats.update(|sample| {
+            sample.projection += started.elapsed();
+            sample.changed_rows += changed_rows;
+        });
         if let Some(message) = message_id {
             if let Some(prompt) = next
                 .iter_mut()
@@ -1292,15 +1518,21 @@ impl Store {
             ))?;
             let mut queued: Vec<Value> = parse(&raw)?;
             queued.retain(|m| m["id"].as_str() != Some(message));
-            let encoded = encode(&queued)?;
+            let encoded = self.save_encode(&queued)?;
             self.shared_patch(id, &[("queued_messages_json", json!(encoded))])?;
             next_queue = Some(encoded);
         }
 
-        if !rows.is_empty() {
+        if ranges.iter().any(|(_, rows)| !rows.is_empty()) {
             self.shared_patch(id, &[("updated_at", json!(crate::time::now_ms()))])?;
         }
-        sql(tx.commit())?;
+        let started = std::time::Instant::now();
+        let committed = sql(tx.commit());
+        self.save_stats.update(|sample| {
+            sample.commit += started.elapsed();
+            sample.commit_count += u64::from(committed.is_ok());
+        });
+        committed?;
         if let Some(queue) = next_queue {
             self.shared
                 .as_ref()
@@ -1317,6 +1549,495 @@ impl Store {
             .insert(id, HistoryRevision::of(&next));
         // The source appRequestId is the durable, transactional receipt.
         Ok(())
+    }
+
+    /// The chunked-mode save. One `BEGIN IMMEDIATE` transaction covers the
+    /// sparse block writes, the queue dequeue and the delivery receipt, so a
+    /// failed commit leaves all three absent together. Only the blocks the
+    /// ranges touch are read and written; the middle history never enters the
+    /// write set.
+    fn shared_write_rows_native(
+        &self,
+        id: i64,
+        original: &str,
+        ranges: &[(usize, &[Row])],
+        message_id: Option<&str>,
+    ) -> Result<(), String> {
+        // Sorted, disjoint spans: one plan regardless of caller order.
+        let mut spans: Vec<(usize, usize)> = ranges
+            .iter()
+            .map(|(start, rows)| (*start, start + rows.len()))
+            .collect();
+        spans.sort_unstable();
+        for pair in spans.windows(2) {
+            if pair[1].0 < pair[0].1 {
+                return Err("Overlapping row ranges in one save; nothing was written".into());
+            }
+        }
+        let mut sorted: Vec<_> = ranges.to_vec();
+        sorted.sort_by_key(|(start, _)| *start);
+        sql(self.conn.execute_batch("BEGIN IMMEDIATE"))?;
+        let work = self.shared_write_rows_native_body(id, original, &sorted, message_id);
+        let started = std::time::Instant::now();
+        let committed = match work {
+            Ok(outcome) => sql(self.conn.execute_batch("COMMIT")).map(|()| outcome),
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                return Err(error);
+            }
+        };
+        self.save_stats.update(|sample| {
+            sample.commit += started.elapsed();
+            sample.commit_count += u64::from(committed.is_ok());
+        });
+        let (flush, next_queue) = committed?;
+        // The sparse writer's own counters: what this save actually wrote.
+        self.save_stats.update(|sample| {
+            sample.blocks_written = flush.blocks_written;
+            sample.chunks_written = flush.chunks_written;
+            sample.chunk_bytes_written = flush.chunk_bytes_written;
+        });
+        if let Some(queue) = next_queue {
+            self.shared
+                .as_ref()
+                .unwrap()
+                .queues
+                .borrow_mut()
+                .insert(id, queue);
+        }
+        self.shared
+            .as_ref()
+            .unwrap()
+            .native_revisions
+            .borrow_mut()
+            .insert(id, flush.session_revision);
+        Ok(())
+    }
+
+    fn shared_write_rows_native_body(
+        &self,
+        id: i64,
+        original: &str,
+        ranges: &[(usize, &[Row])],
+        message_id: Option<&str>,
+    ) -> Result<(native_chunks::SparseFlush, Option<String>), String> {
+        let index = native_chunks::block_index(&self.conn, original).map_err(|e| e.to_string())?;
+        let total = index
+            .last()
+            .map_or(0, |block| block.first_row + block.row_count);
+        for (start, _) in ranges {
+            if i64::try_from(*start).unwrap_or(i64::MAX) > total {
+                return Err(
+                    "Transcript changed; refusing to overwrite a different conversation revision"
+                        .into(),
+                );
+            }
+        }
+        let current_revision = native_chunks::session_revision(&self.conn, original)
+            .map_err(|e| e.to_string())?
+            .ok_or("This session has no chunked-storage marker")?;
+        let expected = self
+            .shared
+            .as_ref()
+            .unwrap()
+            .native_revisions
+            .borrow()
+            .get(&id)
+            .copied()
+            .unwrap_or(current_revision);
+        let update = blocks::sparse_plan(&index, ranges)?;
+        let mut dirty = update.dirty;
+        // Render every dirty stored block: only these payloads are read.
+        let started = std::time::Instant::now();
+        let mut changed_rows = 0;
+        let mut renders: HashMap<i64, native_chunks::BlockUpdate> = HashMap::new();
+        // The dirty blocks' merged values, kept so a delivery receipt can patch
+        // one without re-reading (and double-counting) its payload.
+        let mut merged: HashMap<i64, Value> = HashMap::new();
+        for block in &dirty {
+            let stored = index
+                .iter()
+                .find(|stored| stored.block_seq == block.block_seq)
+                .unwrap();
+            let is_last = stored.block_seq == index.last().map_or(-1, |b| b.block_seq);
+            let extend_to = if is_last {
+                i64::MAX
+            } else {
+                stored.first_row + stored.row_count
+            };
+            let (skeleton, chunks, payloads) =
+                native_chunks::stored_payload(&self.conn, original, stored.block_seq)
+                    .map_err(|e| e.to_string())?;
+            let payload_len = skeleton.len()
+                + chunks.iter().map(|chunk| chunk.len()).sum::<usize>()
+                + payloads.iter().map(|payload| payload.len()).sum::<usize>();
+            self.save_stats
+                .update(|sample| sample.history_bytes_read += payload_len as u64);
+            let mut value: Value = native_chunks::block_value(&skeleton, &chunks, &payloads)?;
+            for (span_start, span_rows) in ranges {
+                let span_start = i64::try_from(*span_start).unwrap_or(i64::MAX);
+                let from = span_start.max(stored.first_row);
+                let to = (span_start + span_rows.len() as i64).min(extend_to);
+                if from >= to {
+                    continue;
+                }
+                let slice = &span_rows[(from - span_start) as usize..(to - span_start) as usize];
+                let merged = blocks::merge_measured(
+                    &[value.clone()],
+                    (from - stored.first_row) as usize,
+                    slice,
+                    &mut changed_rows,
+                )?;
+                let Some(one) = merged.into_iter().next() else {
+                    return Err(
+                        "A saved message boundary changed; the original conversation was preserved"
+                            .into(),
+                    );
+                };
+                value = one;
+            }
+            merged.insert(block.block_seq, value.clone());
+            let update = self.render_native_block(&value)?;
+            renders.insert(block.block_seq, update);
+        }
+        self.save_stats.update(|sample| {
+            sample.projection += started.elapsed();
+            sample.changed_rows += changed_rows;
+        });
+        // Appended rows become new blocks after the stored extent.
+        let mut new_values = if update.appended.is_empty() {
+            Vec::new()
+        } else {
+            blocks::merge(&[], 0, &update.appended)?
+        };
+        if let Some(message) = message_id {
+            // The accepted draft is a zero-row block; removing it cannot move
+            // any row. Deleting it in this transaction keeps the dequeue, the
+            // message rows and the receipt atomic.
+            let mut deleted_draft = false;
+            for stored in &index {
+                if stored.row_count != 0 {
+                    continue;
+                }
+                let (skeleton, chunks, payloads) =
+                    native_chunks::stored_payload(&self.conn, original, stored.block_seq)
+                        .map_err(|e| e.to_string())?;
+                let payload_len = skeleton.len()
+                    + chunks.iter().map(|chunk| chunk.len()).sum::<usize>()
+                    + payloads.iter().map(|payload| payload.len()).sum::<usize>();
+                self.save_stats
+                    .update(|sample| sample.history_bytes_read += payload_len as u64);
+                let value: Value = native_chunks::block_value(&skeleton, &chunks, &payloads)?;
+                if value["draft"] == true && value["id"].as_str() == Some(message) {
+                    sql(self.conn.execute(
+                        "DELETE FROM native_payloads WHERE session_id=?1 AND block_seq=?2",
+                        params![original, stored.block_seq],
+                    ))?;
+                    sql(self.conn.execute(
+                        "DELETE FROM native_chunks WHERE session_id=?1 AND block_seq=?2",
+                        params![original, stored.block_seq],
+                    ))?;
+                    sql(self.conn.execute(
+                        "DELETE FROM native_blocks WHERE session_id=?1 AND block_seq=?2",
+                        params![original, stored.block_seq],
+                    ))?;
+                    deleted_draft = true;
+                }
+            }
+            // The blob save recomputes `is_draft` from the whole block list;
+            // here the only way this save can change it is the deletion above,
+            // and the queue may still hold other drafts — so it drops exactly
+            // when the last one went, without reading the session's history
+            // (drafts project no rows, so only zero-row payloads are read).
+            if deleted_draft && !self.shared_native_user_draft_exists(original)? {
+                self.shared_patch(id, &[("is_draft", json!(false))])?;
+            }
+            // The receipt rides the last user prompt: a newly appended one
+            // when the turn carries it, else the stored one from the tail.
+            if let Some(prompt) = new_values
+                .iter_mut()
+                .rev()
+                .find(|b| b["role"] == "user" && b["draft"] != true)
+            {
+                prompt["appRequestId"] = json!(message);
+            } else {
+                let mut found: Option<(i64, Value)> = None;
+                for stored in index.iter().rev() {
+                    // A block this save already rendered carries its merged
+                    // value; re-reading it would both double-count its bytes
+                    // and drop the merged rows.
+                    let value = if let Some(value) = merged.get(&stored.block_seq) {
+                        value.clone()
+                    } else {
+                        let (skeleton, chunks, payloads) =
+                            native_chunks::stored_payload(&self.conn, original, stored.block_seq)
+                                .map_err(|e| e.to_string())?;
+                        let payload_len = skeleton.len()
+                            + chunks.iter().map(|chunk| chunk.len()).sum::<usize>()
+                            + payloads.iter().map(|payload| payload.len()).sum::<usize>();
+                        self.save_stats
+                            .update(|sample| sample.history_bytes_read += payload_len as u64);
+                        native_chunks::block_value(&skeleton, &chunks, &payloads)?
+                    };
+                    if value["role"] == "user" && value["draft"] != true {
+                        found = Some((stored.block_seq, value));
+                        break;
+                    }
+                }
+                if let Some((seq, mut value)) = found {
+                    value["appRequestId"] = json!(message);
+                    let receipt = self.render_native_block(&value)?;
+                    if !dirty.iter().any(|d| d.block_seq == seq) {
+                        let stored = index.iter().find(|s| s.block_seq == seq).unwrap();
+                        dirty.push(native_chunks::DirtyBlock {
+                            block_seq: seq,
+                            first_row: stored.first_row,
+                            last_row: stored.first_row + stored.row_count - 1,
+                        });
+                    }
+                    renders.insert(seq, receipt);
+                }
+            }
+        }
+        // Re-projection re-chunks a merged block's text by the transcript's
+        // row width, so a rendered block can hold a different number of rows
+        // than the plan laid out (a short tail row and its token become one
+        // row; a full one splits). The render is authoritative: re-align every
+        // dirty block's extent — and where new blocks may land — before the
+        // writer validates the plan against them.
+        for block in &mut dirty {
+            if let Some(rendered) = renders.get(&block.block_seq) {
+                block.last_row = block.first_row + rendered.rows.len() as i64 - 1;
+            }
+        }
+        let mut next_row = update.append_from_row;
+        if let Some(last) = index.last() {
+            if let Some(rendered) = renders.get(&last.block_seq) {
+                next_row = last.first_row + rendered.rows.len() as i64;
+            }
+        }
+        let max_seq = index.last().map_or(-1, |block| block.block_seq);
+        for (ordinal, value) in new_values.iter().enumerate() {
+            let row_count = blocks::project(std::slice::from_ref(value))?.len() as i64;
+            let seq = max_seq + 1 + ordinal as i64;
+            dirty.push(native_chunks::DirtyBlock {
+                block_seq: seq,
+                first_row: next_row,
+                last_row: next_row + row_count - 1,
+            });
+            renders.insert(seq, self.render_native_block(value)?);
+            next_row += row_count;
+        }
+        // Keep the session list honest without reading every payload: the
+        // flag only ever moves false→true here (the blob path's downward
+        // recomputes all go through the full-replace store), and only a
+        // block that actually carries a user message can move it.
+        if new_values.iter().any(|b| b["role"] == "user")
+            && !self.shared_native_has_user(original)?
+        {
+            self.shared_patch(id, &[("has_user_message", json!(true))])?;
+        }
+        let plan = native_chunks::SparseSavePlan {
+            session_revision_expected: expected,
+            dirty,
+        };
+        let flush = native_chunks::flush_sparse_tx(&self.conn, original, &plan, &|block| {
+            renders
+                .get(&block.block_seq)
+                .cloned()
+                .ok_or_else(|| format!("No rendered update for block {}", block.block_seq))
+        })
+        .map_err(|e| e.to_string())?;
+        let mut next_queue = None;
+        if let Some(message) = message_id {
+            let field = self.shared_field("queued_messages_json", "'[]'");
+            let raw: String = sql(self.conn.query_row(
+                &format!("SELECT {field} FROM sessions WHERE id=?1"),
+                [original],
+                |r| r.get(0),
+            ))?;
+            let mut queued: Vec<Value> = parse(&raw)?;
+            queued.retain(|m| m["id"].as_str() != Some(message));
+            let encoded = self.save_encode(&queued)?;
+            self.shared_patch(id, &[("queued_messages_json", json!(encoded))])?;
+            next_queue = Some(encoded);
+        }
+        if ranges.iter().any(|(_, rows)| !rows.is_empty()) {
+            self.shared_patch(id, &[("updated_at", json!(crate::time::now_ms()))])?;
+        }
+        Ok((flush, next_queue))
+    }
+
+    /// Serialize one merged block into its stored skeleton+rows form. A member
+    /// whose serialized value alone exceeds the chunk target — a long answer's
+    /// `text`, a tool's payload input — is stripped from the skeleton and
+    /// stored in bounded segments instead, so the `native_blocks` row stays
+    /// small and unchanged segments never re-enter a save.
+    fn render_native_block(&self, value: &Value) -> Result<native_chunks::BlockUpdate, String> {
+        let rows = blocks::project(std::slice::from_ref(value))?;
+        let raw = self.save_encode(value)?;
+        let form = native_chunks::store_block_form(value, &raw, &rows)?;
+        Ok(native_chunks::BlockUpdate {
+            skeleton: form.skeleton,
+            rows: form.elements,
+            payloads: form.payloads,
+        })
+    }
+
+    /// Whether a chunked session already counts a user message, without
+    /// touching its stored payloads.
+    fn shared_native_has_user(&self, original: &str) -> Result<bool, String> {
+        let field = self.shared_field("has_user_message", "0");
+        sql(self.conn.query_row(
+            &format!("SELECT {field} FROM sessions WHERE id=?1"),
+            [original],
+            |r| r.get(0),
+        ))
+    }
+
+    /// Whether a chunked session still holds a user draft block. Drafts
+    /// project no rows, so they are exactly the zero-row blocks; only those
+    /// payloads are read, never the session's history.
+    fn shared_native_user_draft_exists(&self, original: &str) -> Result<bool, String> {
+        for stored in native_chunks::block_index(&self.conn, original).map_err(|e| e.to_string())? {
+            if stored.row_count != 0 {
+                continue;
+            }
+            let (skeleton, chunks, payloads) =
+                native_chunks::stored_payload(&self.conn, original, stored.block_seq)
+                    .map_err(|e| e.to_string())?;
+            let value = native_chunks::block_value(&skeleton, &chunks, &payloads)?;
+            if value["role"] == "user" && value["draft"] == true {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// The storage-mode version of one session's chunked-backend marker:
+    /// `None` while the session is still a desktop `blocks_json` blob. This
+    /// reads the same marker the save path dispatches on, so a caller
+    /// reporting which backend produced a run (the persistence probe) sees
+    /// what the store will actually use — never the flag it asked for.
+    pub fn storage_mode_version(&self, session: i64) -> Result<Option<u32>, String> {
+        let original = self.persisted_session_id(session)?;
+        Ok(
+            match native_chunks::session_storage_mode(&self.conn, &original)
+                .map_err(|e| e.to_string())?
+            {
+                native_chunks::StorageMode::Blob => None,
+                native_chunks::StorageMode::NativeChunks { mode_version } => Some(mode_version),
+            },
+        )
+    }
+
+    /// Whether sessions this store creates from here on opt into the chunked
+    /// storage backend. The flag is a store-level preference picked by the
+    /// surface that owns the store (the native runtime turns it on for the
+    /// ordinary local sessions it creates); existing sessions are never
+    /// converted by it, and terminal (TUI) sessions stay blobs regardless.
+    /// On a store without the desktop schema this is a no-op. Enabling it
+    /// creates the backend's tables if this database predates them (additive
+    /// tables only; no existing schema is altered).
+    pub fn prefer_chunked_storage(&self, enabled: bool) -> Result<(), String> {
+        let Some(shared) = self.shared.as_ref() else {
+            return Ok(());
+        };
+        if enabled {
+            self.shared_writable()?;
+            sql(native_chunks::ensure_native_chunks_tables(&self.conn))?;
+        }
+        shared.native_creation.set(enabled);
+        Ok(())
+    }
+
+    /// Convert one existing ordinary local session from the desktop blob to
+    /// the chunked backend: a consistency backup from the committed state,
+    /// then one transaction that stores every block through the chunked
+    /// writer's canonical packing and flips the mode marker (the blob column
+    /// stays in place, untouched — the marker switches the readers). An
+    /// interruption rolls the whole conversion back and it can be retried.
+    /// Refuses remote, cloud-owned, terminal and indexed sessions, and any
+    /// session whose blocks the chunked layout cannot store; never converts
+    /// partially. The write-enable gate applies: a storage-mode version newer
+    /// than this build refuses before anything is written.
+    pub fn convert_session_to_chunked(
+        &mut self,
+        id: i64,
+    ) -> Result<native_chunks::ConversionReport, String> {
+        self.shared_writable()?;
+        if self.remote_session(id)?.is_some() {
+            return Err("Remote transcripts are owned by the host".into());
+        }
+        if self.cloud_location(id)?.is_cloud() {
+            return Err(super::CLOUD_OWNED.into());
+        }
+        if id >= 0 && self.shared_surface(id)?.is_tui() {
+            return Err(
+                "Terminal conversations keep desktop blobs; they cannot be converted".into(),
+            );
+        }
+        let original = self.persisted_session_id(id)?;
+        let report = native_chunks::convert_session_to_native(&mut self.conn, &original)
+            .map_err(|error| error.to_string())?;
+        // The same operation that flips the marker re-seeds this handle's
+        // guards: the chunked revision cache starts at the marker's revision,
+        // and the blob snapshot this handle may still hold must not survive
+        // into the new mode (a stale one would refuse this handle's own
+        // first sparse save after a later downgrade).
+        let shared = self.shared.as_ref().unwrap();
+        shared.snapshots.borrow_mut().remove(&id);
+        shared.native_revisions.borrow_mut().insert(id, 0);
+        Ok(report)
+    }
+
+    /// The verifiable downgrade: rebuild this chunked session's desktop blob
+    /// from its latest native content, prove restart equality, and delete the
+    /// native copy — marker, blocks, chunks and payload segments — in the one
+    /// transaction that restores the blob. Any failure leaves the native
+    /// content valid and untouched. Run this before opening the conversation
+    /// with an older build that cannot read the chunked backend.
+    pub fn downgrade_session_to_blob(&mut self, id: i64) -> Result<(), String> {
+        self.shared_writable()?;
+        if self.remote_session(id)?.is_some() {
+            return Err("Remote transcripts are owned by the host".into());
+        }
+        if self.cloud_location(id)?.is_cloud() {
+            return Err(super::CLOUD_OWNED.into());
+        }
+        let original = self.persisted_session_id(id)?;
+        native_chunks::export_downgrade_to_blob(&mut self.conn, &original)?;
+        // The same operation that flips the marker back drops its guards: the
+        // chunked revision must not survive the marker it guarded, and the
+        // rebuilt blob has no snapshot on this handle yet (another handle's
+        // stale guards fail closed — it must reload before saving).
+        let shared = self.shared.as_ref().unwrap();
+        shared.native_revisions.borrow_mut().remove(&id);
+        shared.snapshots.borrow_mut().remove(&id);
+        Ok(())
+    }
+
+    /// The stored block extents of a chunked-mode session — block sequence
+    /// and inclusive absolute rows, in block order. Empty for a blob session
+    /// or a chunked session before its first save. The runtime records the
+    /// block an in-place row edit (a tool's streaming status) lands in, so a
+    /// save writes that one block instead of every block from the row to the
+    /// end of the window.
+    pub(super) fn shared_block_extents(
+        &self,
+        session: i64,
+    ) -> Result<Vec<native_chunks::DirtyBlock>, String> {
+        let original = self.persisted_session_id(session)?;
+        let index = native_chunks::block_index(&self.conn, &original).map_err(|e| e.to_string())?;
+        Ok(index
+            .into_iter()
+            .filter(|block| block.row_count > 0)
+            .map(|block| native_chunks::DirtyBlock {
+                block_seq: block.block_seq,
+                first_row: block.first_row,
+                last_row: block.first_row + block.row_count - 1,
+            })
+            .collect())
     }
     pub(super) fn shared_reset_provider_id_if(
         &self,
@@ -1607,6 +2328,13 @@ impl Store {
             ("orchestration_workers", "session_id"),
             ("orchestration_sidebar", "lead_id"),
             ("orchestration_runs", "lead_id"),
+            // The chunked backend's marker and payloads; in a desktop-schema
+            // database `native_sessions` is the marker table, never the
+            // legacy native-only layout.
+            ("native_blocks", "session_id"),
+            ("native_chunks", "session_id"),
+            ("native_payloads", "session_id"),
+            ("native_sessions", "session_id"),
         ] {
             if has_table(&self.conn, table)? {
                 sql(self.conn.execute(
@@ -1623,6 +2351,12 @@ impl Store {
             .as_ref()
             .unwrap()
             .snapshots
+            .borrow_mut()
+            .remove(&id);
+        self.shared
+            .as_ref()
+            .unwrap()
+            .native_revisions
             .borrow_mut()
             .remove(&id);
         Ok(())
@@ -1830,15 +2564,7 @@ impl Store {
             ],
         )?;
         let mut blocks = self.shared_blocks(id)?;
-        if self
-            .shared
-            .as_ref()
-            .unwrap()
-            .snapshots
-            .borrow()
-            .get(&id)
-            .is_some_and(|old| !old.matches(&blocks))
-        {
+        if self.shared_history_moved(id, &blocks)? {
             return Err("This conversation changed in another window. Reopen it before saving; its data was preserved.".into());
         }
 

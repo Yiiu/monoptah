@@ -64,7 +64,10 @@ impl Store {
         let mut records = sql(query.query(params![original, from, before]))?;
         let mut result = Vec::new();
         while let Some(record) = sql(records.next())? {
-            result.push(parse(&sql(record.get::<_, String>(0))?)?);
+            let raw: String = sql(record.get(0))?;
+            self.save_stats
+                .update(|sample| sample.history_bytes_read += raw.len() as u64);
+            result.push(parse(&raw)?);
         }
         Ok(result)
     }
@@ -143,5 +146,28 @@ impl Store {
             params![original, message],
             |row| row.get::<_, bool>(0),
         ))
+    }
+    /// Up to `limit` rows from absolute row `first_row` on, for UI
+    /// pagination. The chunked backend reads only the covering blocks; a blob
+    /// session has only the whole history to project. Absolute row numbers
+    /// are the store's own — paging never shifts the origin, so the same row
+    /// keeps its number under any window.
+    pub(in crate::store) fn shared_page_rows(
+        &self,
+        id: i64,
+        first_row: i64,
+        limit: usize,
+    ) -> Result<Vec<Row>, String> {
+        let original = self.persisted_session_id(id)?;
+        if !matches!(
+            native_chunks::session_storage_mode(&self.conn, &original).map_err(|e| e.to_string())?,
+            native_chunks::StorageMode::Blob
+        ) {
+            return native_chunks::page_rows(&self.conn, &original, first_row, limit);
+        }
+        let blocks = self.shared_all_blocks(id)?;
+        let rows = blocks::project(&blocks)?;
+        let first_row = first_row.max(0) as usize;
+        Ok(rows.into_iter().skip(first_row).take(limit).collect())
     }
 }

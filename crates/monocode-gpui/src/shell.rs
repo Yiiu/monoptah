@@ -9515,6 +9515,14 @@ impl Render for Shell {
                         if shell.close_needs_confirmation(cx) {
                             shell.request_quit(window, cx);
                             false
+                        } else if cx.windows().len() == 1 {
+                            // The last window must not disappear before the quit
+                            // drain finishes: a failed settings save keeps the
+                            // app open with its retry and error UI still alive,
+                            // so the last close goes through the same quit path
+                            // instead of closing directly.
+                            shell.request_quit(window, cx);
+                            false
                         } else {
                             true
                         }
@@ -14672,6 +14680,127 @@ mod tests {
         assert_eq!(
             transcript.read_with(cx, |view, _| view.render_passes),
             before.2
+        );
+    }
+}
+
+#[cfg(test)]
+mod persistence_safety_tests {
+    use super::*;
+    use crate::runtime::Database;
+    use gpui::{TestAppContext, VisualTestContext, WindowHandle};
+    use monocode_core::store::Store;
+    use std::sync::{Arc, Mutex};
+
+    /// `tests::window`'s fixture, with the Store shared with the test so the
+    /// fixed-key setting saver can be armed against it.
+    fn window_with_store(cx: &mut TestAppContext) -> (WindowHandle<Shell>, Database) {
+        let mut store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let mut a = store.create("codex", "/work/another-project").unwrap();
+        let b = store.create("claude", "/work/monocode").unwrap();
+        store
+            .write_rows(
+                a.id,
+                0,
+                &[monocode_core::transcript::Row {
+                    role: "assistant".into(),
+                    text: "History loaded when the adjacent tab becomes active".into(),
+                    first: true,
+                    sent_at: None,
+                }],
+            )
+            .unwrap();
+        a.has_messages = true;
+        let ids = (a.id, b.id);
+        let mut state = Workspace {
+            new_layout_boxy: false,
+            ..Default::default()
+        };
+        state.add_project("/work/another-project");
+        state.add_project("/work/monocode");
+        state.open(a.id);
+        state.open(b.id);
+        let saved = serde_json::to_string(&state).unwrap();
+        let store = Arc::new(Mutex::new(store));
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| {
+                cx.new(|cx| {
+                    let mut shell = Shell::new(
+                        store.clone(),
+                        vec![b, a],
+                        "/work/monocode".into(),
+                        Some(saved),
+                        cx,
+                    );
+                    shell.ensure_session(ids.0, cx);
+                    shell
+                })
+            })
+            .unwrap()
+        });
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        (window, store)
+    }
+
+    #[gpui::test]
+    fn last_window_close_survives_a_failed_drain(cx: &mut TestAppContext) {
+        let (window, _store) = window_with_store(cx);
+        // The saver gets its own Store so this test's forced failure cannot hit
+        // the shell's workspace writes.
+        let saver_store: Database = Arc::new(Mutex::new(
+            Store::open(std::path::Path::new(":memory:")).unwrap(),
+        ));
+        saver_store
+            .lock()
+            .unwrap()
+            .fail_next_save_commit_for_test()
+            .unwrap();
+        cx.update(|cx| {
+            crate::ui_store_saves::install(saver_store.clone(), cx);
+            crate::ui_store_saves::inbox_saver(cx)
+                .unwrap()
+                .save_latest("unsaved".into())
+                .unwrap();
+        });
+        let mut visual = VisualTestContext::from_window(window.into(), cx);
+        // The close button on the last window is routed through the quit drain
+        // instead of destroying the window outright.
+        assert!(
+            !visual.simulate_close(),
+            "the last window is kept while the drain runs"
+        );
+        cx.run_until_parked();
+        assert_eq!(cx.windows().len(), 1, "the retry and error UI survived");
+        assert_eq!(
+            saver_store
+                .lock()
+                .unwrap()
+                .setting(crate::ui_store_saves::INBOX_KEY)
+                .unwrap(),
+            None,
+            "the failing value never landed"
+        );
+        // The shell is still alive and interactive after the refused quit.
+        window.update(cx, |_, _, cx| cx.notify()).unwrap();
+        cx.update(|cx| {
+            assert!(
+                crate::ui_store_saves::inbox_saver(cx)
+                    .unwrap()
+                    .save_latest("retry".into())
+                    .is_ok(),
+                "the saver takes saves again after the failed drain"
+            );
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            saver_store
+                .lock()
+                .unwrap()
+                .setting(crate::ui_store_saves::INBOX_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("retry")
         );
     }
 }

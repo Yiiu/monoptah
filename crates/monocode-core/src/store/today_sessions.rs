@@ -216,7 +216,9 @@ impl Store {
 
     /// (session id, key) for every session whose first message opens with a
     /// task mention. SQL keeps to sessions whose transcript contains `@today/`
-    /// at all; only those are parsed.
+    /// at all; only those are parsed. A chunked session's transcript lives in
+    /// the native tables (its blob stays the empty fixture), so the scan
+    /// covers both places.
     fn session_mention_keys(&self) -> Result<Vec<(i64, String, u64)>, String> {
         let mut found = Vec::new();
         if self.shared.is_some() {
@@ -244,7 +246,8 @@ impl Store {
                     found.push((super::shared::handle(&original), key, at.max(0) as u64));
                 }
             }
-            return Ok(found);
+            drop(stmt);
+            return self.native_session_mention_keys(found);
         }
         let ids = legacy_candidates(&self.conn)?;
         for (id, at) in ids {
@@ -270,6 +273,67 @@ impl Store {
             };
             if let Some(key) = leading_key(&text) {
                 found.push((id, key, at));
+            }
+        }
+        Ok(found)
+    }
+
+    /// Chunked sessions whose first message opens with a task mention: the
+    /// blob scan cannot see them, because a chunked session's `blocks_json`
+    /// stays the empty fixture it was created with. SQL prefilters to
+    /// sessions whose chunks or payload segments contain `@today/` at all;
+    /// only those are reconstructed, and only until their first sent user
+    /// message (the mention must open the conversation, so the scan never
+    /// walks a long history).
+    fn native_session_mention_keys(
+        &self,
+        mut found: Vec<(i64, String, u64)>,
+    ) -> Result<Vec<(i64, String, u64)>, String> {
+        if !super::shared::has_table(&self.conn, "native_sessions")? {
+            return Ok(found);
+        }
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT s.id, s.updated_at FROM sessions s
+                 JOIN native_sessions n ON n.session_id = s.id
+                 WHERE EXISTS(SELECT 1 FROM native_chunks c
+                              WHERE c.session_id = s.id AND c.rows_json LIKE '%@today/%')
+                    OR EXISTS(SELECT 1 FROM native_payloads p
+                              WHERE p.session_id = s.id AND p.payload_json LIKE '%@today/%')",
+            )
+            .map_err(sql)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(sql)?;
+        for row in rows {
+            let Ok((original, at)) = row else {
+                continue;
+            };
+            let mut first_user: Option<Value> = None;
+            let mut first_sent: Option<Value> = None;
+            for block in super::native_chunks::iter_full_history(&self.conn, &original) {
+                let Ok(block) = block else {
+                    break;
+                };
+                if block["role"] != "user" || block["internal"] == true {
+                    continue;
+                }
+                if block["draft"] != true {
+                    first_sent = Some(block);
+                    break;
+                }
+                first_user.get_or_insert(block);
+            }
+            let first = first_sent.or(first_user);
+            if let Some(key) = first
+                .as_ref()
+                .and_then(|block| block["text"].as_str())
+                .and_then(leading_key)
+            {
+                found.push((super::shared::handle(&original), key, at.max(0) as u64));
             }
         }
         Ok(found)
@@ -620,5 +684,46 @@ mod tests {
         let ids: Vec<i64> = store.sessions().unwrap().iter().map(|s| s.id).collect();
         assert_eq!(ids, vec![s]);
         assert_eq!(store.today_task_session_ids(&t.id).unwrap(), vec![s]);
+    }
+
+    #[test]
+    fn today_backfill_reads_native() {
+        // A chunked session's opening mention lives in the native tables, not
+        // in `blocks_json`; the backfill must still find and link it.
+        let mut store = Store::open_monocode(Path::new(":memory:")).unwrap();
+        let t = task(&store, "Report");
+        store.prefer_chunked_storage(true).unwrap();
+        let sent = session(&store);
+        let original = store.persisted_session_id(sent).unwrap();
+        send(
+            &mut store,
+            sent,
+            &[&format!("  @today/{} fix it", t.key), "ok"],
+        );
+        assert_eq!(raw_blob(&store, &original), "[]");
+        let chunks: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM native_chunks WHERE session_id=?1",
+                [&original],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(chunks > 0);
+        assert_eq!(store.today_backfill_session_links(NOW + 1).unwrap(), 1);
+        assert_eq!(store.today_session_task(sent).unwrap(), Some(t.id.clone()));
+        // The guard makes the scan once per database.
+        assert_eq!(store.today_backfill_session_links(NOW + 2).unwrap(), 0);
+    }
+
+    fn raw_blob(store: &Store, original: &str) -> String {
+        store
+            .conn
+            .query_row(
+                "SELECT blocks_json FROM sessions WHERE id=?1",
+                [original],
+                |row| row.get(0),
+            )
+            .unwrap()
     }
 }
