@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { mergeContextUsage } from "../../../../features/sessions/model/contextUsage";
 import {
   modelsForClaudeVersion,
   modelsFromClaudeListModels,
@@ -822,7 +823,7 @@ describe("contextUsedFromAssistant", () => {
 });
 
 describe("contextFromResult", () => {
-  it("reads the window the CLI reports rather than a model table", () => {
+  it("reads only the reported window when per-request usage is missing", () => {
     const rec = {
       type: "result",
       usage: {
@@ -835,7 +836,54 @@ describe("contextFromResult", () => {
         "claude-sonnet-5": { contextWindow: 1000000, maxOutputTokens: 64000 },
       },
     };
-    expect(contextFromResult(rec)).toEqual({ used: 29608, window: 1000000 });
+    expect(contextFromResult(rec)).toEqual({ used: undefined, window: 1000000 });
+  });
+
+  it.each([
+    { label: "missing", iterations: undefined },
+    { label: "empty", iterations: [] },
+  ])(
+    "preserves the latest request when result iterations are $label",
+    ({ iterations }) => {
+      const used = contextUsedFromAssistant({
+        type: "assistant",
+        message: {
+          usage: {
+            input_tokens: 2_000,
+            cache_creation_input_tokens: 8_000,
+            cache_read_input_tokens: 200_000,
+            output_tokens: 500,
+          },
+        },
+      });
+      const previous = mergeContextUsage(
+        { used: 300_000, window: 500_000 },
+        { used },
+      );
+      const result = contextFromResult({
+        type: "result",
+        usage: {
+          input_tokens: 1_800_000,
+          output_tokens: 125,
+          ...(iterations === undefined ? {} : { iterations }),
+        },
+        modelUsage: { "claude-opus-5": { contextWindow: 500_000 } },
+      });
+      expect(result).toEqual({ used: undefined, window: 500_000 });
+      expect(mergeContextUsage(previous, result!)).toEqual({
+        used: 210_500,
+        window: 500_000,
+      });
+    },
+  );
+
+  it("ignores aggregate usage when neither a reading nor a window is available", () => {
+    expect(
+      contextFromResult({
+        type: "result",
+        usage: { input_tokens: 1_800_000, output_tokens: 125 },
+      }),
+    ).toBeUndefined();
   });
 
   it("uses the last iteration, since top-level usage sums the whole turn", () => {
