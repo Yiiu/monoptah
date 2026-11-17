@@ -13060,6 +13060,8 @@ mod tests {
         let saved = serde_json::to_string(&state).unwrap();
         let store = Arc::new(Mutex::new(store));
         let window = cx.update(|cx| {
+            // Match app startup before tests open Inbox from the shell.
+            crate::ui_store_saves::install(store.clone(), cx);
             cx.open_window(Default::default(), |_, cx| {
                 cx.new(|cx| {
                     let mut shell =
