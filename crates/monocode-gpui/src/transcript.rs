@@ -5167,7 +5167,16 @@ impl TranscriptView {
                                 .line_height(px(20.))
                                 .text_color(content(0.7))
                                 .when(!open, |d| d.max_h(px(80.)).overflow_hidden())
-                                .child(note.text.clone()),
+                                .child(markdown::linked_text(
+                                    format!("interjection-{message_start}-{}", row.key.1).into(),
+                                    note.text.clone().into(),
+                                    Vec::new(),
+                                    monocode_core::user_links::find_web_links(&note.text)
+                                        .into_iter()
+                                        .map(|found| (found.range, found.link.url))
+                                        .collect(),
+                                    self.text_selection(row.key, message_start, false, cx),
+                                )),
                         )
                     })
                     .when(long, |d| {
