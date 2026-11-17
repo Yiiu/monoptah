@@ -885,6 +885,18 @@ test("no step before the tag ever runs a publishing command or cancels in a succ
   assert.ok(!events.slice(0, tagAt).some((e) => /^(visible|capture) (git push|gh release|gh run cancel)/.test(e)));
 });
 
+test("every core build job installs locked npm dependencies before native tooling tests", () => {
+  const workflow = parseYaml(read(".github/workflows/native.yml"));
+  for (const name of ["core", "core-windows-build"]) {
+    const steps = workflow.jobs[name].steps;
+    const setup = steps.findIndex((step) => step.uses?.startsWith("actions/setup-node@"));
+    const install = steps.findIndex((step) => step.run?.trim() === "npm ci");
+    const tests = steps.findIndex((step) => step.run?.trim() === "npm run native:test:dev");
+    assert.ok(setup >= 0 && tests > setup, `${name} sets up Node before running tooling tests`);
+    assert.ok(install > setup && install < tests, `${name} installs locked npm dependencies before tooling tests`);
+  }
+});
+
 test("Homebrew stays optional and only enables an explicitly configured tap", () => {
   const workflow = parseYaml(read(`.github/workflows/${WORKFLOW_FILE}`));
   const homebrew = workflow.jobs.homebrew;
