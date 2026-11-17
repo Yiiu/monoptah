@@ -30,6 +30,10 @@
     "build:fedora": "tauri build --bundles rpm",
     "build:windows": "set \"RUSTUP_TOOLCHAIN=stable-x86_64-pc-windows-msvc\" && tauri build --bundles nsis",
     "worktrees:clean": "node scripts/worktrees-clean.mjs",
+    "openspec": "node scripts/openspec.mjs",
+    "openspec:init": "node scripts/openspec.mjs init --tools claude,codex --profile core --scope project --no-animation",
+    "openspec:check": "node scripts/openspec.mjs validate --all --strict --no-interactive",
+    "test:openspec": "node --test scripts/openspec.test.mjs",
     "native:dev": "node scripts/dev-native.mjs",
     "native:test:dev": "node --test scripts/dev-native.test.mjs scripts/bundle-native-macos.test.mjs scripts/native-dependencies.test.mjs scripts/native-release.test.mjs scripts/package-native.test.mjs scripts/package-native-monoptah.test.mjs scripts/native-release-monoptah.test.mjs scripts/native-release-macos-local.test.mjs scripts/native-release-notes.test.mjs scripts/pin-host-release.test.mjs scripts/sandbox-scripts.test.mjs scripts/worktrees-clean.test.mjs",
     "native:release:mac": "node scripts/native-release-macos-local.mjs",
@@ -93,6 +97,7 @@
     "yaml": "^2.9.1"
   },
   "devDependencies": {
+    "@fission-ai/openspec": "2.1.0",
     "@playwright/test": "^1.63.0",
     "@tailwindcss/vite": "^4",
     "@tauri-apps/cli": "^2",

@@ -1,0 +1,61 @@
+schema: spec-driven
+
+context: |
+  Project: Monoptah, a maintained fork of an existing desktop coding application.
+  The primary shipping app is Rust with GPUI in crates/monocode-gpui and shared
+  logic in crates/monocode-core. The repository also contains a React 19 /
+  TypeScript / Vite / Tauri application, a TypeScript remote Host in host/,
+  and a separate mobile app in mobile/.
+
+  Read CLAUDE.md and docs/git-conventions.md before planning or implementation;
+  they are the authoritative engineering and Git rules. Follow directory-specific
+  instructions when touching mobile/. Consult existing implementation and tests
+  before describing current behavior. Preserve working installs and stored data.
+  Keep established package, crate, protocol and storage identifiers unchanged.
+
+  OpenSpec CLI commands run from the repository root as npm run openspec -- <args>.
+  Translate bare openspec commands in generated skills and hints to that form.
+  The project pins the CLI version in devDependencies; no global install is needed.
+  Refresh project skills with npm run openspec:init. The launcher blocks upstream
+  update because it can also refresh machine-wide skills.
+  Use the existing OpenSpec artifacts as the shared plan and task record.
+
+  Native Rust commands must use the native-dev profile or the documented n* aliases.
+  Seed the native build cache before the first cargo command in a new worktree.
+  Make all edits for a task, then run formatting, clippy and related tests in one
+  pass. Rerun only failed checks after fixes. Run the full native:check once per
+  batch before a merge or release, rather than after every task or small edit.
+  Keep native tests Linux-portable. Review once per user request, with separate
+  review for high-risk data, secret, migration or billable cloud changes.
+  Use the isolated development app and data directories described in CLAUDE.md.
+
+  Write OpenSpec artifacts in English, preserving their structural headings and
+  SHALL/MUST keywords. User-facing discussion can follow the user's language.
+
+rules:
+  proposal:
+    - State the user-visible outcome, scope and non-goals.
+    - Identify the affected surfaces (native app, core, Tauri/web, Host or mobile).
+    - Name affected existing capabilities; do not invent a complete specification for legacy behavior.
+  specs:
+    - Specify observable behavior with testable scenarios, including relevant failure or recovery cases.
+    - Describe only the capabilities in scope; preserve compatibility and existing identifiers.
+  design:
+    - Ground the approach in relevant source files and existing shared components.
+    - Explain persistence, migration and platform implications when they apply.
+    - Describe verification that respects CLAUDE.md, including native-dev and batched native checks when relevant.
+  tasks:
+    - Use numbered Markdown checkboxes with concrete affected paths and completion criteria.
+    - Group verification after implementation edits; avoid repeating expensive native builds for each small step.
+    - Include one final review against the original request and record the verification evidence.
+
+operations:
+  apply:
+    guidance:
+      - Follow CLAUDE.md and docs/git-conventions.md for implementation and Git actions.
+      - Reuse the change's plan and task list when applying supporting development skills.
+      - Run only the checks appropriate to the changed surfaces and report their actual outcomes.
+  archive:
+    guidance:
+      - Record the implementation verification and review outcome before treating the change as complete.
+      - Keep archive completion separate from Git merge, app release and deployment status.

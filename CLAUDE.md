@@ -4,6 +4,27 @@ This repository is a fork of [`hardbeat920/monocode`](https://github.com/hardbea
 renamed **Monoptah**. It tracks upstream and merges from it regularly, while carrying
 fork-local changes that are never offered back upstream.
 
+## OpenSpec
+
+OpenSpec tracks requirements, designs, tasks and archived changes. Read
+[`docs/openspec.md`](docs/openspec.md) for setup and the project workflow.
+
+- Use OpenSpec for new behavior, changes spanning multiple modules, and compatibility or
+  persistence changes. Small repairs and documentation edits can use the normal repository
+  workflow unless the user requests OpenSpec.
+- This file and `docs/git-conventions.md` remain the source of truth for engineering rules.
+  Apply those rules while planning, implementing and verifying an OpenSpec change.
+- The CLI is pinned in `devDependencies`. Run it from the repository root with
+  `npm run openspec -- <arguments>`. Translate bare `openspec ...` commands in generated
+  skills and CLI hints to that form; a global installation is not required. The launcher
+  keeps CLI state in the ignored `.openspec-local/` directory. Refresh project skills with
+  `npm run openspec:init`; upstream `update` can also change machine-wide skills and is blocked.
+- Use OpenSpec artifacts as the shared plan and task record for an OpenSpec change. Use
+  supporting skills for debugging, implementation and review without creating a second
+  competing plan or repeating reviews.
+- Native verification follows the batching and `native-dev` rules below. OpenSpec validation
+  checks specification structure; verify the implementation with the relevant project checks.
+
 ## Git conventions
 
 Full rules and examples: [`docs/git-conventions.md`](docs/git-conventions.md).

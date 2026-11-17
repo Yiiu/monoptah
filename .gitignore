@@ -56,6 +56,12 @@ Thumbs.db
 ehthumbs.db
 Desktop.ini
 
+# Local agent scratch files, downloads and release verification artifacts
+/.superpowers/
+
+# Project-local OpenSpec CLI preferences and remembered projects
+/.openspec-local/
+
 # Local document preview mockup
 /work/mono-document-preview.html
 
