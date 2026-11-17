@@ -13060,8 +13060,14 @@ mod tests {
         let saved = serde_json::to_string(&state).unwrap();
         let store = Arc::new(Mutex::new(store));
         let window = cx.update(|cx| {
-            // Match app startup before tests open Inbox from the shell.
-            crate::ui_store_saves::install(store.clone(), cx);
+            // A test can create several fixtures in one AppContext. Each new
+            // Store needs its own saver, even if a previous fixture installed one.
+            let saver = crate::ui_store_saves::UiStoreSaves::new(
+                store.clone(),
+                crate::ui_store_saves::INBOX_KEY,
+                cx.background_executor().clone(),
+            );
+            cx.set_global(crate::ui_store_saves::Shared(saver));
             cx.open_window(Default::default(), |_, cx| {
                 cx.new(|cx| {
                     let mut shell =
@@ -13077,6 +13083,32 @@ mod tests {
         cx.refresh().unwrap();
         cx.run_until_parked();
         (window, ids.0, ids.1)
+    }
+    #[gpui::test]
+    fn window_fixtures_save_inbox_state_to_their_own_store(cx: &mut TestAppContext) {
+        for value in ["first fixture", "second fixture"] {
+            let (window, _, _) = window(cx);
+            cx.update(|cx| {
+                crate::ui_store_saves::inbox_saver(cx)
+                    .unwrap()
+                    .save_latest(value.into())
+                    .unwrap();
+            });
+            cx.run_until_parked();
+            window
+                .read_with(cx, |shell, _| {
+                    assert_eq!(
+                        locked(&shell.store)
+                            .unwrap()
+                            .setting(crate::ui_store_saves::INBOX_KEY)
+                            .unwrap()
+                            .as_deref(),
+                        Some(value),
+                        "each fixture writes to the Store used by its Inbox"
+                    );
+                })
+                .unwrap();
+        }
     }
     #[gpui::test]
     fn leaving_the_original_layout_defaults_to_boxy_only_before_the_notice(
