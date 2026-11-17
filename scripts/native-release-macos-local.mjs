@@ -57,6 +57,7 @@ const root = fileURLToPath(new URL("../", import.meta.url));
 
 export const WORKFLOW_FILE = "native-release-monoptah.yml";
 export const NOTES_FILE = "docs/native/monoptah-release-notes.md";
+export const UPDATER_CONFIG = "scripts/native-updater.json";
 export const TARGET = "aarch64-apple-darwin";
 export const BINARY = `crates/monocode-gpui/target/${TARGET}/release/monocode-gpui`;
 // Must equal NATIVE_FEED_URL in the release workflow (a test asserts it).
@@ -107,12 +108,22 @@ export function parseArgs(argv) {
   return { version: releaseVersion(version), dryRun, recheck, since, notesFile, ciTimeoutMinutes };
 }
 
-// The updater public key is the one the Tauri app trusts, from tauri.conf.json.
+// Native has its own signing identity; the paused Tauri release keeps its key.
 export function readUpdaterPubkey(confText) {
-  const key = JSON.parse(confText)?.plugins?.updater?.pubkey;
-  if (typeof key !== "string" || !key)
-    throw new Error("src-tauri/tauri.conf.json has no plugins.updater.pubkey");
-  return key;
+  const key = JSON.parse(confText)?.pubkey;
+  if (typeof key !== "string" || !key.trim())
+    throw new Error(`${UPDATER_CONFIG} has no native updater pubkey`);
+  const trimmed = key.trim();
+  const lines = Buffer.from(trimmed, "base64").toString("utf8").split(/\r?\n/);
+  const packet = Buffer.from(lines[1] ?? "", "base64");
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(trimmed) || !lines[0]?.startsWith("untrusted comment:") || packet.length !== 42 || packet.subarray(0, 2).toString("ascii") !== "Ed")
+    throw new Error(`${UPDATER_CONFIG} has an invalid native updater pubkey`);
+  return trimmed;
+}
+
+export function originMatchesRepository(remote) {
+  const match = /^(?:git@github\.com:|https:\/\/github\.com\/|ssh:\/\/git@github\.com\/)([^/]+\/[^/]+?)(?:\.git)?\/?$/i.exec(remote.trim());
+  return match?.[1].toLowerCase() === REPOSITORY.toLowerCase();
 }
 
 export function buildEnv(version, pubkey, baseEnv = process.env) {
@@ -226,6 +237,11 @@ export function gatherState(run, { version, tauriCli = true }) {
   const fetch = run("git", ["fetch", "origin"]);
   state.fetchOk = fetch.status === 0;
   if (!state.fetchOk) state.fetchError = errorOf(fetch);
+  const pushOrigin = run("git", ["remote", "get-url", "--push", "--all", "origin"]);
+  // Git pushes to every configured URL. Keep only the verdict in state:
+  // any of the URLs may contain credentials.
+  const pushUrls = out(pushOrigin).split(/\r?\n/).filter((url) => url.trim());
+  state.originPushMatches = pushOrigin.status === 0 && pushUrls.length > 0 && pushUrls.every(originMatchesRepository);
   state.branch = out(run("git", ["branch", "--show-current"]));
   state.head = out(run("git", ["rev-parse", "HEAD"]));
   state.originMain = out(run("git", ["rev-parse", "refs/remotes/origin/main"]));
@@ -253,6 +269,8 @@ export function evaluatePreconditions(state, version) {
   const problems = [];
   if (!state.fetchOk)
     problems.push(`git fetch origin failed: ${state.fetchError ?? ""}. Check the network and the remote.`);
+  if (!state.originPushMatches)
+    problems.push(`origin must push to ${REPOSITORY}, matching the release API destination. Check: git remote get-url --push --all origin`);
   if (state.branch !== "main")
     problems.push(`The current branch is "${state.branch || "(detached)"}", not main. Run: git switch main`);
   if (!state.head || !state.originMain || state.head !== state.originMain)
@@ -662,7 +680,7 @@ export async function runRelease(argv, io) {
       "This builds the macOS arm64 app and must run on an Apple silicon Mac, not " + io.platform + "/" + io.arch + ".",
     );
   const tag = tagFor(version);
-  const pubkey = readUpdaterPubkey(io.readText("src-tauri/tauri.conf.json"));
+  const pubkey = readUpdaterPubkey(io.readText(UPDATER_CONFIG));
   const env = buildEnv(version, pubkey, io.env);
 
   io.log("Checking preconditions for " + tag + "...");

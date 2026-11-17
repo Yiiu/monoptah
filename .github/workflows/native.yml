@@ -147,6 +147,8 @@ jobs:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
           shared-key: core
+      # Install tooling dependencies on Windows too (yaml and the updater signer).
+      - run: npm ci
       - run: npm run native:test:dev
       - run: cargo clippy --manifest-path crates/monocode-gpui/Cargo.toml --locked -p monocode-core --all-targets --profile native-dev -- -D warnings
       - uses: taiki-e/install-action@v2

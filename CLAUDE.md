@@ -234,6 +234,16 @@ Windows x86_64 (unsigned installer). It releases separately from the Tauri app. 
 runs on GitHub Actions (hosted macOS runners are not being acquired): the macOS app is checked,
 built and packaged on the maintainer's Mac, everything else is on CI.
 
+This checkout releases Native to `Yiiu/monoptah`. The Native verification key lives in
+`scripts/native-updater.json` and must match `NATIVE_UPDATER_PUBKEY` in the release workflow;
+it is independent of the paused Tauri app's key. Repository secrets
+`TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` hold the matching Native
+signing credentials. Never regenerate that key after shipping this channel. For the **first**
+Yiiu release, append `--since 408567cde36243ec361ee0a68e3bcba00abbfdb8` to the release command
+so inherited PR numbers are not queried against this fork. Later releases use the previous
+Yiiu tag normally. See the repository setup section in `docs/native/release-flow.md`.
+
+
 What CI checks (`native.yml`): `monocode-core` clippy and tests plus `native:test:dev` on Linux
 and Windows (the Windows core tests run in 3 shards from one nextest archive), GPUI `fmt` and clippy `-D warnings` on Linux, GPUI tests on Linux (built once with
 `cargo nextest archive`, run in 3 shards, one process per test), and GPUI `cargo check
@@ -299,8 +309,10 @@ artifact. The Linux and Windows packages use upstream's `scripts/package-native.
 
 The `homebrew` job only bumps `Casks/monoptah-native.rb` in the tap (macOS only; Linux and
 Windows have no package-manager entry), it does not create it: add that file (modelled on
-`Casks/monoptah.rb`) before the first release, or the job fails. It runs after `publish` when
-`HOMEBREW_TAP_TOKEN` is set. While it is unset, bump the cask by hand with
+`Casks/monoptah.rb`) before enabling the job, or it fails. It runs after `publish` when both
+repository variable `HOMEBREW_TAP_REPOSITORY` (`owner/repository`) and secret
+`HOMEBREW_TAP_TOKEN` are set. With either missing it skips Homebrew; it never defaults to
+another maintainer's tap. To bump an existing tap by hand, use
 `scripts/update-homebrew-cask.sh` and the sha from the `MonoptahNative_<version>_aarch64.zip.sha256`
 asset. The fork scripts are `scripts/native-release-macos-local.mjs`,
 `scripts/native-release-notes.mjs`, `scripts/package-native-monoptah.mjs` (also the asset table

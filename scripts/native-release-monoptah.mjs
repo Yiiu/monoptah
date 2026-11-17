@@ -51,7 +51,7 @@ import {
   releaseVersion,
 } from "./package-native-monoptah.mjs";
 
-export const REPOSITORY = "hhoangg/monoptah";
+export const REPOSITORY = "Yiiu/monoptah";
 export const APP_ID = "com.monoptah.native";
 // Must equal CHANNEL in crates/monocode-core/src/app_update/mod.rs.
 export const CHANNEL = "native-preview";

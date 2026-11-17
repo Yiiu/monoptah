@@ -41,7 +41,9 @@ const TAG_PATTERN = /^native-v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 
 export const DOWNLOADS_SECTION = `## Downloads and updates
 
-- macOS Apple silicon: app archive and ZIP; Homebrew cask \`hhoangg/monoptah/monoptah-native\`.
+Download packages from [Yiiu/monoptah releases](https://github.com/${REPOSITORY}/releases).
+
+- macOS Apple silicon: app archive and ZIP.
 - Linux x86_64: AppImage, DEB and RPM (built on AlmaLinux 10).
 - Windows x86_64: NSIS installer.
 - Every updater package and the shared native update feed are signed. Native releases use their own feed and do not replace the Tauri update feed.
