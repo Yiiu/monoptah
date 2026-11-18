@@ -205,7 +205,17 @@ impl Store {
         {
             return Ok(None);
         }
-        let rows = self.load(id)?.rows;
+        let rows = match self.load(id) {
+            Ok(history) => history.rows,
+            // The host can confirm removal before the local binding is refreshed.
+            Err(error)
+                if remote
+                    && error == "Host rejected request: Session not found on this machine" =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
         let turns = self.agent_settings(id)?.unwrap_or_default().turns;
         let read = project.and_then(|project| {
             let turn = self.app_latest_turn_id(id, &rows)?;
