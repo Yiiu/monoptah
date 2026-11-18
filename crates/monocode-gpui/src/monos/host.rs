@@ -2083,6 +2083,10 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.set_enabled
                 let results = work.await;
                 let _ = this.update(cx, |this, cx| {
                     this.completion_work.remove(&(id.clone(), batch));
+                    // Keep the batch pending when the store could not read its report.
+                    let Ok(results) = results else {
+                        return;
+                    };
                     // A newer turn may have started or settled while the report was read.
                     let views = this
                         .owner
@@ -2130,15 +2134,15 @@ pub(super) fn completion_results(
     sessions: Vec<(i64, String, Option<String>)>,
     book: Option<&monocode_core::accounts::Book>,
     mut live: HashMap<i64, Option<LimitFacts>>,
-) -> Vec<(i64, String, String)> {
+) -> Result<Vec<(i64, String, String)>, String> {
     let budget = completion_budget(sessions.len());
     sessions
         .into_iter()
         .map(|(id, title, project)| {
-            let db = locked(store);
+            let db = locked(store)?;
             let facts = match live.remove(&id) {
                 Some(facts) => facts,
-                None => db.as_ref().ok().and_then(|db| stored_limit(db, id)),
+                None => stored_limit(&db, id),
             };
             let note = facts.map_or_else(String::new, |facts| {
                 let note = usage_limit_note(
@@ -2150,15 +2154,13 @@ pub(super) fn completion_results(
                 format!("{note}\n")
             });
             let prose = db
-                .and_then(|db| {
-                    db.app_completion_report(
-                        id,
-                        project.as_deref(),
-                        budget.saturating_sub(note.chars().count()),
-                    )
-                })
-                .unwrap_or_else(|_| "Session was removed".into());
-            (id, title, format!("{note}{prose}"))
+                .app_completion_report(
+                    id,
+                    project.as_deref(),
+                    budget.saturating_sub(note.chars().count()),
+                )?
+                .unwrap_or_else(|| "Session was removed".into());
+            Ok((id, title, format!("{note}{prose}")))
         })
         .collect()
 }

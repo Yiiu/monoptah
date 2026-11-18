@@ -7115,6 +7115,7 @@ fn the_completion_report_reads_the_live_limit_and_the_saved_one_only_for_closed_
             Some(&book),
             live,
         )
+        .unwrap()
         .remove(0)
         .2
     };
@@ -7615,6 +7616,13 @@ fn completion_report_flags_an_interrupted_child_and_names_its_project(cx: &mut T
         store.save_agent_settings(child, &settings).unwrap();
         child
     };
+    let receipt_key = format!("agent:{child}");
+    let receipt = {
+        let store = locked(&s.store).unwrap();
+        let receipt = store.setting(&receipt_key).unwrap().unwrap();
+        store.save_setting(&receipt_key, "{").unwrap();
+        receipt
+    };
     s.manager.update(cx, |m, cx| {
         m.chats[&s.id].update(cx, |chat, _| {
             chat.settings.usage_limit = Some(Default::default())
@@ -7636,6 +7644,17 @@ fn completion_report_flags_an_interrupted_child_and_names_its_project(cx: &mut T
         });
         m.check_completions(cx);
     });
+    cx.run_until_parked();
+    s.manager.read_with(cx, |m, _| {
+        let mono = m.roster.get(&s.id).unwrap();
+        assert!(!mono.launches[0].completed);
+        assert!(mono.outbox.is_empty());
+    });
+    locked(&s.store)
+        .unwrap()
+        .save_setting(&receipt_key, &receipt)
+        .unwrap();
+    s.manager.update(cx, |m, cx| m.check_completions(cx));
     cx.run_until_parked();
     s.manager.read_with(cx, |m, _| {
         let mono = m.roster.get(&s.id).unwrap();

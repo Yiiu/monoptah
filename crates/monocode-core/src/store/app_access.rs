@@ -188,17 +188,23 @@ impl Store {
         id: i64,
         project: Option<&str>,
         count: usize,
-    ) -> Result<String, String> {
+    ) -> Result<Option<String>, String> {
         use crate::response::{completion_report, read_call, turn_end};
 
         // The desktop can append from a different connection. Read the rows,
         // receipt and paging cursor from the same SQLite snapshot.
-        let snapshot = (self.shared.is_some()
-            && self.conn.is_autocommit()
-            && self.remote_session(id)?.is_none())
-        .then(|| self.conn.unchecked_transaction())
-        .transpose()
-        .map_err(|e| e.to_string())?;
+        let remote = self.remote_session(id)?.is_some();
+        let snapshot = (self.shared.is_some() && self.conn.is_autocommit() && !remote)
+            .then(|| self.conn.unchecked_transaction())
+            .transpose()
+            .map_err(|e| e.to_string())?;
+        if !remote
+            && (id < 0
+                || self.persisted_session_id(id).is_err()
+                || self.mono_session(id)?.is_none())
+        {
+            return Ok(None);
+        }
         let rows = self.load(id)?.rows;
         let turns = self.agent_settings(id)?.unwrap_or_default().turns;
         let read = project.and_then(|project| {
@@ -208,12 +214,12 @@ impl Store {
         if let Some(snapshot) = snapshot {
             snapshot.commit().map_err(|e| e.to_string())?;
         }
-        Ok(completion_report(
+        Ok(Some(completion_report(
             &rows,
             turn_end(&rows, &turns),
             read.as_ref(),
             count,
-        ))
+        )))
     }
 
     pub fn app_conversation(
@@ -328,6 +334,16 @@ mod tests {
             )
             .unwrap();
         assert!(store.agent_settings(id).unwrap().unwrap().turns[&1].stopped);
+    }
+
+    #[test]
+    fn a_receipt_read_error_is_distinct_from_a_removed_session() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let id = store.create("codex", "/work/repo").unwrap().id;
+        store.save_setting(&format!("agent:{id}"), "{").unwrap();
+        assert!(store.app_completion_report(id, None, 12000).is_err());
+        store.delete(id).unwrap();
+        assert_eq!(store.app_completion_report(id, None, 12000).unwrap(), None);
     }
 
     /// A native stop leaves no row. The receipt the runtime closes records it,

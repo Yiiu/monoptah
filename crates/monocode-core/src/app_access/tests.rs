@@ -339,6 +339,7 @@ fn completion_report_read_calls_reach_the_cut_text_in_both_stores() {
                 mono.session_project(&session.cwd).as_deref(),
                 12000,
             )
+            .unwrap()
             .unwrap();
         assert!(report.chars().count() <= 12000);
         let (marker, tail) = report.split_once("\n\n").unwrap();
