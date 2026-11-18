@@ -1459,8 +1459,7 @@ impl Monos {
     }
     pub(super) fn tick_at(&mut self, now: u64, cx: &mut Context<Self>) {
         let changed = self.check_habits(cx);
-        // Nothing changed means nothing to draw. Times on screen still advance
-        // once a minute, which is as fine as they are shown.
+        // Quiet views still refresh their minute-based labels.
         let minute = now / 60_000;
         let rolled = minute != self.last_tick_minute;
         self.last_tick_minute = minute;
@@ -1500,9 +1499,14 @@ impl Monos {
         for view in self.attention_views(&mono.id, cx) {
             view.entity_id().hash(&mut hasher);
         }
-        // The changes badge polls files while a turn runs, which no entity
-        // announces: keep waking at the tick's own pace until it ends.
-        if self.chat().is_some_and(|chat| chat.read(cx).busy) {
+        // Running chats poll for file changes and running habits show elapsed
+        // seconds, so both refresh at the tick's own pace.
+        if self.chat().is_some_and(|chat| chat.read(cx).busy)
+            || self
+                .habits
+                .iter()
+                .any(|habit| self.habit_running_since(habit).is_some())
+        {
             (now / 10_000).hash(&mut hasher);
         }
         hasher.finish()

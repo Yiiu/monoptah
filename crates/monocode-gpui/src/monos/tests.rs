@@ -6915,3 +6915,31 @@ fn a_tick_that_finds_nothing_new_does_not_wake_the_view(cx: &mut TestAppContext)
     tick(now, cx);
     assert_eq!(woken.get(), before + 1, "and only once");
 }
+
+#[gpui::test]
+fn running_habit_refreshes_elapsed_time_while_the_mono_chat_is_idle(cx: &mut TestAppContext) {
+    use std::{cell::Cell, rc::Rc};
+    let s = setup(cx);
+    seed_habit(&s);
+    s.manager.update(cx, |m, cx| {
+        assert!(!m.chat().unwrap().read(cx).busy);
+        m.habits = habits::load(&s.root, &s.id).unwrap();
+        m.scheduling = true;
+    });
+    let woken = Rc::new(Cell::new(0));
+    let _subscription = cx.update(|cx| {
+        let woken = woken.clone();
+        cx.observe(&s.manager, move |_, _| woken.set(woken.get() + 1))
+    });
+    let tick = |at, cx: &mut TestAppContext| {
+        s.manager.update(cx, |m, cx| m.tick_at(at, cx));
+        cx.run_until_parked();
+    };
+    let now = 10 * 60_000;
+    tick(now, cx);
+    let before = woken.get();
+    tick(now + 10_000, cx);
+    assert_eq!(woken.get(), before + 1);
+    tick(now + 10_001, cx);
+    assert_eq!(woken.get(), before + 1);
+}
