@@ -529,6 +529,7 @@ fn main() {
             #[cfg(target_os = "macos")]
             memory_log::start(cx);
             frame_log::start(cx);
+            pulse::start_stats(cx);
             persistence_log::start(cx);
             ui_store_saves::install(db.clone(), cx);
             gpu_trim::start(cx);

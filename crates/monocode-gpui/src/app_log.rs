@@ -59,9 +59,12 @@ fn rotate(path: &PathBuf) {
 }
 
 fn wanted(metadata: &log::Metadata) -> bool {
-    (metadata.target() == crate::persistence_log::TARGET && metadata.level() <= log::Level::Info)
-        || metadata.level() <= log::Level::Warn
-        || (metadata.level() <= log::Level::Info && metadata.target().starts_with("gpui_macos"))
+    let target = metadata.target();
+    metadata.level() <= log::Level::Warn
+        || (metadata.level() <= log::Level::Info
+            && (target == crate::persistence_log::TARGET
+                || target == "pulse_stats"
+                || target.starts_with("gpui_macos")))
 }
 
 impl log::Log for FileLog {

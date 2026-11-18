@@ -147,7 +147,13 @@ impl log::Log for NativeLog {
 /// Only the UI runtime and the watchdog are recorded. Other crates (HTTP,
 /// TLS, providers) can put URLs or request details in their warnings, and the
 /// file is meant to be safe to send along with a freeze report.
-const RECORDED_CRATES: [&str; 4] = ["gpui", "gpui_macos", "gpui_apple", "ui_watchdog"];
+const RECORDED_CRATES: [&str; 5] = [
+    "gpui",
+    "gpui_macos",
+    "gpui_apple",
+    "ui_watchdog",
+    "pulse_stats",
+];
 
 fn recorded_target(target: &str) -> bool {
     let krate = target.split("::").next().unwrap_or_default();
@@ -156,12 +162,17 @@ fn recorded_target(target: &str) -> bool {
 
 /// Warnings from every recorded crate, plus the macOS window's info lines
 /// (occlusion, resize, file drop and its frame probe), which describe the
-/// state around a freeze and are otherwise lost.
+/// state around a freeze and are otherwise lost, and the opt-in pulse stats
+/// line (`MONOPTAH_PULSE_STATS=1`).
 fn wanted(level: log::Level, target: &str) -> bool {
     (target == crate::persistence_log::TARGET && level <= log::Level::Info)
         || recorded_target(target)
             && (level <= log::Level::Warn
-                || (level == log::Level::Info && target.split("::").next() == Some("gpui_macos")))
+                || (level == log::Level::Info
+                    && matches!(
+                        target.split("::").next(),
+                        Some("gpui_macos" | "pulse_stats")
+                    )))
 }
 
 fn format_line(record: &log::Record) -> String {
@@ -225,6 +236,8 @@ mod tests {
         assert!(wanted(log::Level::Warn, "gpui::window"));
         assert!(!wanted(log::Level::Info, "gpui::window"));
         assert!(!wanted(log::Level::Info, "gpui_apple"));
+        assert!(wanted(log::Level::Info, "pulse_stats"));
+        assert!(!wanted(log::Level::Debug, "pulse_stats"));
         assert!(!wanted(log::Level::Debug, "gpui_macos::window"));
         assert!(!wanted(log::Level::Warn, "reqwest::connect"));
     }
