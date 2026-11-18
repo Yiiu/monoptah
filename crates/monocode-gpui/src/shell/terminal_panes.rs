@@ -750,7 +750,7 @@ mod tests {
             .unwrap();
         let mut visual = VisualTestContext::from_window(window.into(), cx);
         visual.run_until_parked();
-        visual.simulate_keystrokes("cmd-shift-j");
+        visual.simulate_keystrokes("secondary-shift-j");
         visual.run_until_parked();
         let tab = window
             .update(&mut visual, |shell, _, _| {
@@ -826,7 +826,7 @@ mod tests {
             .unwrap();
         let mut visual = VisualTestContext::from_window(window.into(), cx);
         visual.run_until_parked();
-        visual.simulate_keystrokes("cmd-shift-j");
+        visual.simulate_keystrokes("secondary-shift-j");
         visual.run_until_parked();
         let first = window
             .update(&mut visual, |shell, _, _| shell.workspace.active.unwrap())
