@@ -157,6 +157,10 @@ pub(super) enum Batch {
 }
 const RESULT_CHARS: usize = 12_000;
 const BATCH_CHARS: usize = 48_000;
+
+fn completion_budget(sessions: usize) -> usize {
+    (BATCH_CHARS / sessions.max(1)).clamp(200, RESULT_CHARS)
+}
 /// Reports that can go out now. A group waits for its launching turn to end and
 /// for every child to stop; an "each" launch only for itself.
 pub(super) fn ready_batches(
@@ -274,7 +278,7 @@ pub(super) fn usage_limit_note(
 /// The message the Mono receives. The results share one budget, so a large
 /// group still names every session.
 pub(super) fn completion_message(batch: Batch, results: &[(i64, String, String)]) -> String {
-    let budget = (BATCH_CHARS / results.len().max(1)).clamp(200, RESULT_CHARS);
+    let budget = completion_budget(results.len());
     let report = results
         .iter()
         .map(|(id, title, prose)| {
@@ -2053,6 +2057,29 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.set_enabled
             let book = crate::accounts::get(cx).map(|center| center.read(cx).book.clone());
             let live =
                 self.live_limits(&sessions.iter().map(|(id, _)| *id).collect::<Vec<_>>(), cx);
+            let generations: Vec<_> = sessions
+                .iter()
+                .map(|(id, _)| {
+                    let updated = views.iter().find(|v| v.id == *id).map(|v| v.updated_at);
+                    (*id, updated)
+                })
+                .collect();
+            let mono = self.roster.get(&id).expect("ready batch has a Mono");
+            let sessions = sessions
+                .into_iter()
+                .map(|(id, title)| {
+                    let project = mono
+                        .launches
+                        .iter()
+                        .find(|launch| launch.session_id == id)
+                        .and_then(|launch| mono.session_project(&launch.cwd));
+                    (
+                        id,
+                        title,
+                        monocode_core::response::read_call(id, project.as_deref()),
+                    )
+                })
+                .collect();
             let work = cx
                 .background_executor()
                 .spawn(async move { completion_results(&store, sessions, book.as_ref(), live) });
@@ -2060,6 +2087,20 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.set_enabled
                 let results = work.await;
                 let _ = this.update(cx, |this, cx| {
                     this.completion_work.remove(&(id.clone(), batch));
+                    // A newer turn may have started or settled while the report was read.
+                    let views = this
+                        .owner
+                        .upgrade()
+                        .map(|o| o.read(cx).mono_session_views(cx))
+                        .unwrap_or_default();
+                    if generations.iter().any(|(id, seen)| {
+                        views
+                            .iter()
+                            .find(|v| v.id == *id)
+                            .is_some_and(|v| v.busy || Some(v.updated_at) != *seen)
+                    }) {
+                        return;
+                    }
                     if let Some(mono) = this.roster.get_mut(&id) {
                         finish_batch(&mut mono.launches, batch);
                     }
@@ -2085,39 +2126,46 @@ pub(super) struct LimitFacts {
     pub account: String,
     pub limit: monocode_core::usage::Limit,
 }
-/// What each stopped session reports: its last prose, led by a usage-limit note naming the
+/// What each stopped session reports: its final reply, led by a usage-limit note naming the
 /// account when it stopped on one. A limit is cleared when a new turn starts, so a set one
 /// belongs to the latest turn. `live` holds the open sessions, which win over the saved copy.
 pub(super) fn completion_results(
     store: &Database,
-    sessions: Vec<(i64, String)>,
+    sessions: Vec<(i64, String, Option<Value>)>,
     book: Option<&monocode_core::accounts::Book>,
     mut live: HashMap<i64, Option<LimitFacts>>,
 ) -> Vec<(i64, String, String)> {
+    let budget = completion_budget(sessions.len());
     sessions
         .into_iter()
-        .map(|(id, title)| {
+        .map(|(id, title, read)| {
             let db = locked(store);
-            let mut prose = db
-                .as_ref()
-                .map_err(Clone::clone)
-                .and_then(|db| db.load(id))
-                .map(|t| monocode_core::response::prose(&t.rows))
-                .unwrap_or_else(|_| "Session was removed".into());
             let facts = match live.remove(&id) {
                 Some(facts) => facts,
                 None => db.as_ref().ok().and_then(|db| stored_limit(db, id)),
             };
-            if let Some(facts) = facts {
+            let note = facts.map_or_else(String::new, |facts| {
                 let note = usage_limit_note(
                     &facts.provider,
                     &account_label(book, &facts.provider, &facts.account),
                     &facts.limit,
                     monocode_core::usage::now_ms(),
                 );
-                prose = format!("{note}\n{prose}");
-            }
-            (id, title, prose)
+                format!("{note}\n")
+            });
+            let prose = db
+                .and_then(|db| {
+                    let rows = db.load(id)?.rows;
+                    let turns = db.agent_settings(id)?.unwrap_or_default().turns;
+                    Ok(monocode_core::response::completion_report(
+                        &rows,
+                        monocode_core::response::turn_end(&rows, &turns),
+                        read.as_ref(),
+                        budget.saturating_sub(note.chars().count()),
+                    ))
+                })
+                .unwrap_or_else(|_| "Session was removed".into());
+            (id, title, format!("{note}{prose}"))
         })
         .collect()
 }

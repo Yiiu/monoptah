@@ -72,10 +72,13 @@ impl Monos {
         let Some(mono) = self.roster.of_session(id).map(|mono| mono.id.clone()) else {
             return false;
         };
+        self.open(&mono, window, cx);
         self.settings = None;
         self.wf_leave_page();
         self.route = None;
-        self.open(&mono, window, cx);
+        self.panel_check = None;
+        self.focus_active(window, cx);
+        cx.notify();
         true
     }
 }

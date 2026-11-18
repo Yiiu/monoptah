@@ -34,7 +34,7 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
         "models.list"|"soul.read"|"habits.list"=>"",
         "accounts.list"=>"provider",
         "sessions.list"|"folders.list"|"worktrees.list"=>"project",
-        "sessions.read"=>"sessionId project before limit maxChars",
+        "sessions.read"=>"sessionId project before limit maxChars charOffset",
         "sessions.start"=>"prompt project harness model modelSettings effort runtimeMode title draft reveal workspaceMode worktreeBase worktreeCwd placement besideSessionId notifyOnComplete completionDelivery parentSessionId folderName folderId target account",
         action if action.starts_with("cloud.") => {
             cloud_fields = cloud::fields(action).ok_or("Unknown app action. Run app help")?;
@@ -117,7 +117,15 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
         {
             return Err(format!("{key} must be true or false"));
         }
-        if ["limit", "offset", "maxChars", "number", "lines"].contains(&key.as_str())
+        if [
+            "limit",
+            "offset",
+            "maxChars",
+            "charOffset",
+            "number",
+            "lines",
+        ]
+        .contains(&key.as_str())
             && value.as_u64().is_none()
         {
             return Err(format!("{key} must be a non-negative integer"));
@@ -149,6 +157,7 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
             "limit",
             "offset",
             "maxChars",
+            "charOffset",
             "number",
             "lines",
             "id",
