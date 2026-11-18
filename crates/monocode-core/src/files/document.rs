@@ -165,7 +165,7 @@ pub fn read_document_with(
         }
         return document_from_bytes(path, bytes, MAX_TEXT_BYTES);
     }
-    let path = expand_home(path);
+    let path = filesystem_path(expand_home(path));
     let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
     let meta = file.metadata().map_err(|e| e.to_string())?;
     if !meta.is_file() {
@@ -361,7 +361,8 @@ pub fn save_document(path: &Path, document: &TextDocument, text: &str) -> Result
             super::remote_write::Mode::Guarded,
         );
     }
-    let destination = std::fs::canonicalize(expand_home(path)).map_err(|e| e.to_string())?;
+    let destination =
+        std::fs::canonicalize(filesystem_path(expand_home(path))).map_err(|e| e.to_string())?;
     if !matches_disk(&destination, &document.disk)? {
         return Err("The file changed on disk. Reload it before saving your edits.".into());
     }
@@ -448,6 +449,38 @@ fn matches_disk(path: &Path, expected: &[u8]) -> Result<bool, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_verbatim_tree_key_opens_and_saves_the_exact_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let verbatim = root.join("project.");
+        let sibling = root.join("project");
+        std::fs::create_dir(&verbatim).unwrap();
+        std::fs::create_dir(&sibling).unwrap();
+        let exact = verbatim.join("plan.md");
+        let other = sibling.join("plan.md");
+        std::fs::write(&exact, "intended file").unwrap();
+        std::fs::write(&other, "sibling file").unwrap();
+
+        let listing = list_dir(&verbatim).unwrap();
+        let key = &listing
+            .iter()
+            .find(|entry| entry.name == "plan.md")
+            .unwrap()
+            .path;
+        assert!(key.starts_with("//?/"), "{key}");
+        let path = Path::new(key);
+        let Document::Text(document) = read_document(path).unwrap() else {
+            panic!("expected a text document");
+        };
+        assert_eq!(document.text, "intended file");
+        save_document(path, &document, "edited file").unwrap();
+        assert_eq!(std::fs::read_to_string(exact).unwrap(), "edited file");
+        assert_eq!(std::fs::read_to_string(other).unwrap(), "sibling file");
+    }
+
     #[test]
     fn remote_links_resolve_inside_the_host_and_text_keeps_host_limits() {
         let cwd = Path::new("remote://linux/home/code");

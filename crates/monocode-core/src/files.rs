@@ -38,6 +38,20 @@ pub struct DirEntry {
     pub ignored: bool,
 }
 
+/// Convert a local tree key at the filesystem boundary. Windows verbatim
+/// paths require backslashes to preserve names with trailing dots or spaces.
+pub fn filesystem_path(path: impl Into<PathBuf>) -> PathBuf {
+    let path = path.into();
+    #[cfg(windows)]
+    if let Some(text) = path
+        .to_str()
+        .filter(|text| text.contains('/') && !remote::is_remote(&path))
+    {
+        return PathBuf::from(text.replace('/', "\\"));
+    }
+    path
+}
+
 /// Immediate children of `path` (project tree). Folders first, then natural name order.
 pub fn list_dir(path: &Path) -> Result<Vec<DirEntry>, String> {
     if remote::is_remote(path) {

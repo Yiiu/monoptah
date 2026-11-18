@@ -17,7 +17,7 @@ use gpui::{
     MouseButton, MouseDownEvent, Point, PromptLevel, Role, SharedString, StyleRefinement,
     Subscription, Window, actions, div, list, prelude::*, px, rgb,
 };
-use monocode_core::files::{self, DirEntry, NameIssueKind, Severity};
+use monocode_core::files::{self, DirEntry, NameIssueKind, Severity, filesystem_path};
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
@@ -221,16 +221,6 @@ pub(crate) struct Explorer {
     typeahead: (String, Option<Instant>),
     next_id: u64,
     _subscriptions: Vec<Subscription>,
-}
-
-fn filesystem_path(path: &str) -> PathBuf {
-    // A verbatim Windows prefix must be spelled `\\?\`, even though tree keys use `/`.
-    // Otherwise Windows may normalize significant trailing dots or spaces away.
-    #[cfg(windows)]
-    if !files::remote::is_remote(Path::new(path)) {
-        return PathBuf::from(path.replace('/', "\\"));
-    }
-    PathBuf::from(path)
 }
 
 fn parent_of(path: &str) -> String {
