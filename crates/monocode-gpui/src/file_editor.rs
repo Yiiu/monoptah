@@ -136,6 +136,15 @@ pub(crate) fn split_location(raw: &str) -> (String, Option<(usize, usize)>) {
         }
         path = String::from_utf8_lossy(&decoded).into_owned();
     }
+    // Markdown links and file URLs can spell a Windows drive as `/C:/...`.
+    // Strip only that URL root, after decoding, before PathBuf components can
+    // turn the embedded `C:` into a drive-relative prefix and lose its root.
+    #[cfg(windows)]
+    if let [b'/', drive, b':', b'/' | b'\\', ..] = path.as_bytes()
+        && drive.is_ascii_alphabetic()
+    {
+        path.remove(0);
+    }
     (path, location)
 }
 
@@ -1753,6 +1762,78 @@ mod tests {
             .unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
+    #[cfg(windows)]
+    #[test]
+    fn windows_file_links_strip_the_url_drive_prefix_after_decoding() {
+        for raw in [
+            "/C:/dev/erase/plan.md:12:4",
+            "file:///C:/dev/erase/plan.md:12:4",
+            "file:///%43%3A/dev/erase/plan.md:12:4",
+            "C:/dev/erase/plan.md:12:4",
+            "file://C:/dev/erase/plan.md:12:4",
+        ] {
+            assert_eq!(
+                split_location(raw),
+                ("C:/dev/erase/plan.md".into(), Some((12, 4))),
+                "{raw}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_file_links_resolve_to_absolute_paths_on_the_requested_drive() {
+        for raw in [
+            "/C:/dev/erase/plan.md#L3",
+            "file:///C:/dev/erase/plan.md#L3",
+            "C:/dev/erase/plan.md#L3",
+            r"C:\dev\erase\plan.md#L3",
+        ] {
+            let (path, location) = file_location(raw, r"D:\other\workspace");
+            assert_eq!(path, r"C:\dev\erase\plan.md", "{raw}");
+            assert!(std::path::Path::new(&path).is_absolute(), "{raw}");
+            assert_eq!(location, Some((3, 1)), "{raw}");
+        }
+        assert_eq!(
+            file_location(
+                "file:///C:/dev/%E6%96%87%E6%A1%A3/my%20plan.md:5",
+                r"D:\other\workspace"
+            ),
+            (r"C:\dev\文档\my plan.md".into(), Some((5, 1)))
+        );
+    }
+
+    #[test]
+    fn file_links_preserve_non_drive_paths_and_locations() {
+        for (raw, expected, location) in [
+            (
+                "/project/docs/plan.md#L2",
+                "/project/docs/plan.md",
+                Some((2, 1)),
+            ),
+            ("../docs/plan.md:5:2", "../docs/plan.md", Some((5, 2))),
+            (
+                "file:////server/share/my%20plan.md#L3",
+                "//server/share/my plan.md",
+                Some((3, 1)),
+            ),
+            ("/C:notes/plan.md", "/C:notes/plan.md", None),
+            ("/1:/docs/plan.md", "/1:/docs/plan.md", None),
+            (
+                "remote://host/C:/docs/plan.md",
+                "remote://host/C:/docs/plan.md",
+                None,
+            ),
+        ] {
+            assert_eq!(split_location(raw), (expected.into(), location), "{raw}");
+        }
+        #[cfg(not(windows))]
+        assert_eq!(
+            split_location("/C:/docs/plan.md"),
+            ("/C:/docs/plan.md".into(), None)
+        );
+    }
+
     #[test]
     fn file_links_resolve_relative_paths_and_line_locations() {
         assert_eq!(

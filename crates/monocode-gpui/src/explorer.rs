@@ -17,7 +17,7 @@ use gpui::{
     MouseButton, MouseDownEvent, Point, PromptLevel, Role, SharedString, StyleRefinement,
     Subscription, Window, actions, div, list, prelude::*, px, rgb,
 };
-use monocode_core::files::{self, DirEntry, NameIssueKind, Severity};
+use monocode_core::files::{self, DirEntry, NameIssueKind, Severity, filesystem_path};
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
@@ -381,7 +381,8 @@ impl Explorer {
             search.update(cx, |search, cx| search.focus(window, cx));
             return;
         }
-        let search = cx.new(|cx| ProjectSearch::new(self.cwd.clone(), self.enabled, cx));
+        let project = self.git.read(cx).root.clone();
+        let search = cx.new(|cx| ProjectSearch::new(project, self.enabled, cx));
         self.search_events = Some(cx.subscribe_in(
             &search,
             window,
@@ -493,6 +494,18 @@ impl Explorer {
     }
     fn sync_project(&mut self, cx: &mut Context<Self>) -> bool {
         let root = self.git.read(cx).root.clone();
+        // Search events retain the project's original identity even if only its spelling changed.
+        if let Some(search) = &self.search {
+            search.update(cx, |search, cx| search.set_root(root.clone(), cx));
+        }
+        // list_dir and parent_path use slash paths. Keep the root in that same form so
+        // child listings, their cache keys and refreshes all belong to this tree.
+        #[cfg(windows)]
+        let root = if files::remote::is_remote(Path::new(&root)) {
+            root
+        } else {
+            root.replace('\\', "/")
+        };
         if root == self.cwd {
             return false;
         }
@@ -500,9 +513,6 @@ impl Explorer {
             self.leave_root(cx);
         }
         self.cwd = root.clone();
-        if let Some(search) = &self.search {
-            search.update(cx, |search, cx| search.set_root(root.clone(), cx));
-        }
         let saved = self.enter_root(&root, cx);
         self.expanded = saved.expanded;
         self.selected = saved.selected;
@@ -572,7 +582,7 @@ impl Explorer {
         if self.is_offline(cx) || !self.reading.insert(path.clone()) {
             return;
         }
-        let dir = PathBuf::from(&path);
+        let dir = filesystem_path(&path);
         let work = cx
             .background_executor()
             .spawn(async move { files::list_dir(&dir) });
@@ -594,7 +604,13 @@ impl Explorer {
         cx: &mut Context<Self>,
     ) {
         // A late answer for another root (the panels switched meanwhile) is not this tree's.
-        if !crate::remote_cache::within(&self.cwd, &path) {
+        let inside = if self.is_remote_root() {
+            // Remote cache admission and eviction both use the exact workspace identity.
+            crate::remote_cache::within(&self.cwd, &path)
+        } else {
+            files::is_equal_or_inside(&path, &self.cwd)
+        };
+        if !inside {
             return;
         }
         match &result {
@@ -942,7 +958,7 @@ impl Explorer {
                 let from = path.clone();
                 let work = cx.background_executor().spawn({
                     let name = name.clone();
-                    async move { files::rename_path(Path::new(&from), &name) }
+                    async move { files::rename_path(&filesystem_path(&from), &name) }
                 });
                 cx.spawn_in(window, async move |this, cx| {
                     let result = work.await;
@@ -972,7 +988,7 @@ impl Explorer {
                 let at = parent.clone();
                 let work = cx.background_executor().spawn({
                     let name = name.clone();
-                    async move { files::create_path(Path::new(&at), &name, as_folder) }
+                    async move { files::create_path(&filesystem_path(&at), &name, as_folder) }
                 });
                 cx.spawn_in(window, async move |this, cx| {
                     let result = work.await;
@@ -1104,7 +1120,7 @@ impl Explorer {
                     this.clip = None;
                 }
                 this.run(
-                    move || files::delete_path(Path::new(&target)).map(|_| None),
+                    move || files::delete_path(&filesystem_path(&target)).map(|_| None),
                     vec![parent],
                     is_dir.then_some(path),
                     window,
@@ -1144,9 +1160,9 @@ impl Explorer {
         let from = clip.path.clone();
         if clip.cut {
             let to_parent = dest.clone();
-            let task = cx
-                .background_executor()
-                .spawn(async move { files::move_path(Path::new(&from), Path::new(&to_parent)) });
+            let task = cx.background_executor().spawn(async move {
+                files::move_path(&filesystem_path(&from), &filesystem_path(&to_parent))
+            });
             let from = clip.path.clone();
             cx.spawn_in(window, async move |this, cx| {
                 let result = task.await;
@@ -1171,7 +1187,7 @@ impl Explorer {
         } else {
             let to = dest.clone();
             self.run(
-                move || files::copy_path(Path::new(&from), Path::new(&to)).map(Some),
+                move || files::copy_path(&filesystem_path(&from), &filesystem_path(&to)).map(Some),
                 vec![dest],
                 None,
                 window,
@@ -1194,7 +1210,7 @@ impl Explorer {
             move || {
                 let mut created = None;
                 for from in &paths {
-                    created = Some(files::copy_path(from, Path::new(&to))?);
+                    created = Some(files::copy_path(from, &filesystem_path(&to))?);
                 }
                 Ok(created)
             },
@@ -1214,7 +1230,7 @@ impl Explorer {
         let parent = parent_of(&path);
         let to = parent.clone();
         self.run(
-            move || files::copy_path(Path::new(&path), Path::new(&to)).map(Some),
+            move || files::copy_path(&filesystem_path(&path), &filesystem_path(&to)).map(Some),
             vec![parent],
             None,
             window,
@@ -1276,7 +1292,7 @@ impl Explorer {
     }
     fn reveal(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
         self.run(
-            move || files::reveal_path(Path::new(&path)).map(|_| None),
+            move || files::reveal_path(&filesystem_path(&path)).map(|_| None),
             Vec::new(),
             None,
             window,
@@ -2187,6 +2203,260 @@ mod tests {
     }
 
     #[gpui::test]
+    fn windows_explorer_accepts_drive_children_but_rejects_other_projects(cx: &mut TestAppContext) {
+        let (window, _) = explorer_window(cx);
+        window
+            .update(cx, |explorer, _, cx| {
+                explorer.cwd = "C:/".into();
+                explorer.apply_listing("C:/code".into(), Ok(listing("C:/code", &["a.rs"])), cx);
+                assert!(explorer.dirs.contains_key("C:/code"));
+                explorer.dirs.clear();
+                explorer.cwd = "C:/code".into();
+                for other in ["C:/code-other", "D:/code", "remote://env/C:/code"] {
+                    explorer.apply_listing(other.into(), Ok(listing(other, &["other.rs"])), cx);
+                }
+                assert!(explorer.dirs.is_empty());
+                explorer.apply_listing(
+                    "C:/code/src".into(),
+                    Ok(listing("C:/code/src", &["ours.rs"])),
+                    cx,
+                );
+                assert!(explorer.dirs.contains_key("C:/code/src"));
+            })
+            .unwrap();
+    }
+
+    #[cfg(windows)]
+    struct WindowsTree(PathBuf);
+
+    #[cfg(windows)]
+    impl WindowsTree {
+        fn new() -> Self {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir()
+                .join(format!("monoptah-explorer-{}-{stamp}", std::process::id()));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for WindowsTree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(windows)]
+    #[gpui::test]
+    fn windows_explorer_loads_expanded_directories_and_refreshes_them(cx: &mut TestAppContext) {
+        let tree = WindowsTree::new();
+        std::fs::create_dir_all(tree.0.join("nested/deeper")).unwrap();
+        std::fs::write(tree.0.join("nested/deeper/leaf.md"), "leaf").unwrap();
+        let (window, git) = explorer_window(cx);
+        // Both ordinary Windows roots and canonicalized (verbatim) roots enter the app.
+        for (iteration, root) in [tree.0.clone(), tree.0.canonicalize().unwrap()]
+            .into_iter()
+            .enumerate()
+        {
+            let added = format!("new-{iteration}.md");
+            git.update(cx, |git, _| git.root = root.to_string_lossy().into_owned());
+            window
+                .update(cx, |explorer, _, cx| explorer.set_enabled(true, cx))
+                .unwrap();
+            cx.run_until_parked();
+            for name in ["nested", "deeper"] {
+                window
+                    .update(cx, |explorer, _, cx| {
+                        let path = explorer
+                            .lines
+                            .iter()
+                            .find_map(|line| match line {
+                                Line::Entry { entry, .. } if entry.name == name => {
+                                    Some(entry.path.clone())
+                                }
+                                _ => None,
+                            })
+                            .unwrap_or_else(|| panic!("{name} was not listed for {root:?}"));
+                        explorer.toggle(&path, cx);
+                    })
+                    .unwrap();
+                cx.run_until_parked();
+            }
+            window
+                .update(cx, |explorer, _, cx| {
+                    assert!(explorer.lines.iter().any(|line| matches!(
+                        line, Line::Entry { entry, depth: 2, .. } if entry.name == "leaf.md"
+                    )));
+                    assert!(
+                        !explorer
+                            .lines
+                            .iter()
+                            .any(|line| matches!(line, Line::Note { .. }))
+                    );
+                    assert!(explorer.reading.is_empty());
+                    assert_eq!(explorer.shown_dirs().len(), 3);
+                    assert!(
+                        !explorer.sync_project(cx),
+                        "the same root must keep its tree"
+                    );
+                    assert!(!explorer.lines.iter().any(|line| matches!(
+                        line, Line::Entry { entry, .. } if entry.name == added
+                    )));
+                    std::fs::write(tree.0.join("nested/deeper").join(&added), "new").unwrap();
+                    explorer.refresh_loaded(cx);
+                })
+                .unwrap();
+            cx.run_until_parked();
+            window
+                .read_with(cx, |explorer, _| {
+                    assert!(explorer.lines.iter().any(|line| matches!(
+                        line, Line::Entry { entry, depth: 2, .. } if entry.name == added
+                    )));
+                })
+                .unwrap();
+        }
+    }
+
+    #[gpui::test]
+    fn a_late_listing_with_another_remote_root_spelling_is_dropped(cx: &mut TestAppContext) {
+        let (window, git) = explorer_window(cx);
+        let old = "remote://win/C:/repo";
+        let current = "remote://win/c:/repo";
+        window
+            .update(cx, |explorer, _, cx| {
+                explorer.cwd = current.into();
+                explorer.apply_listing(old.into(), Ok(listing(old, &["old.rs"])), cx);
+                assert!(explorer.dirs.is_empty());
+                explorer.apply_listing(current.into(), Ok(listing(current, &["current.rs"])), cx);
+                explorer.leave_root(cx);
+                assert!(explorer.dirs.is_empty());
+                let cached = git.read(cx).remote.peek(current).unwrap();
+                assert_eq!(cached.dirs.len(), 1);
+                assert_eq!(cached.dirs[current][0].name, "current.rs");
+                assert!(git.read(cx).remote.peek(old).is_none());
+            })
+            .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[gpui::test]
+    fn windows_explorer_preserves_verbatim_directory_names(cx: &mut TestAppContext) {
+        let tree = WindowsTree::new();
+        let native = tree.0.canonicalize().unwrap();
+        let parent = native.join("a".repeat(100)).join("b".repeat(100));
+        let expected = parent.join("project.");
+        let sibling = parent.join("project");
+        std::fs::create_dir_all(expected.join("nested.")).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::write(expected.join("correct.md"), "correct").unwrap();
+        std::fs::write(expected.join("nested.").join("leaf.md"), "leaf").unwrap();
+        std::fs::write(sibling.join("wrong.md"), "wrong").unwrap();
+        let (window, git) = explorer_window(cx);
+        git.update(cx, |git, _| {
+            git.root = expected.to_string_lossy().into_owned()
+        });
+        window
+            .update(cx, |explorer, _, cx| explorer.set_enabled(true, cx))
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |explorer, _, cx| {
+                assert!(explorer.lines.iter().any(|line| matches!(
+                    line, Line::Entry { entry, .. } if entry.name == "correct.md"
+                )));
+                assert!(!explorer.lines.iter().any(|line| matches!(
+                    line, Line::Entry { entry, .. } if entry.name == "wrong.md"
+                )));
+                let child = explorer
+                    .lines
+                    .iter()
+                    .find_map(|line| match line {
+                        Line::Entry { entry, .. } if entry.name == "nested." => {
+                            Some(entry.path.clone())
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                explorer.toggle(&child, cx);
+                let path = filesystem_path(&explorer.cwd);
+                files::create_path(&path, "created.md", false).unwrap();
+                assert!(expected.join("created.md").exists());
+                assert!(!sibling.join("created.md").exists());
+                files::delete_path(&path.join("created.md")).unwrap();
+                assert!(sibling.join("wrong.md").exists());
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .read_with(cx, |explorer, _| {
+                assert!(explorer.lines.iter().any(|line| matches!(
+                    line, Line::Entry { entry, depth: 1, .. } if entry.name == "leaf.md"
+                )));
+            })
+            .unwrap();
+        // Remove the long verbatim tree before the fixture's ordinary-path cleanup.
+        std::fs::remove_dir_all(native).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[gpui::test]
+    fn windows_explorer_shows_hidden_files_and_can_reveal_git_exclusions(cx: &mut TestAppContext) {
+        let tree = WindowsTree::new();
+        std::fs::create_dir(tree.0.join(".config")).unwrap();
+        std::fs::create_dir(tree.0.join(".git")).unwrap();
+        std::fs::write(tree.0.join(".config/settings.json"), "{}").unwrap();
+        std::fs::write(tree.0.join(".env"), "EXAMPLE=placeholder").unwrap();
+        std::fs::write(tree.0.join(".gitignore"), "ignored.txt\n").unwrap();
+        std::fs::write(tree.0.join("ignored.txt"), "ignored").unwrap();
+        let hidden = tree.0.join("hidden.txt");
+        std::fs::write(&hidden, "hidden").unwrap();
+        let mut command = std::process::Command::new("attrib");
+        command.arg("+H").arg(&hidden);
+        monocode_core::process::configure_child(&mut command);
+        assert!(command.output().unwrap().status.success());
+        let (window, git) = explorer_window(cx);
+        git.update(cx, |git, _| {
+            git.root = tree
+                .0
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+        });
+        window
+            .update(cx, |explorer, _, cx| explorer.set_enabled(true, cx))
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |explorer, _, cx| {
+                let visible = |explorer: &Explorer, name: &str| {
+                    explorer.lines.iter().any(|line| {
+                        matches!(
+                            line, Line::Entry { entry, .. } if entry.name == name
+                        )
+                    })
+                };
+                assert!(visible(explorer, ".env"));
+                assert!(visible(explorer, ".config"));
+                assert!(visible(explorer, "hidden.txt"));
+                assert!(!visible(explorer, ".git"));
+                assert!(!visible(explorer, "ignored.txt"));
+                explorer.set_show_excluded(true, cx);
+                assert!(visible(explorer, ".git"));
+                assert!(visible(explorer, "ignored.txt"));
+                explorer.set_show_excluded(false, cx);
+                assert!(!visible(explorer, ".git"));
+                assert!(!visible(explorer, "ignored.txt"));
+                assert!(visible(explorer, "hidden.txt"));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
     fn a_disconnect_keeps_the_cached_tree_and_disables_writes(cx: &mut gpui::TestAppContext) {
         let (window, git) = explorer_window(cx);
         window
@@ -2530,6 +2800,38 @@ mod tests {
             results.size.height > px(0.),
             "results container has no height: {results:?}"
         );
+        let opened = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let seen = opened.clone();
+        let _subscription = visual.update(|_, cx| {
+            cx.subscribe(&explorer, move |_, event: &OpenSearchMatch, _| {
+                seen.borrow_mut().push(event.cwd.clone());
+            })
+        });
+        let first = visual.debug_bounds("project-search-match-0-0").unwrap();
+        visual.simulate_click(first.center(), gpui::Modifiers::default());
+        visual.run_until_parked();
+        assert_eq!(opened.borrow().as_slice(), &[cwd]);
+        #[cfg(windows)]
+        for (iteration, next) in [
+            root.to_string_lossy().replace('\\', "/"),
+            root.canonicalize().unwrap().to_string_lossy().into_owned(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            explorer.update(visual, |explorer, cx| {
+                explorer.git.update(cx, |git, _| git.root = next.clone());
+                explorer.sync_project(cx);
+            });
+            visual.executor().advance_clock(Duration::from_millis(500));
+            visual.run_until_parked();
+            visual.refresh().unwrap();
+            let first = visual.debug_bounds("project-search-match-0-0").unwrap();
+            visual.simulate_click(first.center(), gpui::Modifiers::default());
+            visual.run_until_parked();
+            assert_eq!(opened.borrow().last(), Some(&next));
+            assert_eq!(opened.borrow().len(), iteration + 2);
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
