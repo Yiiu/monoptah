@@ -299,7 +299,6 @@ fn char_offsets_without_a_limit_read_on_in_the_latest_message() {
 /// host runs it, must return exactly the part the report cut.
 #[test]
 fn completion_report_read_calls_reach_the_cut_text_in_both_stores() {
-    use crate::response::{completion_report, read_call, TurnEnd};
     let mono = crate::mono::Mono {
         projects: vec!["/work/other".into(), "/work/repo".into()],
         ..Default::default()
@@ -334,8 +333,13 @@ fn completion_report_read_calls_reach_the_cut_text_in_both_stores() {
         let session = store.create("codex", "/work/repo").unwrap();
         store.write_rows(session.id, 0, &transcript.rows).unwrap();
         let rows = store.load(session.id).unwrap().rows;
-        let call = read_call(session.id, mono.session_project(&session.cwd).as_deref());
-        let report = completion_report(&rows, TurnEnd::Unknown, call.as_ref(), 12000);
+        let report = store
+            .app_completion_report(
+                session.id,
+                mono.session_project(&session.cwd).as_deref(),
+                12000,
+            )
+            .unwrap();
         assert!(report.chars().count() <= 12000);
         let (marker, tail) = report.split_once("\n\n").unwrap();
         assert!(expected.ends_with(tail) && tail.ends_with("THE CONCLUSION"));
@@ -346,6 +350,14 @@ fn completion_report_read_calls_reach_the_cut_text_in_both_stores() {
         )));
         let json = &marker[marker.find('{').unwrap()..=marker.find('}').unwrap()];
         let mut input: Value = serde_json::from_str(json).unwrap();
+        let mut newer = crate::transcript::Transcript::default();
+        newer.begin("user");
+        newer.append("A later request");
+        newer.begin("assistant");
+        newer.append("A different answer");
+        store
+            .write_rows(session.id, rows.len(), &newer.rows)
+            .unwrap();
         // The host's path: validate, resolve the Mono project, filter by cwd.
         crate::mono::api::validate("sessions.read", &input).unwrap();
         let project = mono.project(input["project"].as_str()).unwrap();

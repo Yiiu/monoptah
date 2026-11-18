@@ -165,6 +165,57 @@ impl Store {
         Ok((session, true))
     }
 
+    /// The latest exchange ID as `app_conversation` exposes it.
+    fn app_latest_turn_id(&self, id: i64, rows: &[crate::transcript::Row]) -> Option<String> {
+        if self.shared.is_some() && self.remote_session(id).ok()?.is_none() {
+            return self
+                .shared_blocks(id)
+                .ok()?
+                .iter()
+                .rfind(|block| crate::app_access::readable_prompt(block))?
+                .get("id")?
+                .as_str()
+                .map(str::to_owned);
+        }
+        rows.iter()
+            .enumerate()
+            .rfind(|(index, row)| row.role == "user" && (row.first || *index == 0))
+            .map(|(index, _)| format!("row-{index}"))
+    }
+
+    pub fn app_completion_report(
+        &self,
+        id: i64,
+        project: Option<&str>,
+        count: usize,
+    ) -> Result<String, String> {
+        use crate::response::{completion_report, read_call, turn_end};
+
+        // The desktop can append from a different connection. Read the rows,
+        // receipt and paging cursor from the same SQLite snapshot.
+        let snapshot = (self.shared.is_some()
+            && self.conn.is_autocommit()
+            && self.remote_session(id)?.is_none())
+        .then(|| self.conn.unchecked_transaction())
+        .transpose()
+        .map_err(|e| e.to_string())?;
+        let rows = self.load(id)?.rows;
+        let turns = self.agent_settings(id)?.unwrap_or_default().turns;
+        let read = project.and_then(|project| {
+            let turn = self.app_latest_turn_id(id, &rows)?;
+            read_call(id, Some(project), &turn)
+        });
+        if let Some(snapshot) = snapshot {
+            snapshot.commit().map_err(|e| e.to_string())?;
+        }
+        Ok(completion_report(
+            &rows,
+            turn_end(&rows, &turns),
+            read.as_ref(),
+            count,
+        ))
+    }
+
     pub fn app_conversation(
         &self,
         id: i64,
@@ -241,7 +292,8 @@ mod tests {
             ];
             store.shared_store_blocks(session.id, &blocks).unwrap();
             let rows = store.load(session.id).unwrap().rows;
-            let call = read_call(session.id, Some("/work/repo")).unwrap();
+            let turn = store.app_latest_turn_id(session.id, &rows).unwrap();
+            let call = read_call(session.id, Some("/work/repo"), &turn).unwrap();
             let report = completion_report(&rows, TurnEnd::Unknown, Some(&call), 12000);
             let expected = crate::response::normalized(text);
             let mut input = call.clone();
@@ -263,6 +315,19 @@ mod tests {
                 assert_eq!(report, expected);
             }
         }
+    }
+
+    #[test]
+    fn shared_settings_include_the_persisted_stop_marker() {
+        let store = Store::open_monocode(Path::new(":memory:")).unwrap();
+        let id = store.create("codex", "/work/repo").unwrap().id;
+        store
+            .shared_store_blocks(
+                id,
+                &[json!({"id":"u","role":"user","text":"Go","nativeStopped":true})],
+            )
+            .unwrap();
+        assert!(store.agent_settings(id).unwrap().unwrap().turns[&1].stopped);
     }
 
     /// A native stop leaves no row. The receipt the runtime closes records it,

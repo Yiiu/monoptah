@@ -159,13 +159,13 @@ pub fn turn_end(
         TurnEnd::Unknown
     }
 }
-/// The `sessions.read` input that returns `session`'s latest final message.
+/// The `sessions.read` input that returns the reported turn's final message.
 /// `project` is the Mono project that `sessions.read` can use to resolve the
 /// session. Cloud sessions use a negative ID and the assigned local project.
-pub fn read_call(session: i64, project: Option<&str>) -> Option<serde_json::Value> {
+pub fn read_call(session: i64, project: Option<&str>, turn: &str) -> Option<serde_json::Value> {
     let project = project?;
     (session != 0).then(
-        || serde_json::json!({"sessionId":session,"project":project,"limit":1,"maxChars":6000}),
+        || serde_json::json!({"sessionId":session,"project":project,"turnId":turn,"limit":1,"maxChars":6000}),
     )
 }
 /// A delegated session's completion report: the last non-blank assistant
@@ -242,10 +242,11 @@ pub fn completion_report(
         },
     };
     let Some((_, text)) = answer else {
-        return match unfinished {
+        let message = match unfinished {
             Some(how) => format!("(its latest turn did not finish: {how}. It wrote no message.)"),
             None => "(no written reply on its latest turn)".into(),
         };
+        return message.chars().take(count).collect();
     };
     let header = unfinished.map(|how| {
         format!(
@@ -253,6 +254,9 @@ pub fn completion_report(
         )
     });
     let header_len = header.as_deref().map_or(0, |h| h.chars().count());
+    if let Some(header) = header.as_deref().filter(|_| header_len >= count) {
+        return header.chars().take(count).collect();
+    }
     let budget = count.saturating_sub(header_len);
     let total = text.chars().count();
     let marker = |omitted: usize| {
@@ -777,7 +781,7 @@ mod tests {
     fn completion_report_keeps_the_end_when_over_budget() {
         let answer = format!("{}THE CONCLUSION", "detail ".repeat(3000));
         let rows = rows(&[("user", "Go"), ("assistant", &answer)]);
-        let call = read_call(42, Some("/repo")).unwrap();
+        let call = read_call(42, Some("/repo"), "turn-1").unwrap();
         let report = completion_report(&rows, TurnEnd::Unknown, Some(&call), 12000);
         assert_eq!(report.chars().count(), 12000);
         assert!(report.ends_with("THE CONCLUSION"));
@@ -802,13 +806,28 @@ mod tests {
         assert_eq!(unfinished.chars().count(), 12000);
         assert!(unfinished.starts_with("(its latest turn did not finish: it was stopped."));
         assert!(unfinished.ends_with("THE CONCLUSION"));
-        // Remote sessions can't be read through sessions.read, so no call is offered.
+        for count in [0, 5, 50] {
+            assert_eq!(
+                completion_report(&rows, TurnEnd::Stopped, Some(&call), count)
+                    .chars()
+                    .count(),
+                count
+            );
+            assert!(
+                completion_report(&[], TurnEnd::Stopped, None, count)
+                    .chars()
+                    .count()
+                    <= count
+            );
+        }
         assert_eq!(
-            read_call(-5, Some("/repo")),
-            Some(serde_json::json!({"sessionId":-5,"project":"/repo","limit":1,"maxChars":6000}))
+            read_call(-5, Some("/repo"), "turn-1"),
+            Some(
+                serde_json::json!({"sessionId":-5,"project":"/repo","turnId":"turn-1","limit":1,"maxChars":6000})
+            )
         );
-        assert_eq!(read_call(0, Some("/repo")), None);
-        assert_eq!(read_call(5, None), None);
+        assert_eq!(read_call(0, Some("/repo"), "turn-1"), None);
+        assert_eq!(read_call(5, None, "turn-1"), None);
         let remote = completion_report(&rows, TurnEnd::Unknown, None, 12000);
         assert!(remote.starts_with(
             "[the start of this message was cut; open the session to read it in full]\n\n"

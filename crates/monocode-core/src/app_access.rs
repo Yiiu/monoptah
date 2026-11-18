@@ -378,6 +378,13 @@ fn assistant_message(block: &Value) -> bool {
         _ => false,
     }
 }
+
+pub(crate) fn readable_prompt(block: &Value) -> bool {
+    block["role"] == "user"
+        && (block["internal"] != true || block["monoSessionCompletion"].is_object())
+        && block["draft"] != true
+}
+
 /// Tauri's prose-only exchanges, with canonical source block IDs as cursors.
 pub fn conversation_page(blocks: &[Value], input: &Value) -> Result<Value, String> {
     let max = bounded(input, "maxChars", 1200, 200, 6000)?;
@@ -387,10 +394,7 @@ pub fn conversation_page(blocks: &[Value], input: &Value) -> Result<Value, Strin
     let limit = bounded(input, "limit", if offset > 0 { 1 } else { 3 }, 1, 3)?;
     let mut turns: Vec<(&Value, Vec<&Value>)> = Vec::new();
     for block in blocks {
-        if block["role"] == "user"
-            && (block["internal"] != true || block["monoSessionCompletion"].is_object())
-            && block["draft"] != true
-        {
+        if readable_prompt(block) {
             turns.push((block, Vec::new()));
         } else if assistant_message(block)
             && block["internal"] != true
@@ -401,18 +405,30 @@ pub fn conversation_page(blocks: &[Value], input: &Value) -> Result<Value, Strin
             }
         }
     }
-    let end = match input.get("before") {
-        Some(Value::String(before)) => turns
+    let (start, end) = if let Some(turn_id) = input.get("turnId") {
+        if input.get("before").is_some() {
+            return Err("Use turnId or before".into());
+        }
+        let turn = turn_id.as_str().ok_or("turnId must be text")?;
+        let index = turns
             .iter()
-            .position(|(b, _)| b["id"] == *before)
-            .ok_or("before is not a turn ID in this session")?,
-        Some(value) => value
-            .as_u64()
-            .ok_or("before must be a turn ID")?
-            .min(turns.len() as u64) as usize,
-        None => turns.len(),
+            .position(|(b, _)| b["id"] == turn)
+            .ok_or("turnId is not a turn ID in this session")?;
+        (index, index + 1)
+    } else {
+        let end = match input.get("before") {
+            Some(Value::String(before)) => turns
+                .iter()
+                .position(|(b, _)| b["id"] == *before)
+                .ok_or("before is not a turn ID in this session")?,
+            Some(value) => value
+                .as_u64()
+                .ok_or("before must be a turn ID")?
+                .min(turns.len() as u64) as usize,
+            None => turns.len(),
+        };
+        (end.saturating_sub(limit), end)
     };
-    let start = end.saturating_sub(limit);
     let selected = &turns[start..end];
     Ok(json!({"turns":selected.iter().map(|(user,answers)|{
         let text=user["text"].as_str().unwrap_or("");

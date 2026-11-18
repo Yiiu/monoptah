@@ -2073,11 +2073,7 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.set_enabled
                         .iter()
                         .find(|launch| launch.session_id == id)
                         .and_then(|launch| mono.session_project(&launch.cwd));
-                    (
-                        id,
-                        title,
-                        monocode_core::response::read_call(id, project.as_deref()),
-                    )
+                    (id, title, project)
                 })
                 .collect();
             let work = cx
@@ -2131,14 +2127,14 @@ pub(super) struct LimitFacts {
 /// belongs to the latest turn. `live` holds the open sessions, which win over the saved copy.
 pub(super) fn completion_results(
     store: &Database,
-    sessions: Vec<(i64, String, Option<Value>)>,
+    sessions: Vec<(i64, String, Option<String>)>,
     book: Option<&monocode_core::accounts::Book>,
     mut live: HashMap<i64, Option<LimitFacts>>,
 ) -> Vec<(i64, String, String)> {
     let budget = completion_budget(sessions.len());
     sessions
         .into_iter()
-        .map(|(id, title, read)| {
+        .map(|(id, title, project)| {
             let db = locked(store);
             let facts = match live.remove(&id) {
                 Some(facts) => facts,
@@ -2155,14 +2151,11 @@ pub(super) fn completion_results(
             });
             let prose = db
                 .and_then(|db| {
-                    let rows = db.load(id)?.rows;
-                    let turns = db.agent_settings(id)?.unwrap_or_default().turns;
-                    Ok(monocode_core::response::completion_report(
-                        &rows,
-                        monocode_core::response::turn_end(&rows, &turns),
-                        read.as_ref(),
+                    db.app_completion_report(
+                        id,
+                        project.as_deref(),
                         budget.saturating_sub(note.chars().count()),
-                    ))
+                    )
                 })
                 .unwrap_or_else(|_| "Session was removed".into());
             (id, title, format!("{note}{prose}"))

@@ -5136,7 +5136,9 @@ impl Shell {
         if let Some(view) = self
             .workspace
             .active
-            .and_then(|pane| self.sessions.get(&self.workspace.session_for_pane(pane)))
+            .map(|pane| self.workspace.session_for_pane(pane))
+            .filter(|&id| self.workspace.tab_of(id) == self.workspace.active_tab())
+            .and_then(|id| self.sessions.get(&id))
         {
             self.review_focused = false;
             window.focus(&view.read(cx).input.focus_handle(cx), cx);

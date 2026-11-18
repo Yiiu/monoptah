@@ -262,11 +262,16 @@ impl Shell {
             .workspace
             .active
             .filter(|id| self.workspace.tab_of(*id).is_some());
-        let (Some(owner), Some(_)) = (self.terminal_owner(), target) else {
+        let (Some(owner), Some(target)) = (self.terminal_owner(), target) else {
             self.new_title_terminal(window, cx);
             return;
         };
-        let cwd = self.terminal_cwd(cx);
+        let cwd = self
+            .workspace
+            .terminal_panes
+            .get(&target)
+            .map(|pane| pane.cwd.clone())
+            .unwrap_or_else(|| self.terminal_cwd(cx));
         let terminal = self.spawn_terminal(cwd.clone(), cx);
         let pane = self.workspace.next_pane_id();
         self.workspace
@@ -828,8 +833,14 @@ mod tests {
         visual.run_until_parked();
         visual.simulate_keystrokes("secondary-shift-j");
         visual.run_until_parked();
+        let cwd = std::env::temp_dir().to_string_lossy().into_owned();
         let first = window
-            .update(&mut visual, |shell, _, _| shell.workspace.active.unwrap())
+            .update(&mut visual, |shell, _, _| {
+                let first = shell.workspace.active.unwrap();
+                assert_ne!(shell.workspace.project, cwd);
+                shell.workspace.terminal_panes.get_mut(&first).unwrap().cwd = cwd.clone();
+                first
+            })
             .unwrap();
         let selector = Box::leak(format!("split-pane-split-down-{first}").into_boxed_str());
         let button = visual.debug_bounds(selector).unwrap().center();
@@ -840,7 +851,7 @@ mod tests {
                 assert_eq!(shell.workspace.terminal_panes.len(), 2);
                 let second = shell.workspace.active.unwrap();
                 assert_ne!(second, first);
-                assert!(shell.workspace.terminal_panes.contains_key(&second));
+                assert_eq!(shell.workspace.terminal_panes[&second].cwd, cwd);
                 assert_eq!(shell.workspace.tab_of(second), shell.workspace.tab_of(b));
             })
             .unwrap();
@@ -885,6 +896,14 @@ mod tests {
             })
             .unwrap();
         assert!(visual.debug_bounds("terminal-dock").is_none());
+        window
+            .update(&mut visual, |shell, window, cx| {
+                let focus = window.focused(cx);
+                assert!(focus.is_some());
+                shell.focus_prompt(window, cx);
+                assert_eq!(window.focused(cx), focus);
+            })
+            .unwrap();
         // The tabs replace the footer's terminal button.
         assert!(visual.debug_bounds("footer-terminal").is_none());
         // The plus button asks for a session or a terminal.
