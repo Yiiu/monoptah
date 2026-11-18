@@ -414,6 +414,9 @@ impl Render for ProjectSearch {
                             }));
                         div()
                             .id(("project-search-match", group_index * 501 + index))
+                            .debug_selector(move || {
+                                format!("project-search-match-{group_index}-{index}")
+                            })
                             .role(Role::Button)
                             .aria_label(format!(
                                 "{}:{} {}",

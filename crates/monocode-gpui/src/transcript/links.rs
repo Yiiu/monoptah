@@ -77,6 +77,52 @@ impl Target {
         }
     }
 }
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn windows_markdown_file_links_resolve_for_open_and_copy() {
+        for (source, expected, location) in [
+            (
+                "[接入方案](/C:/dev/erase/.trellis/tasks/11-14-cloud-retouch-workspace/research/people-selection-productization.md)",
+                r"C:\dev\erase\.trellis\tasks\11-14-cloud-retouch-workspace\research\people-selection-productization.md",
+                None,
+            ),
+            (
+                "[实施计划](file:///C:/dev/erase/.trellis/tasks/11-14-cloud-retouch-workspace/implement.md#L7)",
+                r"C:\dev\erase\.trellis\tasks\11-14-cloud-retouch-workspace\implement.md",
+                Some((7, 1)),
+            ),
+            (
+                "[空格文件](</C:/dev/文档/my plan.md:3:2>)",
+                r"C:\dev\文档\my plan.md",
+                Some((3, 2)),
+            ),
+        ] {
+            let tree = crate::markdown_model::parse_full(source);
+            let mut row = markdown::rows(&tree.blocks[0].block).remove(0);
+            markdown::resolve_file_links(&mut row, r"D:\other\workspace");
+            let markdown::Part::Text { runs, .. } = row.part else {
+                panic!("expected a paragraph: {source}");
+            };
+            let url = runs[0].style.link.as_ref().expect("file link");
+            let Target::File {
+                path,
+                location: actual_location,
+                ..
+            } = Target::resolve(url, Some(r"D:\other\workspace")).expect("absolute file target")
+            else {
+                panic!("expected a file target: {source}");
+            };
+            // Open, copy and reveal all consume this same resolved path.
+            assert_eq!(path, expected, "{source}");
+            assert!(Path::new(&path).is_absolute(), "{source}");
+            assert_eq!(actual_location, location, "{source}");
+        }
+    }
+}
+
 impl TranscriptView {
     pub(super) fn open_link_menu(
         &mut self,
