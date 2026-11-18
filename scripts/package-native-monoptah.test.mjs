@@ -283,3 +283,18 @@ test("the output directory may not be inside the built bundle", () => {
   assert.doesNotThrow(() => assertOutsideBundle(`${app}-out`, binary));
   assert.doesNotThrow(() => assertOutsideBundle("/tmp/out", binary));
 });
+
+test("output aliases into the built bundle are rejected", async (t) => {
+  const { directory, release } = await releaseDir(t);
+  const binary = join(release, "monocode-gpui");
+  const app = join(release, "Monoptah Native.app");
+  const contents = join(app, "Contents");
+  await mkdir(contents, { recursive: true });
+  const alias = join(directory, "linked-contents");
+  symlinkSync(contents, alias, process.platform === "win32" ? "junction" : "dir");
+
+  assert.throws(() => assertOutsideBundle(join(alias, "new-output"), binary), /must not be inside/);
+  const caseAlias = join(release, "monoptah native.app");
+  if (existsSync(caseAlias))
+    assert.throws(() => assertOutsideBundle(join(caseAlias, "new-output"), binary), /must not be inside/);
+});

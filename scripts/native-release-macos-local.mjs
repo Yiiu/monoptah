@@ -797,25 +797,26 @@ export async function runRelease(argv, io) {
     dir = io.makeTempDir(version);
     io.log("Packaging into " + dir + "...");
     const pack = packageCommand(version, dir);
-    // The packaging child removes the bundle itself. This covers it being killed
-    // by a signal (Ctrl-C reaches it through the guard below, which keeps this
-    // process alive until the child is gone) and any other failure. A cleanup
-    // problem never hides the original error.
-    let packError = null;
-    try {
-      await guarded(async () => io.visible(pack.command, pack.args, env));
-    } catch (error) {
-      packError = error;
-      throw error;
-    } finally {
+    await guarded(async () => {
+      let packError = null;
       try {
-        io.removeBuiltApp();
-      } catch (cleanup) {
-        if (packError instanceof Error)
-          packError.message += "\n(could not remove the built app bundle: " + cleanup.message + ")";
-        else io.log("Warning: could not remove the built app bundle: " + cleanup.message);
+        io.visible(pack.command, pack.args, env);
+      } catch (error) {
+        packError = error;
+        throw error;
+      } finally {
+        // The parent also cleans up if the packaging child was interrupted.
+        try {
+          io.removeBuiltApp();
+        } catch (cleanup) {
+          if (packError instanceof Error)
+            packError.message += "\n(could not remove the built app bundle: " + cleanup.message + ")";
+          else io.log("Warning: could not remove the built app bundle: " + cleanup.message);
+        }
+        // spawnSync defers signal delivery until Node returns to the event loop.
+        await new Promise((resolve) => setImmediate(resolve));
       }
-    }
+    });
     files = macosReleaseFiles(version, io.listDir(dir));
     const notesPath = join(dir, "release-notes.md");
     io.writeText(notesPath, notes.text);

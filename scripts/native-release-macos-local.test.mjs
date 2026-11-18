@@ -1265,6 +1265,24 @@ test("the built app bundle is removed right after packaging: success, failure an
   assert.ok(failed.events.includes("removeBuiltApp"));
 });
 
+test("packaging keeps its interrupt handler through cleanup and the next event loop turn", async () => {
+  const { io, handlers } = fakeIo();
+  const removeBuiltApp = io.removeBuiltApp;
+  let duringCleanup;
+  let onNextTurn;
+  io.removeBuiltApp = () => {
+    duringCleanup = handlers.length;
+    onNextTurn = new Promise((resolve) => {
+      setImmediate(() => resolve(handlers.length));
+    });
+    removeBuiltApp();
+  };
+
+  await runRelease([V, "--dry-run"], io);
+  assert.equal(duringCleanup, 1);
+  assert.equal(await onNextTurn, 1);
+});
+
 test("a failing cleanup never hides the packaging error and only warns after a good package step", async () => {
   const failed = fakeIo({ failOn: packageCommand(V, "/tmp/out").command, cleanupFails: true });
   await assert.rejects(runRelease([V], failed.io), (e) => /failed \(exit 1\)/.test(e.message) && /could not remove the built app bundle: EBUSY/.test(e.message));

@@ -15,7 +15,7 @@
 // The version defaults to MONOCODE_NATIVE_VERSION.
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { lstatSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -201,8 +201,21 @@ export function markNeverIndex(dir) {
 export function assertOutsideBundle(out, binary) {
   const app = join(dirname(resolve(binary)), APP_NAME);
   const dir = resolve(out);
+  const error = `The output directory must not be inside ${app}`;
   if (dir === app || dir.startsWith(app + sep))
-    throw new Error(`The output directory must not be inside ${app}`);
+    throw new Error(error);
+
+  const bundle = statSync(app, { bigint: true, throwIfNoEntry: false });
+  if (!bundle) return;
+  // Follow existing ancestors and compare directory identity, including
+  // aliases on case-insensitive filesystems.
+  let ancestor = dir;
+  while (ancestor !== dirname(ancestor)) {
+    const entry = statSync(ancestor, { bigint: true, throwIfNoEntry: false });
+    if (entry?.dev === bundle.dev && entry.ino === bundle.ino)
+      throw new Error(error);
+    ancestor = dirname(entry ? realpathSync.native(ancestor) : ancestor);
+  }
 }
 
 export async function packageMonoptahNative({ binary, out, version }) {
@@ -237,6 +250,8 @@ export async function packageMonoptahNative({ binary, out, version }) {
       ],
       { env: { ...process.env, MONOCODE_NATIVE_SIGNING_IDENTITY: "" } },
     );
+    // The bundle may have been absent when the initial check ran.
+    assertOutsideBundle(out, binary);
     run("codesign", ["--verify", "--deep", "--strict", "--verbose=2", app]);
     // codesign -dv writes to stderr.
     const details = spawnSync("codesign", ["-dv", app], { encoding: "utf8" });
