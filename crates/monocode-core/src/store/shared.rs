@@ -739,7 +739,7 @@ impl Store {
                  VALUES(?1,?2,0)",
                 params![
                     original,
-                    i64::from(native_chunks::NATIVE_CHUNKS_MODE_VERSION)
+                    i64::from(native_chunks::INITIAL_NATIVE_CHUNKS_MODE_VERSION)
                 ],
             ))?;
         }
@@ -1277,6 +1277,7 @@ impl Store {
         self.shared_writable()?;
         let shared = self.shared.as_ref().unwrap();
         let previous_revision = shared.native_revisions.borrow().get(&id).copied();
+        let previous_mode = shared.storage_modes.borrow().get(&id).copied();
         let result = (|| {
             let tx = sql(rusqlite::Transaction::new_unchecked(
                 &self.conn,
@@ -1295,8 +1296,9 @@ impl Store {
             }
             self.shared_store_blocks(id, blocks)?;
             sql(tx.commit())?;
-            self.shared_record_storage_mode(id, mode);
+            // The native writer already recorded the format it wrote.
             if matches!(mode, native_chunks::StorageMode::Blob) {
+                self.shared_record_storage_mode(id, mode);
                 shared
                     .snapshots
                     .borrow_mut()
@@ -1305,8 +1307,13 @@ impl Store {
             Ok(())
         })();
         if result.is_err() {
-            // The inner writer advances its guard inside the transaction.
-            // Rollback must also restore that guard so the same save can retry.
+            // The inner native writer updates both guards before the outer
+            // commit. Restore them together so a rolled-back save can retry.
+            let mut modes = shared.storage_modes.borrow_mut();
+            match previous_mode {
+                Some(mode) => modes.insert(id, mode),
+                None => modes.remove(&id),
+            };
             let mut revisions = shared.native_revisions.borrow_mut();
             match previous_revision {
                 Some(revision) => {
@@ -1384,6 +1391,14 @@ impl Store {
         original: &str,
         blocks: &[Value],
     ) -> Result<(), String> {
+        let tx = if self.conn.is_autocommit() {
+            Some(sql(rusqlite::Transaction::new_unchecked(
+                &self.conn,
+                rusqlite::TransactionBehavior::Immediate,
+            ))?)
+        } else {
+            None
+        };
         let current_revision = native_chunks::session_revision(&self.conn, original)
             .map_err(|e| e.to_string())?
             .ok_or("This session has no chunked-storage marker")?;
@@ -1423,6 +1438,9 @@ impl Store {
                 ("is_draft", json!(draft)),
             ],
         )?;
+        if let Some(tx) = tx {
+            sql(tx.commit())?;
+        }
         // Cached inside the caller's transaction: a failed commit leaves a
         // higher cached revision, so the next save refuses (fail-closed)
         // instead of writing under a revision that never landed.
@@ -1432,6 +1450,12 @@ impl Store {
             .native_revisions
             .borrow_mut()
             .insert(id, flush.session_revision);
+        self.shared_record_storage_mode(
+            id,
+            native_chunks::StorageMode::NativeChunks {
+                mode_version: flush.mode_version,
+            },
+        );
         Ok(())
     }
 
@@ -1748,7 +1772,7 @@ impl Store {
         self.shared_record_storage_mode(
             id,
             native_chunks::StorageMode::NativeChunks {
-                mode_version: native_chunks::NATIVE_CHUNKS_MODE_VERSION,
+                mode_version: flush.mode_version,
             },
         );
         Ok(())
@@ -2155,7 +2179,7 @@ impl Store {
         self.shared_record_storage_mode(
             id,
             native_chunks::StorageMode::NativeChunks {
-                mode_version: native_chunks::NATIVE_CHUNKS_MODE_VERSION,
+                mode_version: report.mode_version,
             },
         );
         Ok(report)

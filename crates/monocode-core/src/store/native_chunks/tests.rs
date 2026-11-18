@@ -715,12 +715,37 @@ fn review_public_store_blocks_commit_failure_can_retry() {
     store.load(session).unwrap();
     let snapshot = native_snapshot(&store.conn, &original);
     store.fail_next_save_commit_for_test().unwrap();
-    let after = vec![json!({"id":"p","role":"user","text":"After","sentAt":1})];
+    let after = vec![json!({"id":"p","role":"user","text":"After %NATIVE_ROWS%","sentAt":1})];
     assert!(store.store_blocks(session, &after).is_err());
     assert!(store.conn.is_autocommit());
     assert_eq!(native_snapshot(&store.conn, &original), snapshot);
+    assert_eq!(store.storage_mode_version(session).unwrap(), Some(1));
     store.store_blocks(session, &after).unwrap();
-    assert_eq!(store.load(session).unwrap().rows[0].text, "After");
+    assert_eq!(store.storage_mode_version(session).unwrap(), Some(2));
+    assert_eq!(
+        store.load(session).unwrap().rows[0].text,
+        "After %NATIVE_ROWS%"
+    );
+}
+
+#[test]
+fn review_public_store_blocks_marker_upgrade_can_save_again_without_reopen() {
+    let mut store = Store::open_monocode(Path::new(":memory:")).unwrap();
+    let session = created_chunked(&store, "codex");
+    let before = vec![json!({"id":"p","role":"user","text":"Before","sentAt":1})];
+    store.store_blocks(session, &before).unwrap();
+    assert_eq!(store.storage_mode_version(session).unwrap(), Some(1));
+
+    let after = vec![json!({"id":"p","role":"user","text":"After %NATIVE_ROWS%","sentAt":1})];
+    store.store_blocks(session, &after).unwrap();
+    assert_eq!(store.storage_mode_version(session).unwrap(), Some(2));
+
+    store
+        .write_rows(session, 1, &[appended_row("Follow-up")])
+        .unwrap();
+    let rows = store.load(session).unwrap().rows;
+    assert_eq!(rows[0].text, "After %NATIVE_ROWS%");
+    assert_eq!(rows[1].text, "Follow-up");
 }
 
 #[test]
@@ -1290,6 +1315,7 @@ fn zero_dirty_no_write() {
         flush,
         SparseFlush {
             session_revision: 1,
+            mode_version: NATIVE_CHUNKS_MODE_VERSION,
             blocks_written: 0,
             chunks_written: 0,
             chunk_bytes_written: 0,
@@ -1724,17 +1750,91 @@ fn giant_root_id_stays_inline_while_nested_ids_use_payloads() {
 }
 
 #[test]
-fn oversized_nested_strings_still_refuse_source_markers() {
-    for marker in [ROWS_PLACEHOLDER, TEXT_SENTINEL, PAYLOAD_PLACEHOLDER] {
-        let block = json!({"id":"reserved-large","role":"assistant","text":"small",
-            "future":{"array":[format!("{}{marker}", "x".repeat(CHUNK_TARGET_BYTES))]}});
-        let rows = blocks::project(std::slice::from_ref(&block)).unwrap();
-        let raw = serde_json::to_string(&block).unwrap();
-        assert!(store_block_form(&block, &raw, &rows)
-            .err()
+fn literal_markers_survive_nested_payloads_and_hidden_text() {
+    let block = json!({
+        "id": "reserved-large",
+        "role": "assistant",
+        "draft": true,
+        "text": "%NATIVE_ROWS_TEXT%",
+        "future": {
+            "%NATIVE_ROWS%/~": [
+                format!("{}%NATIVE_ROWS%", "😀".repeat(CHUNK_TARGET_BYTES / 4)),
+                "%NATIVE_PAYLOAD%",
+                format!("%NATIVE_PAYLOAD%{}", "x".repeat(CHUNK_TARGET_BYTES)),
+            ]
+        }
+    });
+    let raw = serde_json::to_string(&block).unwrap();
+    let form = store_block_form(&block, &raw, &[]).unwrap();
+    assert!(form.skeleton.len() < CHUNK_TARGET_BYTES);
+    assert_eq!(
+        block_value(&form.skeleton, &[], &form.payloads).unwrap(),
+        block
+    );
+}
+
+#[test]
+fn literal_markers_save_to_a_legacy_chunked_session_and_survive_reopen() {
+    use crate::tool::{ToolCall, ToolState};
+    use crate::transcript::Transcript;
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("history.db");
+    let mut store = Store::open_monocode(&path).unwrap();
+    store.prefer_chunked_storage(true).unwrap();
+    let session = store.create("claude", "/workspace").unwrap();
+    let original = store.persisted_session_id(session.id).unwrap();
+    let mut transcript = Transcript::default();
+    transcript.begin("assistant");
+    transcript.append("Already saved");
+    store.write_rows(session.id, 0, &transcript.rows).unwrap();
+    assert_eq!(store.storage_mode_version(session.id).unwrap(), Some(1));
+    let before = native_snapshot(&store.conn, &original);
+
+    let prompt = transcript.begin("user");
+    transcript.append("Block JSON contains the reserved marker %NATIVE_ROWS%, so its skeleton could not be spliced unambiguously");
+    let tool = transcript.begin("tool");
+    let mut call = ToolCall::new("call-example", "Read");
+    call.output = "source line: const ROWS_PLACEHOLDER = \"%NATIVE_ROWS%\";".into();
+    call.state = ToolState::Completed;
+    transcript.rows[tool].text = serde_json::to_string(&call).unwrap();
+    store.fail_next_save_commit_for_test().unwrap();
+    assert!(store
+        .write_rows(session.id, prompt, &transcript.rows[prompt..])
+        .is_err());
+    assert_eq!(store.storage_mode_version(session.id).unwrap(), Some(1));
+    assert_eq!(native_snapshot(&store.conn, &original), before);
+    store
+        .write_rows(session.id, prompt, &transcript.rows[prompt..])
+        .unwrap();
+
+    let followup = transcript.begin("assistant");
+    transcript.append("Later reply");
+    store
+        .write_rows(session.id, followup, &transcript.rows[followup..])
+        .unwrap();
+    let after = native_snapshot(&store.conn, &original);
+    assert_eq!(store.storage_mode_version(session.id).unwrap(), Some(2));
+    assert_eq!(
+        (&after[0].1, &after[0].2, after[0].3),
+        (&before[0].1, &before[0].2, before[0].3)
+    );
+    drop(store);
+
+    let mut reopened = Store::open_monocode(&path).unwrap();
+    let id = reopened.resolve_session_id(&original).unwrap();
+    let rows = reopened.load(id).unwrap().rows;
+    assert_eq!(rows[0].text, "Already saved");
+    assert_eq!(rows[prompt].text, transcript.rows[prompt].text);
+    assert_eq!(
+        serde_json::from_str::<ToolCall>(&rows[tool].text)
             .unwrap()
-            .contains("reserved marker"));
-    }
+            .output,
+        call.output
+    );
+    assert_eq!(rows[followup].text, "Later reply");
+    reopened.downgrade_session_to_blob(id).unwrap();
+    assert_eq!(reopened.load(id).unwrap().rows, rows);
 }
 
 fn seed_legacy_large_tool(store: &mut Store, id: &str) -> Vec<Value> {
@@ -1883,7 +1983,7 @@ fn restart_equality_rows_and_raw_blocks() {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(mode, i64::from(NATIVE_CHUNKS_MODE_VERSION));
+        assert_eq!(mode, i64::from(INITIAL_NATIVE_CHUNKS_MODE_VERSION));
         store.shared_store_blocks(session, &blocks).unwrap();
         // A runtime-style streamed append lands through the sparse writer too.
         let seeded = blocks::project(&blocks).unwrap();
@@ -2454,7 +2554,7 @@ fn conversion_is_atomic_and_retryable() {
     assert_eq!(
         session_storage_mode(&store.conn, "conv").unwrap(),
         StorageMode::NativeChunks {
-            mode_version: NATIVE_CHUNKS_MODE_VERSION
+            mode_version: INITIAL_NATIVE_CHUNKS_MODE_VERSION
         }
     );
     // The blob stays in place, byte-identical — the marker switched the
@@ -2546,7 +2646,7 @@ fn downgrade_export_restores_latest_and_verifies() {
     assert_eq!(
         session_storage_mode(&store.conn, "conv").unwrap(),
         StorageMode::NativeChunks {
-            mode_version: NATIVE_CHUNKS_MODE_VERSION
+            mode_version: INITIAL_NATIVE_CHUNKS_MODE_VERSION
         }
     );
     assert_eq!(native_row_counts(&store.conn, "conv").0, 1);

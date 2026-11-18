@@ -39,6 +39,7 @@ pub struct ConversionReport {
     pub bytes_written: u64,
     /// The revision committed by this conversion, before any subsequent writer.
     pub session_revision: i64,
+    pub(crate) mode_version: u32,
 }
 
 /// Every way a conversion refuses. Distinct refusals — a session that is not
@@ -53,8 +54,8 @@ pub(crate) enum ConversionError {
     AlreadyNative,
     /// The session is an indexed history with its own ownership rules.
     IndexedHistory,
-    /// A block refuses chunked storage (a reserved marker in its JSON, or its
-    /// own `rows` member). The whole session is refused, never one block.
+    /// A block refuses chunked storage (for example, it has its own `rows`
+    /// member). The whole session is refused, never one block.
     Refused(String),
     /// The writer refused the converted block list (missing or duplicate ids).
     Writer(String),
@@ -268,7 +269,7 @@ fn convert_tx(
         ));
     }
     // Render every block's stored form before writing anything, so a refusal
-    // (a reserved marker, a block carrying its own `rows` member) refuses the
+    // (for example, a block carrying its own `rows` member) refuses the
     // whole session up front — never one block, never partially.
     let mut updates = Vec::with_capacity(blocks.len());
     for (seq, block) in blocks.iter().enumerate() {
@@ -299,7 +300,7 @@ fn convert_tx(
         "INSERT INTO native_sessions(session_id,mode_version,session_revision) VALUES(?1,?2,?3)",
         rusqlite::params![
             session_id,
-            i64::from(super::NATIVE_CHUNKS_MODE_VERSION),
+            i64::from(super::INITIAL_NATIVE_CHUNKS_MODE_VERSION),
             initial_revision
         ],
     )?;
@@ -316,6 +317,7 @@ fn convert_tx(
         chunks: flush.chunks_written,
         bytes_written: flush.chunk_bytes_written,
         session_revision: flush.session_revision,
+        mode_version: flush.mode_version,
     })
 }
 
