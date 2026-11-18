@@ -60,7 +60,20 @@ pub(crate) fn page_rows(
             .into_iter()
             .map(|(_, json)| json)
             .collect::<Vec<_>>();
-        let block_rows = parse_rows(&chunks)?;
+        let mut block_rows = parse_rows(&chunks)?;
+        // Older writers projected goal blocks as system rows. Check the
+        // original block role so ordinary system text cannot become goal state.
+        if block_rows.first().is_some_and(|row| {
+            row.role == "system" && row.text.starts_with('{') && row.text.contains("\"phase\":")
+        }) {
+            let (skeleton, chunks, payloads) = stored_payload(conn, session_id, stored.block_seq)
+                .map_err(|error| error.to_string())?;
+            if block_value(&skeleton, &chunks, &payloads)?["role"] == "goal" {
+                for row in block_rows.iter_mut().take_while(|row| row.role == "system") {
+                    row.role = "goal".into();
+                }
+            }
+        }
         if block_rows.len() as i64 != stored.row_count {
             return Err(format!(
                 "Block {} of session {session_id} stores {} rows but holds {}",

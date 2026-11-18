@@ -27,6 +27,7 @@ pub(crate) mod devin;
 mod discovery;
 mod follow_up;
 mod goal;
+pub use goal::recover_claude_goal;
 mod kind;
 mod lifecycle;
 mod limits;
@@ -262,6 +263,7 @@ struct Protocol {
     interrupt_id: Option<String>,
     claude_prompt_sent: bool,
     claude_result_seen: bool,
+    claude_goal: Option<goal::TranscriptCursor>,
     /// Steers written to stdin that the CLI has not replayed back yet. It takes
     /// one at the next tool boundary, or else runs it after the current request
     /// with a result of its own, so a result does not end the turn while any wait.
@@ -307,6 +309,7 @@ impl Protocol {
             interrupt_id: None,
             claude_prompt_sent: false,
             claude_result_seen: false,
+            claude_goal: None,
             claude_unstarted_steers: Default::default(),
             claude_usage_limit: None,
             claude_resume_at: None,
@@ -885,6 +888,11 @@ impl Protocol {
                         // assistant rows; they are state, not conversation.
                         if v["message"]["model"] == "<synthetic>" {
                             if let Some(notice) = goal::goal_notice(&text) {
+                                if v["parent_tool_use_id"].is_null() {
+                                    if let Some(cursor) = &mut self.claude_goal {
+                                        cursor.observe_notice(&notice);
+                                    }
+                                }
                                 events.push(Event::Goal(notice));
                                 return Ok(events);
                             }
@@ -982,6 +990,15 @@ impl Protocol {
                                 true,
                                 &mut events,
                             );
+                        }
+                        if v["subtype"] == "success" {
+                            if let (Some(cursor), Some(session)) =
+                                (&mut self.claude_goal, v["session_id"].as_str())
+                            {
+                                if let Some(notice) = cursor.completion(session) {
+                                    events.push(Event::Goal(notice));
+                                }
+                            }
                         }
                         self.claude_result_seen = true;
                         // The queued prompt's run starts right after this result. The

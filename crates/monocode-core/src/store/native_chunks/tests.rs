@@ -49,6 +49,31 @@ fn strip_rows_member(raw: &str) -> Value {
 }
 
 #[test]
+fn goal_rows_keep_their_role_when_loading_old_native_chunks() {
+    let mut store = Store::open_monocode(Path::new(":memory:")).unwrap();
+    let text = json!({"phase":"set","condition":"finish it","notice":"Goal set: finish it"});
+    let blocks = [
+        json!({"id":"goal","role":"goal","text":text.to_string(),"sentAt":FIXED_TIME}),
+        json!({"id":"system","role":"system","text":text.to_string()}),
+    ];
+    assert_eq!(blocks::project(&blocks).unwrap()[0].role, "goal");
+    seed_native_session(&store.conn, "old-goal", &blocks);
+    // Older writers preserved the outer block role but projected a system row.
+    store.conn.execute(
+        "UPDATE native_chunks SET rows_json=replace(rows_json,'\"role\":\"goal\"','\"role\":\"system\"'), byte_len=byte_len+2 WHERE session_id='old-goal' AND block_seq=0",
+        [],
+    ).unwrap();
+    let rows = page_rows(&store.conn, "old-goal", 0, 20).unwrap();
+    assert_eq!(rows[0].role, "goal");
+    assert_eq!(rows[0].sent_at, Some(FIXED_TIME));
+    assert_eq!(rows[1].role, "system");
+    let id = store.resolve_session_id("old-goal").unwrap();
+    store.downgrade_session_to_blob(id).unwrap();
+    assert_eq!(store.stored_blocks(id).unwrap(), blocks);
+    assert_eq!(store.load(id).unwrap().rows, rows);
+}
+
+#[test]
 fn round_trip_preserves_unknown_fields_and_hidden_blocks() {
     let blocks = vec![
         json!({"id":"fixed-prompt","role":"user","text":"中文🙂 synthetic prompt","startedAt":FIXED_TIME,

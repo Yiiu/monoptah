@@ -910,12 +910,45 @@ impl Conversation {
         let store = self.store.clone();
         let id = self.summary.id;
         let mono = self.settings.mono.is_some();
+        let recover_goal = (self.summary.provider == Kind::Claude.id() && !self.busy)
+            .then(|| {
+                let session = self.summary.provider_id.clone()?;
+                let root = crate::accounts::get(cx).map(|center| center.read(cx).root.clone());
+                Some((session, self.summary.cwd.clone(), root))
+            })
+            .flatten();
         let work = cx.background_executor().spawn(async move {
             let settings = locked(&store).and_then(|s| s.agent_settings(id));
             (
                 locked(&store)
-                    .and_then(|s| {
-                        let history = s.load(id)?;
+                    .and_then(|mut s| {
+                        let mut history = s.load(id)?;
+                        if let Some((session, cwd, root)) = recover_goal
+                            && let Ok(config) = &settings
+                            && s.cloud_location(id)
+                                .is_ok_and(|location| !location.is_cloud())
+                        {
+                            let mut config = config.clone().unwrap_or_default();
+                            config.account.root = root;
+                            let cwd = Path::new(config.worktree_cwd.as_deref().unwrap_or(&cwd));
+                            if let Some(notice) = monocode_core::provider::recover_claude_goal(
+                                cwd,
+                                &session,
+                                &config,
+                                &history.rows,
+                            ) {
+                                let text =
+                                    serde_json::to_string(&notice).map_err(|e| e.to_string())?;
+                                let at = history.begin("goal");
+                                history.append(&text);
+                                if let Err(error) = s.write_rows(id, at, &history.rows[at..]) {
+                                    history.rows.truncate(at);
+                                    eprintln!(
+                                        "Could not save recovered Claude Goal state: {error}"
+                                    );
+                                }
+                            }
+                        }
                         let edits = if mono {
                             Vec::new()
                         } else {

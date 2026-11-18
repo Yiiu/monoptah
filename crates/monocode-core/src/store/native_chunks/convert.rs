@@ -405,7 +405,23 @@ fn downgrade_tx(
         // Mode 1 already supports placeholders at arbitrary JSON locations.
         // A block written before expanded stripping must still export without
         // a normalization save; require an exact canonical match in either form.
-        if !same_form(&form) && !same_form(&legacy_store_block_form(block, &raw, &rows)?) {
+        let matches_legacy_goal = || -> Result<bool, String> {
+            if block["role"] != "goal" {
+                return Ok(false);
+            }
+            // Older writers projected the same goal block as system rows.
+            // Verify the exact stored bytes using that projection as well.
+            let mut legacy = rows.clone();
+            for row in legacy.iter_mut().take_while(|row| row.role == "goal") {
+                row.role = "system".into();
+            }
+            Ok(same_form(&store_block_form(block, &raw, &legacy)?)
+                || same_form(&legacy_store_block_form(block, &raw, &legacy)?))
+        };
+        if !same_form(&form)
+            && !same_form(&legacy_store_block_form(block, &raw, &rows)?)
+            && !matches_legacy_goal()?
+        {
             return Err(format!(
                 "Restart-equality verification failed: block {} of this conversation would not \
                  re-store to its stored form. The downgrade was refused and the native content \
