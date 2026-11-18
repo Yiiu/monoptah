@@ -715,12 +715,37 @@ fn review_public_store_blocks_commit_failure_can_retry() {
     store.load(session).unwrap();
     let snapshot = native_snapshot(&store.conn, &original);
     store.fail_next_save_commit_for_test().unwrap();
-    let after = vec![json!({"id":"p","role":"user","text":"After","sentAt":1})];
+    let after = vec![json!({"id":"p","role":"user","text":"After %NATIVE_ROWS%","sentAt":1})];
     assert!(store.store_blocks(session, &after).is_err());
     assert!(store.conn.is_autocommit());
     assert_eq!(native_snapshot(&store.conn, &original), snapshot);
+    assert_eq!(store.storage_mode_version(session).unwrap(), Some(1));
     store.store_blocks(session, &after).unwrap();
-    assert_eq!(store.load(session).unwrap().rows[0].text, "After");
+    assert_eq!(store.storage_mode_version(session).unwrap(), Some(2));
+    assert_eq!(
+        store.load(session).unwrap().rows[0].text,
+        "After %NATIVE_ROWS%"
+    );
+}
+
+#[test]
+fn review_public_store_blocks_marker_upgrade_can_save_again_without_reopen() {
+    let mut store = Store::open_monocode(Path::new(":memory:")).unwrap();
+    let session = created_chunked(&store, "codex");
+    let before = vec![json!({"id":"p","role":"user","text":"Before","sentAt":1})];
+    store.store_blocks(session, &before).unwrap();
+    assert_eq!(store.storage_mode_version(session).unwrap(), Some(1));
+
+    let after = vec![json!({"id":"p","role":"user","text":"After %NATIVE_ROWS%","sentAt":1})];
+    store.store_blocks(session, &after).unwrap();
+    assert_eq!(store.storage_mode_version(session).unwrap(), Some(2));
+
+    store
+        .write_rows(session, 1, &[appended_row("Follow-up")])
+        .unwrap();
+    let rows = store.load(session).unwrap().rows;
+    assert_eq!(rows[0].text, "After %NATIVE_ROWS%");
+    assert_eq!(rows[1].text, "Follow-up");
 }
 
 #[test]

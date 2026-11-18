@@ -1277,6 +1277,7 @@ impl Store {
         self.shared_writable()?;
         let shared = self.shared.as_ref().unwrap();
         let previous_revision = shared.native_revisions.borrow().get(&id).copied();
+        let previous_mode = shared.storage_modes.borrow().get(&id).copied();
         let result = (|| {
             let tx = sql(rusqlite::Transaction::new_unchecked(
                 &self.conn,
@@ -1295,8 +1296,9 @@ impl Store {
             }
             self.shared_store_blocks(id, blocks)?;
             sql(tx.commit())?;
-            self.shared_record_storage_mode(id, mode);
+            // The native writer already recorded the format it wrote.
             if matches!(mode, native_chunks::StorageMode::Blob) {
+                self.shared_record_storage_mode(id, mode);
                 shared
                     .snapshots
                     .borrow_mut()
@@ -1305,8 +1307,13 @@ impl Store {
             Ok(())
         })();
         if result.is_err() {
-            // The inner writer advances its guard inside the transaction.
-            // Rollback must also restore that guard so the same save can retry.
+            // The inner native writer updates both guards before the outer
+            // commit. Restore them together so a rolled-back save can retry.
+            let mut modes = shared.storage_modes.borrow_mut();
+            match previous_mode {
+                Some(mode) => modes.insert(id, mode),
+                None => modes.remove(&id),
+            };
             let mut revisions = shared.native_revisions.borrow_mut();
             match previous_revision {
                 Some(revision) => {
