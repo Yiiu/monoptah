@@ -184,6 +184,7 @@ pub(super) fn project_turns(
             let model = &block["turnModel"];
             let duration = block["durationMs"].as_u64();
             let started_at = turn_start(block);
+            let stopped = block["nativeStopped"] == true;
             let turn = offset + prompt + 1;
             if started_at.is_some() {
                 root_turn = Some(turn);
@@ -202,6 +203,7 @@ pub(super) fn project_turns(
                 || metrics.is_some()
                 || block["providerTurnId"].is_string()
                 || joined_turn.is_some()
+                || stopped
             {
                 turns.insert(
                     offset + prompt + 1,
@@ -217,6 +219,7 @@ pub(super) fn project_turns(
                         completed_at: started_at
                             .and_then(|at| at.checked_add(duration.unwrap_or(0))),
                         metrics,
+                        stopped,
                     },
                 );
             }
@@ -902,6 +905,7 @@ impl Store {
             if source.metrics.is_some() {
                 info.metrics = source.metrics;
             }
+            info.stopped |= source.stopped;
         }
         Ok(Some(settings))
     }
@@ -1021,6 +1025,11 @@ impl Store {
             }
             if let Some(id) = &info.provider_turn_id {
                 fields.push(("providerTurnId", json!(id)));
+            }
+            // Native stops leave no transcript block, unlike Tauri's "Stopped"
+            // notice, so the receipt carries them for completion reports.
+            if info.stopped {
+                fields.push(("nativeStopped", json!(true)));
             }
             if let Some(at) = info.started_at {
                 // A native root prompt is written with its send time before

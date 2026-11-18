@@ -3885,6 +3885,7 @@ dependencies = [
  "qrcode",
  "raw-window-handle",
  "rquickjs",
+ "rusqlite",
  "serde",
  "serde_json",
  "similar",

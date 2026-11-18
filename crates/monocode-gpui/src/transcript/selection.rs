@@ -601,6 +601,9 @@ impl TranscriptView {
             .find(|m| m.start == state.response)
             .map(|m| m.turn)
     }
+    /// The selection context for one rendered row of `response`. Documents
+    /// select and copy like chat, but "Add to chat/notes" are conversation
+    /// actions, so `quote` is dropped there and their menu offers Copy alone.
     pub(super) fn text_selection(
         &self,
         row: (usize, usize),
@@ -1132,5 +1135,30 @@ mod tests {
             selected(visual, window).as_deref(),
             Some("First paragraph here.")
         );
+    }
+
+    #[gpui::test]
+    fn documents_are_selectable_and_copy_without_chat_actions(cx: &mut TestAppContext) {
+        let view =
+            cx.new(|cx| TranscriptView::document("# QA note\n\nSelect **this** text.".into(), cx));
+        view.update(cx, |view, cx| {
+            let row = view
+                .rows
+                .iter()
+                .find(|row| matches!(&row.body, Body::Markdown(md) if crate::markdown::selection_text(md) == "Select this text."))
+                .unwrap();
+            let (key, response) = (row.key, view.messages[row.message].start);
+            let selection = view.text_selection(key, response, true, cx).expect("documents select");
+            assert!(!selection.quote, "documents offer Copy alone");
+            {
+                let mut state = view.selection.0.borrow_mut();
+                state.response = response;
+                state.anchor = Some(Position { row: key, byte: 7 });
+                state.head = Some(Position { row: key, byte: 11 });
+                state.menu = Some(gpui::point(px(10.), px(10.)));
+            }
+            assert_eq!(view.selected_text().as_deref(), Some("this"));
+            assert!(view.selection_menu(cx).is_some());
+        });
     }
 }

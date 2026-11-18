@@ -165,6 +165,73 @@ impl Store {
         Ok((session, true))
     }
 
+    /// The latest exchange ID as `app_conversation` exposes it.
+    fn app_latest_turn_id(&self, id: i64, rows: &[crate::transcript::Row]) -> Option<String> {
+        if self.shared.is_some() && self.remote_session(id).ok()?.is_none() {
+            return self
+                .shared_blocks(id)
+                .ok()?
+                .iter()
+                .rfind(|block| crate::app_access::readable_prompt(block))?
+                .get("id")?
+                .as_str()
+                .map(str::to_owned);
+        }
+        rows.iter()
+            .enumerate()
+            .rfind(|(index, row)| row.role == "user" && (row.first || *index == 0))
+            .map(|(index, _)| format!("row-{index}"))
+    }
+
+    pub fn app_completion_report(
+        &self,
+        id: i64,
+        project: Option<&str>,
+        count: usize,
+    ) -> Result<Option<String>, String> {
+        use crate::response::{completion_report, read_call, turn_end};
+
+        // The desktop can append from a different connection. Read the rows,
+        // receipt and paging cursor from the same SQLite snapshot.
+        let remote = self.remote_session(id)?.is_some();
+        let snapshot = (self.shared.is_some() && self.conn.is_autocommit() && !remote)
+            .then(|| self.conn.unchecked_transaction())
+            .transpose()
+            .map_err(|e| e.to_string())?;
+        if !remote
+            && (id < 0
+                || self.persisted_session_id(id).is_err()
+                || self.mono_session(id)?.is_none())
+        {
+            return Ok(None);
+        }
+        let rows = match self.load(id) {
+            Ok(history) => history.rows,
+            // The host can confirm removal before the local binding is refreshed.
+            Err(error)
+                if remote
+                    && error == "Host rejected request: Session not found on this machine" =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let turns = self.agent_settings(id)?.unwrap_or_default().turns;
+        let read = project.and_then(|project| {
+            let turn = self.app_latest_turn_id(id, &rows)?;
+            read_call(id, Some(project), &turn)
+        });
+        if let Some(snapshot) = snapshot {
+            snapshot.commit().map_err(|e| e.to_string())?;
+        }
+        Ok(Some(completion_report(
+            &rows,
+            turn_end(&rows, &turns),
+            read.as_ref(),
+            count,
+        )))
+    }
+
     pub fn app_conversation(
         &self,
         id: i64,
@@ -205,5 +272,148 @@ impl Store {
             }
         }
         Ok(page)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::response::{completion_report, read_call, turn_end, TurnEnd};
+    use std::path::Path;
+
+    /// The report reads projected rows, where a plan or an unstructured task
+    /// list shows as assistant prose; `sessions.read` reads the canonical
+    /// blocks. Both must pick the same message, so the read call returns it.
+    #[test]
+    fn report_and_read_call_agree_on_projected_plan_and_task_messages() {
+        let long = format!("{}PLAN END", "step\n".repeat(4000));
+        for (trailing, text) in [
+            (
+                json!({"id":"p","role":"plan","text":"# Plan\n\n- Fix it"}),
+                "# Plan\n\n- Fix it",
+            ),
+            (
+                json!({"id":"t","role":"tasks","text":"1. Fix it"}),
+                "1. Fix it",
+            ),
+            (json!({"id":"p","role":"plan","text":long}), long.as_str()),
+        ] {
+            let store = Store::open_monocode(Path::new(":memory:")).unwrap();
+            let session = store.create("codex", "/work/repo").unwrap();
+            store.provider_id(session.id, "thread").unwrap();
+            let blocks = vec![
+                json!({"id":"u","role":"user","text":"Plan the fix"}),
+                json!({"id":"a","role":"assistant","text":"THE ANSWER"}),
+                trailing,
+            ];
+            store.shared_store_blocks(session.id, &blocks).unwrap();
+            let rows = store.load(session.id).unwrap().rows;
+            let turn = store.app_latest_turn_id(session.id, &rows).unwrap();
+            let call = read_call(session.id, Some("/work/repo"), &turn).unwrap();
+            let report = completion_report(&rows, TurnEnd::Unknown, Some(&call), 12000);
+            let expected = crate::response::normalized(text);
+            let mut input = call.clone();
+            let mut read = String::new();
+            loop {
+                let page = store
+                    .app_conversation(session.id, &input, false, false)
+                    .unwrap();
+                let message = &page["turns"][0]["assistant"];
+                read.push_str(message["text"].as_str().unwrap());
+                match message.get("nextCharOffset") {
+                    Some(next) => input["charOffset"] = next.clone(),
+                    None => break,
+                }
+            }
+            assert_eq!(read, expected, "sessions.read returns the reported message");
+            assert!(expected.ends_with(report.rsplit("\n\n").next().unwrap()));
+            if expected.chars().count() <= 12000 {
+                assert_eq!(report, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn shared_settings_include_the_persisted_stop_marker() {
+        let store = Store::open_monocode(Path::new(":memory:")).unwrap();
+        let id = store.create("codex", "/work/repo").unwrap().id;
+        store
+            .shared_store_blocks(
+                id,
+                &[json!({"id":"u","role":"user","text":"Go","nativeStopped":true})],
+            )
+            .unwrap();
+        assert!(store.agent_settings(id).unwrap().unwrap().turns[&1].stopped);
+    }
+
+    #[test]
+    fn a_receipt_read_error_is_distinct_from_a_removed_session() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let id = store.create("codex", "/work/repo").unwrap().id;
+        store.save_setting(&format!("agent:{id}"), "{").unwrap();
+        assert!(store.app_completion_report(id, None, 12000).is_err());
+        store.delete(id).unwrap();
+        assert_eq!(store.app_completion_report(id, None, 12000).unwrap(), None);
+    }
+
+    /// A native stop leaves no row. The receipt the runtime closes records it,
+    /// so the report still says the turn was stopped after a restart.
+    #[test]
+    fn a_stopped_turn_still_reports_unfinished_after_reopening_the_store() {
+        let dir = std::env::temp_dir().join(format!(
+            "monocode-stopped-{}-{}",
+            std::process::id(),
+            crate::time::now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let progress = "I will investigate this now";
+        for shared in [false, true] {
+            let path = dir.join(format!("store-{shared}.sqlite"));
+            let open = |path: &Path| {
+                if shared {
+                    Store::open_monocode(path).unwrap()
+                } else {
+                    Store::open(path).unwrap()
+                }
+            };
+            let id = {
+                let mut store = open(&path);
+                let session = store.create("codex", "/work/repo").unwrap();
+                let mut transcript = crate::transcript::Transcript::default();
+                for (role, text) in [("user", "Investigate"), ("assistant", progress)] {
+                    transcript.begin(role);
+                    transcript.append(text);
+                }
+                store.write_rows(session.id, 0, &transcript.rows).unwrap();
+                let mut settings = store
+                    .agent_settings(session.id)
+                    .unwrap()
+                    .unwrap_or_default();
+                settings.turns.insert(
+                    1,
+                    crate::agent::TurnInfo {
+                        started_at: Some(1),
+                        duration_known: true,
+                        stopped: true,
+                        ..Default::default()
+                    },
+                );
+                store.save_agent_settings(session.id, &settings).unwrap();
+                session.id
+            };
+            let store = open(&path);
+            let rows = store.load(id).unwrap().rows;
+            let turns = store.agent_settings(id).unwrap().unwrap_or_default().turns;
+            assert_eq!(
+                turn_end(&rows, &turns),
+                TurnEnd::Stopped,
+                "shared: {shared}"
+            );
+            assert_eq!(
+                completion_report(&rows, turn_end(&rows, &turns), None, 12000),
+                format!("(its latest turn did not finish: it was stopped. This is the last message it wrote, not a final answer:)\n\n{progress}")
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
