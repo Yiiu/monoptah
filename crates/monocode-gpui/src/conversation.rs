@@ -331,7 +331,7 @@ pub(crate) struct Conversation {
     context_anchor: AnchorSlot,
     composer_anchor: AnchorSlot,
     goal_anchor: AnchorSlot,
-    /// The goal pill's full-condition popover is open.
+    /// The goal shelf's full-condition popover is open.
     goal_open: bool,
     composer_motion: ComposerMotion,
     narrow: bool,
@@ -1304,7 +1304,7 @@ impl Conversation {
             && crate::accounts::get(cx)
                 .is_some_and(|center| !center.read(cx).book.exists(kind, &self.settings.account.id))
     }
-    /// The session goal the pill above the composer shows: the last `goal`
+    /// The session goal the shelf above the composer shows: the last `goal`
     /// row wins, so a resumed session recovers its state from the transcript
     /// alone, and a cleared or achieved one shows nothing. The condition comes
     /// from the most recent `Goal set` row; checkins and pauses carry none.
@@ -1327,126 +1327,79 @@ impl Conversation {
             .unwrap_or_default();
         Some((phase, condition))
     }
-    /// The active goal as a capsule above the composer, in the stroked-pill
-    /// family of the Commit shelf: a breathing accent dot while the goal
-    /// steers turns, the condition, and a `×` that clears the goal through
-    /// the same raw-command passthrough that set it. No goal, no pill and no
-    /// reserved space.
-    fn goal_pill(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    /// The goal shares the composer ledge with queued messages and approvals.
+    fn goal_shelf(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let (phase, condition) = self.goal_state(cx)?;
         let paused = phase == GoalPhase::Paused;
-        let shown: String = condition.chars().take(48).collect();
-        let truncated = condition.chars().count() > 48;
         let label = if paused {
-            "目标 · 已暂停 · "
+            "已暂停的目标"
         } else {
-            "目标 · "
+            "进行中的目标"
         };
-        let breath = if paused {
-            None
-        } else {
-            Some(crate::pulse::looping(
-                gpui::ElementId::Name("goal-pill-breath".into()),
-                std::time::Duration::from_millis(2_000),
-                crate::pulse::Rate::Low,
-                move |phase| {
-                    // The same slow swell the background clock's dot uses.
-                    let breath = 0.5 - 0.5 * (phase * std::f32::consts::TAU).cos();
-                    let accent = accent_color();
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .size(px(12.))
-                        .rounded_full()
-                        .bg(accent.opacity(0.22 * (1. - breath)))
-                        .child(
-                            div()
-                                .size(px(6.))
-                                .rounded_full()
-                                .bg(accent.opacity(0.6 + 0.4 * breath)),
-                        )
-                },
-            ))
-        };
+        let toggle =
+            |this: &mut Self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
+                this.goal_open = !this.goal_open;
+                cx.notify();
+            };
+        let summary = div()
+            .id("goal-state")
+            .debug_selector(|| "goal-state".into())
+            .role(Role::Button)
+            .aria_label(format!("{label}：{condition}"))
+            .aria_expanded(self.goal_open)
+            .cursor_pointer()
+            .flex_1()
+            .min_w_0()
+            .h(px(28.))
+            .flex()
+            .items_center()
+            .gap_2()
+            .overflow_hidden()
+            .child(icon("circle-dot", 14.).when(paused, |i| i.text_color(warning_color())))
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(content(0.85))
+                    .child(label),
+            )
+            .child(div().min_w_0().truncate().child(condition))
+            .on_click(cx.listener(toggle));
+        let card = composer_shelf::card("goal-card", self.classic_layout)
+            .debug_selector(|| "goal-card".into())
+            .relative()
+            .bg(gpui::transparent_black())
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(composer_material(gpui::Corners {
+                top_left: px(composer_shelf::RADIUS - 1.),
+                top_right: px(composer_shelf::RADIUS - 1.),
+                ..Default::default()
+            }))
+            .child(self.goal_anchor.probe())
+            .child(summary)
+            .child(
+                icon_button("goal-clear", "清除目标", "trash")
+                    .debug_selector(|| "goal-clear".into())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.goal_open = false;
+                        this.launch_prompt("/goal clear".into(), cx);
+                    })),
+            )
+            .child(
+                icon_button("goal-expand", "查看完整目标", "maximize")
+                    .debug_selector(|| "goal-expand".into())
+                    .aria_expanded(self.goal_open)
+                    .on_click(cx.listener(toggle)),
+            );
         Some(
-            div()
-                .mb(px(6.))
-                .px(px(12.))
-                .flex()
-                .items_center()
-                .child(self.goal_anchor.probe())
-                .child(
-                    div()
-                        .id("goal-state")
-                        .debug_selector(|| "goal-state".into())
-                        .role(Role::Button)
-                        .aria_label(format!("目标：{condition}"))
-                        .cursor_pointer()
-                        .h(px(26.))
-                        .max_w(px(320.))
-                        .flex()
-                        .items_center()
-                        .gap(px(8.))
-                        .pl(px(10.))
-                        .pr(px(4.))
-                        .rounded_full()
-                        .border_1()
-                        .border_color(content(0.1))
-                        .text_size(px(12.))
-                        .text_color(content(0.7))
-                        .hover(|s| {
-                            s.border_color(content(0.2))
-                                .bg(content(0.06))
-                                .text_color(content(1.))
-                        })
-                        .when_some(breath, |d, breath| d.child(breath))
-                        .when(paused, |d| {
-                            d.child(
-                                div()
-                                    .size(px(7.))
-                                    .flex_shrink_0()
-                                    .rounded_full()
-                                    .bg(warning_color()),
-                            )
-                        })
-                        .child(div().min_w_0().truncate().child(format!(
-                            "{label}{shown}{}",
-                            if truncated { "…" } else { "" }
-                        )))
-                        .child(
-                            div()
-                                .id("goal-clear")
-                                .debug_selector(|| "goal-clear".into())
-                                .role(Role::Button)
-                                .aria_label("Clear the goal")
-                                .cursor_pointer()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .size(px(18.))
-                                .rounded_full()
-                                .text_color(content(0.5))
-                                .hover(|s| s.bg(content(0.12)).text_color(content(0.85)))
-                                .child(icon("close", 10.))
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                    // Keep the press from opening the pill's popover.
-                                    cx.stop_propagation();
-                                })
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.goal_open = false;
-                                    this.launch_prompt("/goal clear".into(), cx);
-                                })),
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.goal_open = !this.goal_open;
-                            cx.notify();
-                        })),
-                )
+            composer_shelf::shelf("goal-shelf")
+                .child(card)
                 .into_any_element(),
         )
     }
-    /// The full goal condition, opened by clicking the pill body.
+    /// The full goal condition, opened from the summary or expand button.
     fn goal_popover(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         if !self.goal_open {
             return None;
@@ -3330,7 +3283,7 @@ impl Conversation {
             .children(self.remote_notice(cx))
             .children(self.cloud_sync_notice(cx))
             .children(self.move_notice(cx))
-            .children(self.goal_pill(cx))
+            .children(self.goal_shelf(cx))
             .children(self.goal_popover(cx))
             .child(self.cloud_start_panel(cx))
             .child(self.message_queue(window, cx))
@@ -4507,12 +4460,16 @@ fn tool_pill(id: &'static str, label: &'static str) -> gpui::Stateful<gpui::Div>
 /// `[data-composer-box]::before`: the frosted (or, in light themes, solid)
 /// surface inside the composer's border.
 fn composer_surface(radius: f32) -> impl IntoElement {
+    composer_material(gpui::Corners::all(px(radius - 1.)))
+}
+
+fn composer_material(corners: gpui::Corners<gpui::Pixels>) -> impl IntoElement {
     let blur = composer_blur();
     let fill = composer_fill();
     canvas(
         |_, _, _| {},
         move |bounds, _, window, _| {
-            let surface = gpui::fill(bounds, fill).corner_radii(px(radius - 1.));
+            let surface = gpui::fill(bounds, fill).corner_radii(corners);
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             let surface = if blur > 0. {
                 surface.border_color(gpui::backdrop_blur_marker(blur * window.scale_factor()))

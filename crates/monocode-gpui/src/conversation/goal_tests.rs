@@ -1,5 +1,4 @@
-//! The goal pill above the composer: its state derives from the transcript's
-//! goal rows, and its × launches a raw clear command.
+//! The goal shelf derives its state from transcript rows and shares the composer ledge.
 use super::*;
 use gpui::{TestAppContext, WindowHandle};
 use monocode_core::store::Store;
@@ -105,7 +104,63 @@ fn goal_state_reads_the_last_row(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn goal_pill_clear_launches_the_raw_command(cx: &mut TestAppContext) {
+fn goal_shelf_keeps_queue_approval_and_actions_accessible(cx: &mut TestAppContext) {
+    let window = conversation(cx);
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    visual.refresh().unwrap();
+    assert!(visual.debug_bounds("goal-card").is_none());
+    window
+        .update(visual, |view, _, cx| {
+            view.transcript.update(cx, |v, cx| {
+                v.patch(
+                    0,
+                    vec![goal_row(
+                        GoalPhase::Set,
+                        Some(&"长目标 ".repeat(100)),
+                        "Goal set",
+                    )],
+                    cx,
+                );
+            });
+            // A pending approval belongs to an active turn. Keep the follow-up
+            // queued while its persistence callback runs and the test clicks.
+            view.busy = true;
+            view.follow_ups.state.paused = true;
+            view.enqueue_follow_up("Follow up".into(), None, cx);
+            view.approvals.push_back(Approval {
+                id: "request".into(),
+                title: "Allow this command?".into(),
+                detail: String::new(),
+                can_remember: true,
+            });
+            cx.notify();
+        })
+        .unwrap();
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    let card = visual.debug_bounds("goal-card").unwrap();
+    let summary = visual.debug_bounds("goal-state").unwrap();
+    let clear = visual.debug_bounds("goal-clear").unwrap();
+    let expand = visual.debug_bounds("goal-expand").unwrap();
+    let queue = visual.debug_bounds("message-queue-card").unwrap();
+    let approval = visual.debug_bounds("approval-shelf").unwrap();
+    let composer = visual.debug_bounds("composer-box").unwrap();
+    assert!(summary.right() <= clear.left() && clear.right() <= expand.left());
+    assert!(expand.right() <= card.right());
+    assert!(card.bottom() <= queue.top() && queue.bottom() <= approval.top());
+    assert!(approval.bottom() <= composer.top());
+    visual.simulate_click(expand.center(), Default::default());
+    visual.run_until_parked();
+    window
+        .update(visual, |view, _, _| {
+            assert!(view.goal_open, "expand opens the full goal condition");
+            assert!(view.launched.is_empty(), "expand must not send a prompt");
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn goal_shelf_clear_launches_the_raw_command(cx: &mut TestAppContext) {
     let window = conversation(cx);
     let view = window;
     window
