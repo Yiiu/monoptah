@@ -24,6 +24,10 @@
 //!   the leading row group uses [`TEXT_SENTINEL`]; other strings use
 //!   [`PAYLOAD_PLACEHOLDER`], substituted in serialization order. This bounds
 //!   giant string copies, not arbitrary keys or containers of small values.
+//!
+//! Blocks containing those literal strings instead store their intact JSON as
+//! one segmented payload. Their skeleton is a JSON array holding the block ID,
+//! disjoint from the legacy object skeleton, and their rows use the same chunks.
 use crate::transcript::Row;
 use rusqlite::Connection;
 
@@ -93,17 +97,16 @@ pub(crate) fn ensure_native_chunks_tables(conn: &Connection) -> rusqlite::Result
     conn.execute_batch(NATIVE_CHUNKS_TABLES)
 }
 
-/// Refuse a source document that already carries one of the splice markers:
-/// a stored skeleton containing the literal text could never be spliced back
-/// unambiguously.
+/// A literal marker in source JSON would be ambiguous in a legacy skeleton.
+fn reserved_marker(raw: &str) -> Option<&'static str> {
+    [ROWS_PLACEHOLDER, TEXT_SENTINEL, PAYLOAD_PLACEHOLDER]
+        .into_iter()
+        .find(|marker| raw.contains(*marker))
+}
+
 fn refuse_reserved_markers(raw: &str) -> Result<(), String> {
-    for reserved in [ROWS_PLACEHOLDER, TEXT_SENTINEL, PAYLOAD_PLACEHOLDER] {
-        if raw.contains(reserved) {
-            return Err(format!(
-                "Block JSON contains the reserved marker {reserved}, so its skeleton could not \
-                 be spliced unambiguously"
-            ));
-        }
+    if let Some(marker) = reserved_marker(raw) {
+        return Err(format!("Legacy block skeleton would collide with {marker}"));
     }
     Ok(())
 }
@@ -124,19 +127,8 @@ fn splice_skeleton(raw: &str, rows: &[Row]) -> Result<(String, Vec<String>), Str
     let raw = raw.trim();
     let block: serde_json::Value = serde_json::from_str(raw)
         .map_err(|error| format!("Stored block is not valid JSON: {error}"))?;
-    if !block.is_object() {
-        return Err("A stored block must be a JSON object".into());
-    }
-    if block[ROWS_MEMBER] != serde_json::Value::Null {
-        return Err(format!(
-            "A block cannot carry its own \"{ROWS_MEMBER}\" member; the chunked backend reserves it"
-        ));
-    }
-    let elements = rows
-        .iter()
-        .map(serde_json::to_string)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())?;
+    require_source_block(&block)?;
+    let elements = serialize_rows(rows)?;
     let body = raw
         .strip_prefix('{')
         .and_then(|rest| rest.strip_suffix('}'))
@@ -148,6 +140,35 @@ fn splice_skeleton(raw: &str, rows: &[Row]) -> Result<(String, Vec<String>), Str
         format!("{{{body},\"{ROWS_MEMBER}\":[{ROWS_PLACEHOLDER}]}}")
     };
     Ok((skeleton, elements))
+}
+
+fn require_source_block(block: &serde_json::Value) -> Result<(), String> {
+    if !block.is_object() {
+        return Err("A stored block must be a JSON object".into());
+    }
+    if block[ROWS_MEMBER] != serde_json::Value::Null {
+        return Err(format!(
+            "A block cannot carry its own \"{ROWS_MEMBER}\" member; the chunked backend reserves it"
+        ));
+    }
+    Ok(())
+}
+
+fn serialize_rows(rows: &[Row]) -> Result<Vec<String>, String> {
+    rows.iter()
+        .map(serde_json::to_string)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
+pub(super) fn is_full_block_skeleton(skeleton: &str) -> bool {
+    skeleton.starts_with('[')
+}
+
+pub(super) fn full_block_id(skeleton: &str) -> Result<String, String> {
+    let (id,) = serde_json::from_str::<(String,)>(skeleton)
+        .map_err(|error| format!("Invalid full-block skeleton: {error}"))?;
+    Ok(id)
 }
 
 /// One block's stored form: the skeleton (giant members stripped) and the
@@ -167,14 +188,24 @@ pub(crate) fn store_block_form(
     raw: &str,
     rows: &[Row],
 ) -> Result<StoredForm, String> {
-    refuse_reserved_markers(raw)?;
+    if reserved_marker(raw).is_some() {
+        require_source_block(value)?;
+        let id = value["id"]
+            .as_str()
+            .ok_or("A stored block must have an ID")?;
+        return Ok(StoredForm {
+            skeleton: serde_json::to_string(&(id,)).map_err(|error| error.to_string())?,
+            elements: serialize_rows(rows)?,
+            payloads: vec![raw.to_owned()],
+        });
+    }
     let has_giant = value.as_object().is_some_and(|object| {
         object
             .iter()
             .any(|(key, member)| key != "id" && contains_giant_string(member))
     });
     if !has_giant {
-        let (skeleton, elements) = block_skeleton(raw, rows)?;
+        let (skeleton, elements) = splice_skeleton(raw, rows)?;
         return Ok(StoredForm {
             skeleton,
             elements,
@@ -344,7 +375,7 @@ fn rows_content(chunks: &[String]) -> Result<String, String> {
     Ok(content)
 }
 
-/// Reconstruct a block's stored raw JSON: a pure text splice of the chunks in
+/// Reconstruct a legacy block's stored raw JSON: a pure text splice of the chunks in
 /// place of the placeholder, then of each payload member's segments in place
 /// of its placeholder. Unchanged skeleton and chunk bytes come back verbatim,
 /// so untouched parts of a block never get re-serialized.
@@ -390,6 +421,19 @@ pub(crate) fn block_value(
     chunks: &[String],
     payloads: &[String],
 ) -> Result<serde_json::Value, String> {
+    if is_full_block_skeleton(skeleton) {
+        let [raw] = payloads else {
+            return Err("A full-block skeleton requires exactly one payload".into());
+        };
+        let id = full_block_id(skeleton)?;
+        let block: serde_json::Value = serde_json::from_str(raw)
+            .map_err(|error| format!("Stored block is not valid JSON: {error}"))?;
+        require_source_block(&block)?;
+        if block["id"].as_str() != Some(id.as_str()) {
+            return Err("Full-block payload does not match its stored ID".into());
+        }
+        return Ok(block);
+    }
     let raw = block_raw_json(skeleton, chunks, payloads)?;
     let mut document: serde_json::Value = serde_json::from_str(&raw)
         .map_err(|error| format!("Stored block is not valid JSON: {error}"))?;

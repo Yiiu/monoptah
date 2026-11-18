@@ -739,7 +739,7 @@ impl Store {
                  VALUES(?1,?2,0)",
                 params![
                     original,
-                    i64::from(native_chunks::NATIVE_CHUNKS_MODE_VERSION)
+                    i64::from(native_chunks::INITIAL_NATIVE_CHUNKS_MODE_VERSION)
                 ],
             ))?;
         }
@@ -1384,6 +1384,14 @@ impl Store {
         original: &str,
         blocks: &[Value],
     ) -> Result<(), String> {
+        let tx = if self.conn.is_autocommit() {
+            Some(sql(rusqlite::Transaction::new_unchecked(
+                &self.conn,
+                rusqlite::TransactionBehavior::Immediate,
+            ))?)
+        } else {
+            None
+        };
         let current_revision = native_chunks::session_revision(&self.conn, original)
             .map_err(|e| e.to_string())?
             .ok_or("This session has no chunked-storage marker")?;
@@ -1423,6 +1431,9 @@ impl Store {
                 ("is_draft", json!(draft)),
             ],
         )?;
+        if let Some(tx) = tx {
+            sql(tx.commit())?;
+        }
         // Cached inside the caller's transaction: a failed commit leaves a
         // higher cached revision, so the next save refuses (fail-closed)
         // instead of writing under a revision that never landed.
@@ -1432,6 +1443,12 @@ impl Store {
             .native_revisions
             .borrow_mut()
             .insert(id, flush.session_revision);
+        self.shared_record_storage_mode(
+            id,
+            native_chunks::StorageMode::NativeChunks {
+                mode_version: flush.mode_version,
+            },
+        );
         Ok(())
     }
 
@@ -1748,7 +1765,7 @@ impl Store {
         self.shared_record_storage_mode(
             id,
             native_chunks::StorageMode::NativeChunks {
-                mode_version: native_chunks::NATIVE_CHUNKS_MODE_VERSION,
+                mode_version: flush.mode_version,
             },
         );
         Ok(())
@@ -2155,7 +2172,7 @@ impl Store {
         self.shared_record_storage_mode(
             id,
             native_chunks::StorageMode::NativeChunks {
-                mode_version: native_chunks::NATIVE_CHUNKS_MODE_VERSION,
+                mode_version: report.mode_version,
             },
         );
         Ok(report)

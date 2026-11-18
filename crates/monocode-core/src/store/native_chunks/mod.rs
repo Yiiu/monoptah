@@ -34,12 +34,15 @@ pub(crate) use writer::{
 
 use rusqlite::{params, Connection, OptionalExtension};
 
-/// The storage-mode version this build writes and understands. A marker
+/// The newest storage-mode version this build writes and understands. A marker
 /// claiming a higher version makes the whole connection refuse writes.
 /// Public so out-of-crate callers that create their own sessions (the
 /// persistence probe) can opt them into this backend with the version the
 /// store itself dispatches on.
-pub const NATIVE_CHUNKS_MODE_VERSION: u32 = 1;
+pub const NATIVE_CHUNKS_MODE_VERSION: u32 = 2;
+
+/// Plain blocks still use the original format until a full-block payload is needed.
+pub(crate) const INITIAL_NATIVE_CHUNKS_MODE_VERSION: u32 = 1;
 
 /// The distinct error kind surfaced when a database uses a storage mode newer
 /// than this build understands. An unrecognized format must refuse writes,

@@ -15,7 +15,10 @@
 //! (turn receipts, follow-ups, rewind after an edit, cloud restore). It is
 //! the only writer that recomputes absolute row extents; the sparse path
 //! never renumbers.
-use super::layout::{pack_payload_segments, pack_stored_chunks, ROWS_PLACEHOLDER};
+use super::layout::{
+    full_block_id, is_full_block_skeleton, pack_payload_segments, pack_stored_chunks,
+    ROWS_PLACEHOLDER,
+};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::{collections::HashSet, fmt};
 
@@ -121,6 +124,7 @@ impl Clone for BlockUpdate {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SparseFlush {
     pub session_revision: i64,
+    pub mode_version: u32,
     pub blocks_written: u64,
     pub chunks_written: u64,
     pub chunk_bytes_written: u64,
@@ -240,14 +244,19 @@ pub(crate) fn session_revision(
     conn: &Connection,
     session_id: &str,
 ) -> rusqlite::Result<Option<i64>> {
-    if !super::has_native_sessions(conn)? {
+    Ok(session_state(conn, session_id)?.map(|(revision, _)| revision))
+}
+
+fn session_state(conn: &Connection, session_id: &str) -> rusqlite::Result<Option<(i64, u32)>> {
+    let super::StorageMode::NativeChunks { mode_version } =
+        super::session_storage_mode(conn, session_id)?
+    else {
         return Ok(None);
-    }
-    super::session_storage_mode(conn, session_id)?;
+    };
     conn.query_row(
         "SELECT session_revision FROM native_sessions WHERE session_id=?1",
         [session_id],
-        |row| row.get(0),
+        |row| Ok((row.get(0)?, mode_version)),
     )
     .optional()
 }
@@ -285,7 +294,7 @@ pub(crate) fn flush_sparse_tx(
     plan: &SparseSavePlan,
     render: &dyn Fn(&DirtyBlock) -> Result<BlockUpdate, String>,
 ) -> Result<SparseFlush, FlushError> {
-    let Some(stored_revision) = session_revision(conn, session_id)? else {
+    let Some((stored_revision, mode_version)) = session_state(conn, session_id)? else {
         return Err(FlushError::NotChunked);
     };
     if stored_revision != plan.session_revision_expected {
@@ -308,6 +317,7 @@ pub(crate) fn flush_sparse_tx(
     let mut claimed_ids: HashSet<String> = index.iter().map(|b| b.block_id.clone()).collect();
     let mut stats = SparseFlush {
         session_revision: stored_revision,
+        mode_version,
         blocks_written: 0,
         chunks_written: 0,
         chunk_bytes_written: 0,
@@ -405,11 +415,7 @@ pub(crate) fn flush_sparse_tx(
         }
     }
     if stats.blocks_written > 0 {
-        conn.execute(
-            "UPDATE native_sessions SET session_revision=?2 WHERE session_id=?1",
-            params![session_id, stored_revision + 1],
-        )?;
-        stats.session_revision = stored_revision + 1;
+        update_session_state(conn, session_id, &mut stats)?;
     }
     Ok(stats)
 }
@@ -428,7 +434,7 @@ pub(crate) fn replace_blocks_tx(
     expected_revision: i64,
     blocks: &[BlockUpdate],
 ) -> Result<SparseFlush, FlushError> {
-    let Some(stored_revision) = session_revision(conn, session_id)? else {
+    let Some((stored_revision, mode_version)) = session_state(conn, session_id)? else {
         return Err(FlushError::NotChunked);
     };
     if stored_revision != expected_revision {
@@ -438,6 +444,7 @@ pub(crate) fn replace_blocks_tx(
     let mut claimed_ids: HashSet<String> = HashSet::new();
     let mut stats = SparseFlush {
         session_revision: stored_revision,
+        mode_version,
         blocks_written: 0,
         chunks_written: 0,
         chunk_bytes_written: 0,
@@ -502,13 +509,22 @@ pub(crate) fn replace_blocks_tx(
         first_row += row_count;
     }
     if stats.blocks_written > 0 || deleted {
-        conn.execute(
-            "UPDATE native_sessions SET session_revision=?2 WHERE session_id=?1",
-            params![session_id, stored_revision + 1],
-        )?;
-        stats.session_revision = stored_revision + 1;
+        update_session_state(conn, session_id, &mut stats)?;
     }
     Ok(stats)
+}
+
+fn update_session_state(
+    conn: &Connection,
+    session_id: &str,
+    stats: &mut SparseFlush,
+) -> rusqlite::Result<()> {
+    stats.session_revision += 1;
+    conn.execute(
+        "UPDATE native_sessions SET session_revision=?2, mode_version=?3 WHERE session_id=?1",
+        params![session_id, stats.session_revision, stats.mode_version],
+    )?;
+    Ok(())
 }
 
 /// One bounded chunk write a save plans against a block's stored chunks.
@@ -655,6 +671,9 @@ fn write_block(
     )?;
     stats.blocks_written += 1;
     stats.skeleton_bytes_written += update.skeleton.len() as u64;
+    if is_full_block_skeleton(&update.skeleton) {
+        stats.mode_version = super::NATIVE_CHUNKS_MODE_VERSION;
+    }
     Ok(())
 }
 
@@ -901,6 +920,9 @@ pub(crate) fn stored_payload(
 
 /// The block id a skeleton's raw JSON carries, if any.
 fn skeleton_id(skeleton: &str) -> Option<String> {
+    if is_full_block_skeleton(skeleton) {
+        return full_block_id(skeleton).ok();
+    }
     // A stored skeleton is not valid JSON: its rows member holds the bare
     // placeholder. Splice the placeholder out — exactly one occurrence, since
     // `block_skeleton` refuses blocks that carry the text — and read the id.
