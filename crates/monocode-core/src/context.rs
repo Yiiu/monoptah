@@ -1,4 +1,5 @@
 //! Context-window accounting, matching sessions/model/contextUsage.ts.
+mod restore;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -23,16 +24,59 @@ impl Usage {
     }
 }
 
+const CLAUDE_TOKEN_FIELDS: [&str; 4] = [
+    "input_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+    "output_tokens",
+];
+
+#[derive(Default)]
+pub(crate) struct ClaudeMessageUsage {
+    message_id: Option<String>,
+    counts: [u64; CLAUDE_TOKEN_FIELDS.len()],
+    has_iteration_usage: bool,
+}
+
+impl ClaudeMessageUsage {
+    pub(crate) fn select_message(&mut self, id: &str) {
+        if self.message_id.as_deref().is_some_and(|old| old != id) {
+            *self = Self::default();
+        }
+        self.message_id.get_or_insert_with(|| id.into());
+    }
+
+    /// Each frame can report just some of the cumulative counters for one request.
+    pub(crate) fn observe(&mut self, usage: &Value) -> Option<u64> {
+        if let Some(used) = usage["iterations"]
+            .as_array()
+            .and_then(|v| v.last())
+            .and_then(claude_used)
+        {
+            self.has_iteration_usage = true;
+            return Some(used);
+        }
+        // After a server-side iteration breakdown, top-level totals span iterations.
+        if self.has_iteration_usage {
+            return None;
+        }
+        let mut reported = false;
+        for (count, field) in self.counts.iter_mut().zip(CLAUDE_TOKEN_FIELDS) {
+            if let Some(value) = usage[field].as_u64() {
+                *count = (*count).max(value);
+                reported = true;
+            }
+        }
+        let used = self.counts.iter().sum();
+        (reported && used > 0).then_some(used)
+    }
+}
+
 pub fn claude_used(usage: &Value) -> Option<u64> {
-    let used = [
-        "input_tokens",
-        "cache_creation_input_tokens",
-        "cache_read_input_tokens",
-        "output_tokens",
-    ]
-    .iter()
-    .map(|key| usage[key].as_u64().unwrap_or(0))
-    .sum();
+    let used = CLAUDE_TOKEN_FIELDS
+        .iter()
+        .filter_map(|field| usage[field].as_u64())
+        .sum();
     (used > 0).then_some(used)
 }
 

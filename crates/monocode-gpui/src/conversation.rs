@@ -910,8 +910,14 @@ impl Conversation {
         let store = self.store.clone();
         let id = self.summary.id;
         let mono = self.settings.mono.is_some();
+        let summary = self.summary.clone();
         let work = cx.background_executor().spawn(async move {
             let settings = locked(&store).and_then(|s| s.agent_settings(id));
+            let context = crate::runtime::restored_context(
+                &store,
+                &summary,
+                settings.as_ref().ok().and_then(Option::as_ref),
+            );
             (
                 locked(&store)
                     .and_then(|s| {
@@ -930,7 +936,7 @@ impl Conversation {
                         )
                     }),
                 settings,
-                locked(&store).and_then(|s| s.context_usage(id)),
+                context,
                 locked(&store).and_then(|s| s.follow_ups(id)),
                 locked(&store).and_then(|s| s.history_before(id)),
             )

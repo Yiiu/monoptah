@@ -273,6 +273,9 @@ struct Protocol {
     request: Request,
     emitted: HashMap<String, String>,
     claude_message: usize,
+    claude_stream_usage: Option<crate::context::ClaudeMessageUsage>,
+    /// Suppress summary-request usage even when the boundary has no post-token count.
+    claude_after_boundary: bool,
     begun: bool,
     done: bool,
     tools: HashMap<String, ToolCall>,
@@ -314,6 +317,8 @@ impl Protocol {
             steering: HashMap::new(),
             emitted: HashMap::new(),
             claude_message: 0,
+            claude_stream_usage: None,
+            claude_after_boundary: false,
             begun: false,
             done: false,
             tools: HashMap::new(),
@@ -353,6 +358,51 @@ impl Protocol {
             self.text_key = Some(key.to_owned());
         }
         events.push(Event::Text(text));
+    }
+    /// A streamed assistant snapshot can precede the final usage delta. Keep the
+    /// counters for this main-thread request until its message stops.
+    fn claude_context_used(&mut self, frame: &Value) -> Option<u64> {
+        if !frame["parent_tool_use_id"].is_null() {
+            return None;
+        }
+        let message = match frame["type"].as_str()? {
+            "system" if frame["subtype"] == "compact_boundary" => {
+                self.claude_stream_usage = None;
+                self.claude_after_boundary = true;
+                return frame["compact_metadata"]["post_tokens"].as_u64();
+            }
+            "assistant" if frame["message"]["model"] != "<synthetic>" => {
+                self.claude_after_boundary = false;
+                &frame["message"]
+            }
+            "stream_event" => {
+                let event = &frame["event"];
+                match event["type"].as_str()? {
+                    "message_start" => {
+                        self.claude_after_boundary = false;
+                        self.claude_stream_usage = Some(Default::default());
+                        &event["message"]
+                    }
+                    "message_delta" => event,
+                    "message_stop" => {
+                        self.claude_stream_usage = None;
+                        return None;
+                    }
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
+        if let Some(id) = message["id"].as_str() {
+            self.claude_stream_usage
+                .get_or_insert_with(Default::default)
+                .select_message(id);
+        }
+        let usage = &message["usage"];
+        match &mut self.claude_stream_usage {
+            Some(stream) => stream.observe(usage),
+            None => crate::context::ClaudeMessageUsage::default().observe(usage),
+        }
     }
     fn frame(&mut self, v: Value, stdin: &mut impl Write) -> Result<Vec<Event>, String> {
         if self.request.kind == Kind::Codex {
@@ -786,6 +836,12 @@ impl Protocol {
                 if let Some(model) = v["model"].as_str().filter(|_| v["type"] == "system") {
                     events.push(Event::Model(model.into()));
                 }
+                if let Some(used) = self.claude_context_used(&v) {
+                    events.push(Event::Context {
+                        used: Some(used),
+                        window: None,
+                    });
+                }
                 match v["type"].as_str().unwrap_or("") {
                     "rate_limit_event" if v["parent_tool_use_id"].is_null() => {
                         self.claude_usage_limit =
@@ -852,15 +908,6 @@ impl Protocol {
                     "assistant" => {
                         if let Some(error) = v["error"].as_str() {
                             return Err(self.claude_error(error, &v));
-                        }
-                        if v["parent_tool_use_id"].is_null() {
-                            if let Some(used) = crate::context::claude_used(&v["message"]["usage"])
-                            {
-                                events.push(Event::Context {
-                                    used: Some(used),
-                                    window: None,
-                                });
-                            }
                         }
                         for block in v["message"]["content"].as_array().into_iter().flatten() {
                             if block["type"] == "tool_use" {
@@ -953,10 +1000,14 @@ impl Protocol {
                         }
                         // Result totals sum every request in the turn. Without a
                         // last iteration, keep the latest assistant reading.
-                        let used = v["usage"]["iterations"]
-                            .as_array()
-                            .and_then(|iterations| iterations.last())
-                            .and_then(crate::context::claude_used);
+                        let used = if std::mem::take(&mut self.claude_after_boundary) {
+                            None
+                        } else {
+                            usage["iterations"]
+                                .as_array()
+                                .and_then(|iterations| iterations.last())
+                                .and_then(crate::context::claude_used)
+                        };
                         let window = v["modelUsage"]
                             .as_object()
                             .into_iter()
@@ -2084,6 +2135,150 @@ mod tests {
             window: Some(200000)
         }));
     }
+    #[test]
+    fn claude_context_uses_late_stream_usage_when_the_assistant_snapshot_is_empty() {
+        let mut claude = protocol(Kind::Claude);
+        let mut context = crate::context::Usage::default();
+        for frame in [
+            json!({"type":"stream_event","event":{"type":"message_start","message":{"usage":{"input_tokens":0,"output_tokens":0}}}}),
+            json!({"type":"assistant","message":{"content":[],"usage":{"input_tokens":0,"output_tokens":0}}}),
+            json!({"type":"stream_event","event":{"type":"message_delta","usage":{"input_tokens":2211,"cache_read_input_tokens":4000,"output_tokens":8}}}),
+            json!({"type":"stream_event","event":{"type":"message_stop"}}),
+            json!({"type":"result","usage":{"input_tokens":90000,"iterations":[]},"modelUsage":{"model":{"contextWindow":272000}}}),
+        ] {
+            for event in claude.frame(frame, &mut Vec::new()).unwrap() {
+                if let Event::Context { used, window } = event {
+                    context.merge(used, window);
+                }
+            }
+        }
+        assert_eq!(context.window, Some(272000));
+        assert_eq!(context.used, 6219);
+    }
+
+    #[test]
+    fn claude_context_merges_partial_counts_only_within_the_current_main_message() {
+        let mut claude = protocol(Kind::Claude);
+        let stream = |event| json!({"type":"stream_event","event":event});
+        let mut used = None;
+        for (frame, expected) in [
+            (
+                stream(
+                    json!({"type":"message_start","message":{"usage":{"input_tokens":120,"cache_creation_input_tokens":800,"output_tokens":1}}}),
+                ),
+                921,
+            ),
+            (
+                stream(json!({"type":"message_delta","usage":{"output_tokens":20}})),
+                940,
+            ),
+            (
+                json!({"type":"stream_event","parent_tool_use_id":"child","event":{"type":"message_start","message":{"usage":{"input_tokens":99999}}}}),
+                940,
+            ),
+            (
+                stream(json!({"type":"message_delta","usage":{"output_tokens":25}})),
+                945,
+            ),
+            (stream(json!({"type":"message_stop"})), 945),
+            (
+                stream(
+                    json!({"type":"message_start","message":{"id":"first","usage":{"input_tokens":50}}}),
+                ),
+                50,
+            ),
+            (
+                stream(json!({"type":"message_delta","usage":{"output_tokens":7}})),
+                57,
+            ),
+            // A retry can start with an identified snapshot before the old stop arrives.
+            (
+                json!({"type":"assistant","message":{"id":"retry","usage":{"cache_read_input_tokens":4000}}}),
+                4000,
+            ),
+            (
+                stream(json!({"type":"message_delta","usage":{"output_tokens":8}})),
+                4008,
+            ),
+            (
+                stream(
+                    json!({"type":"message_delta","usage":{"input_tokens":90000,"iterations":[{"input_tokens":60000},{"input_tokens":30000}]}}),
+                ),
+                30000,
+            ),
+        ] {
+            for event in claude.frame(frame, &mut Vec::new()).unwrap() {
+                if let Event::Context {
+                    used: Some(count), ..
+                } = event
+                {
+                    used = Some(count);
+                }
+            }
+            assert_eq!(used, Some(expected));
+        }
+    }
+
+    #[test]
+    fn claude_context_after_compact_uses_post_tokens_not_summarization_usage() {
+        let mut claude = protocol(Kind::Claude);
+        claude.compact = true;
+        let mut context = crate::context::Usage {
+            used: 52_966,
+            window: Some(272_000),
+        };
+        for (frame, expected) in [
+            (
+                json!({"type":"system","subtype":"compact_boundary","parent_tool_use_id":"child","compact_metadata":{"post_tokens":42}}),
+                52_966,
+            ),
+            (
+                json!({"type":"system","subtype":"compact_boundary","compact_metadata":{"pre_tokens":52_966}}),
+                52_966,
+            ),
+            (
+                json!({"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"manual","pre_tokens":52_966,"post_tokens":12_022,"cumulative_dropped_tokens":259_361}}),
+                12_022,
+            ),
+            (
+                json!({"type":"result","usage":{"iterations":[{"input_tokens":52_966}]},"modelUsage":{"model":{"contextWindow":272_000}}}),
+                12_022,
+            ),
+        ] {
+            for event in claude.frame(frame, &mut Vec::new()).unwrap() {
+                if let Event::Context { used, window } = event {
+                    context.merge(used, window);
+                }
+            }
+            assert_eq!(context.used, expected);
+            assert_eq!(context.window, Some(272_000));
+        }
+    }
+
+    #[test]
+    fn claude_context_after_compact_without_a_reading_does_not_use_summary_metrics() {
+        let mut claude = protocol(Kind::Claude);
+        claude.compact = true;
+        claude.frame(json!({"type":"system","subtype":"compact_boundary","compact_metadata":{"pre_tokens":52966}}), &mut Vec::new()).unwrap();
+        let events = claude.frame(json!({"type":"result","usage":{"iterations":[{"input_tokens":54000}]},"modelUsage":{"model":{"contextWindow":272000}}}), &mut Vec::new()).unwrap();
+        assert!(events.contains(&Event::Context {
+            used: None,
+            window: Some(272000)
+        }));
+    }
+
+    #[test]
+    fn claude_context_after_compact_yields_to_a_later_main_request() {
+        let mut claude = protocol(Kind::Claude);
+        claude.frame(json!({"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"auto","post_tokens":12022}}), &mut Vec::new()).unwrap();
+        claude.frame(json!({"type":"stream_event","event":{"type":"message_start","message":{"usage":{"input_tokens":13000}}}}), &mut Vec::new()).unwrap();
+        let events = claude.frame(json!({"type":"result","usage":{"iterations":[{"input_tokens":13000,"output_tokens":80}]}}), &mut Vec::new()).unwrap();
+        assert!(events.contains(&Event::Context {
+            used: Some(13080),
+            window: None
+        }));
+    }
+
     #[test]
     fn claude_context_reports_preserve_latest_request_when_result_has_only_totals() {
         for iterations in [None, Some(json!([]))] {

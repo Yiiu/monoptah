@@ -24,6 +24,37 @@ fn conversation(cx: &mut TestAppContext) -> WindowHandle<Conversation> {
 }
 
 #[gpui::test]
+fn compact_clears_the_submitted_command_as_soon_as_it_starts(cx: &mut TestAppContext) {
+    let window = conversation(cx);
+    window
+        .update(cx, |view, _, cx| {
+            view.summary.provider = "codex".into();
+            // The slash picker leaves a trailing space when it inserts the command.
+            view.input
+                .update(cx, |input, cx| input.set_text("/compact ".into(), cx));
+            view.send(cx);
+            assert!(!view.busy);
+            assert_eq!(view.input.read(cx).content, "/compact ");
+
+            view.summary.provider_id = Some("fixture-session".into());
+            view.send(cx);
+            assert!(view.busy);
+            assert!(view.input.read(cx).content.is_empty());
+            view.input
+                .update(cx, |input, cx| input.set_text("next question".into(), cx));
+            view.cancel.store(true, Ordering::Relaxed);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .read_with(cx, |view, cx| {
+            assert!(!view.busy);
+            assert_eq!(view.input.read(cx).content, "next question");
+        })
+        .unwrap();
+}
+
+#[gpui::test]
 fn mono_messages_steer_the_ready_provider_once_and_keep_their_send_time(cx: &mut TestAppContext) {
     let window = conversation(cx);
     let (send, receive) = std::sync::mpsc::channel();
