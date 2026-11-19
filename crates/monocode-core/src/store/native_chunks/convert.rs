@@ -419,8 +419,8 @@ fn downgrade_tx(
                 || same_form(&legacy_store_block_form(block, &raw, &legacy)?))
         };
         if !same_form(&form)
-            && !same_form(&legacy_store_block_form(block, &raw, &rows)?)
             && !matches_legacy_goal()?
+            && !same_form(&legacy_store_block_form(block, &raw, &rows)?)
         {
             return Err(format!(
                 "Restart-equality verification failed: block {} of this conversation would not \

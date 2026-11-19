@@ -58,6 +58,78 @@ impl Row {
     }
 }
 
+/// Whole messages, newest first. A paged transcript may start in the middle
+/// of a message; that leading fragment cannot be interpreted on its own.
+fn messages_rev(mut rows: &[Row]) -> impl Iterator<Item = (usize, &[Row])> {
+    std::iter::from_fn(move || {
+        let start = rows.iter().rposition(|row| row.first)?;
+        let (older, message) = rows.split_at(start);
+        rows = older;
+        Some((start, message))
+    })
+}
+
+fn message_text(message: &[Row]) -> std::borrow::Cow<'_, str> {
+    if message.len() == 1 {
+        return message[0].text.as_str().into();
+    }
+    message
+        .iter()
+        .map(|row| row.text.as_str())
+        .collect::<String>()
+        .into()
+}
+
+impl GoalNotice {
+    /// The latest active goal, including the set condition for checkins/pauses.
+    pub fn active(rows: &[Row]) -> Option<(GoalPhase, String)> {
+        let (_, phase, condition) = Self::active_message(rows)?;
+        Some((phase, condition))
+    }
+
+    pub(crate) fn active_message(rows: &[Row]) -> Option<(usize, GoalPhase, String)> {
+        let mut goals = messages_rev(rows).filter(|(_, msg)| msg[0].role == "goal");
+        let (index, message) = goals.next()?;
+        let latest: Self = serde_json::from_str(&message_text(message)).ok()?;
+        let phase = match latest.phase {
+            GoalPhase::Set => return Some((index, GoalPhase::Set, latest.condition?)),
+            GoalPhase::Checkin => GoalPhase::Set,
+            GoalPhase::Paused => GoalPhase::Paused,
+            _ => return None,
+        };
+        let set = goals
+            .filter_map(|(_, msg)| serde_json::from_str::<Self>(&message_text(msg)).ok())
+            .find(|notice| notice.phase == GoalPhase::Set);
+        Some((
+            index,
+            phase,
+            set.and_then(|notice| notice.condition).unwrap_or_default(),
+        ))
+    }
+
+    /// Older sessions used user rows; current clients echo raw commands as
+    /// interjections. Only the nearest prompt/command before this goal counts.
+    pub(crate) fn command_time(rows: &[Row], condition: &str) -> Option<u64> {
+        let (command, sent_at) = messages_rev(rows)
+            .take_while(|(_, msg)| msg[0].role != "goal")
+            .find_map(|(_, msg)| {
+                let command = match msg[0].role.as_str() {
+                    "user" => message_text(msg),
+                    "interjection" => {
+                        let echo: Interjection = serde_json::from_str(&message_text(msg)).ok()?;
+                        if echo.custom_type != "command" {
+                            return None;
+                        }
+                        echo.text.into()
+                    }
+                    _ => return None,
+                };
+                Some((command, msg[0].sent_at))
+            })?;
+        (command.trim().strip_prefix("/goal ")?.trim() == condition).then_some(sent_at)?
+    }
+}
+
 #[derive(Default, Debug)]
 pub struct Transcript {
     pub rows: Vec<Row>,

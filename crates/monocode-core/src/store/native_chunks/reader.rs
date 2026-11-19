@@ -63,12 +63,32 @@ pub(crate) fn page_rows(
         let mut block_rows = parse_rows(&chunks)?;
         // Older writers projected goal blocks as system rows. Check the
         // original block role so ordinary system text cannot become goal state.
-        if block_rows.first().is_some_and(|row| {
-            row.role == "system" && row.text.starts_with('{') && row.text.contains("\"phase\":")
-        }) {
-            let (skeleton, chunks, payloads) = stored_payload(conn, session_id, stored.block_seq)
+        if block_rows.first().is_some_and(|row| row.role == "system") {
+            // Inspect the small skeleton, without rebuilding large system blocks.
+            // A full-block envelope stores the original role in its payload.
+            let goal: Option<bool> = conn
+                .query_row(
+                    "SELECT CASE WHEN substr(skeleton_json,1,1) <> '[' THEN
+                    coalesce(json_extract(replace(skeleton_json,?3,''),'$.role')='goal',0)
+                 END FROM native_blocks WHERE session_id=?1 AND block_seq=?2",
+                    rusqlite::params![
+                        session_id,
+                        stored.block_seq,
+                        super::layout::ROWS_PLACEHOLDER
+                    ],
+                    |row| row.get(0),
+                )
                 .map_err(|error| error.to_string())?;
-            if block_value(&skeleton, &chunks, &payloads)?["role"] == "goal" {
+            let goal = match goal {
+                Some(goal) => goal,
+                None => {
+                    let (skeleton, chunks, payloads) =
+                        stored_payload(conn, session_id, stored.block_seq)
+                            .map_err(|error| error.to_string())?;
+                    block_value(&skeleton, &chunks, &payloads)?["role"] == "goal"
+                }
+            };
+            if goal {
                 for row in block_rows.iter_mut().take_while(|row| row.role == "system") {
                     row.role = "goal".into();
                 }

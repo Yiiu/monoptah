@@ -172,6 +172,54 @@ fn reopening_a_stale_goal_persists_the_completion_and_hides_the_pill(cx: &mut Te
     assert_eq!(completion.phase, GoalPhase::Achieved);
 }
 
+#[test]
+fn late_recovery_checks_the_provider_binding_and_preserves_changed_rows() {
+    let mut db = Store::open(Path::new(":memory:")).unwrap();
+    let summary = db.create("claude", "/project").unwrap();
+    let id = summary.id;
+    db.provider_id(id, "original").unwrap();
+    let goal = goal_row(GoalPhase::Set, Some("first"), "Goal set: first");
+    db.write_rows(id, 0, &[goal]).unwrap();
+    let mut history = db.load(id).unwrap();
+    let achieved = GoalNotice {
+        phase: GoalPhase::Achieved,
+        condition: Some("first".into()),
+        notice: "Goal achieved".into(),
+    };
+    let finish = |db: &mut Store, history: &mut monocode_core::transcript::Transcript| {
+        history::finish_goal_recovery(
+            db,
+            id,
+            "original",
+            "/project",
+            &Settings::default(),
+            history,
+            &achieved,
+        )
+        .unwrap();
+    };
+    db.change_provider(id, "codex").unwrap();
+    finish(&mut db, &mut history);
+    assert_eq!(db.load(id).unwrap().rows.len(), 1);
+    db.change_provider(id, "claude").unwrap();
+    db.provider_id(id, "other").unwrap();
+    finish(&mut db, &mut history);
+    assert_eq!(db.load(id).unwrap().rows.len(), 1);
+    db.provider_id(id, "original").unwrap();
+    db.write_rows(
+        id,
+        1,
+        &[goal_row(GoalPhase::Set, Some("new"), "Goal set: new")],
+    )
+    .unwrap();
+    finish(&mut db, &mut history);
+    assert_eq!(db.load(id).unwrap().rows, history.rows);
+    assert_eq!(
+        GoalNotice::active(&history.rows),
+        Some((GoalPhase::Set, "new".into()))
+    );
+}
+
 #[gpui::test]
 fn goal_pill_clear_launches_the_raw_command(cx: &mut TestAppContext) {
     let window = conversation(cx);

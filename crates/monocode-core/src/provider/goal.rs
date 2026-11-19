@@ -18,40 +18,13 @@ pub fn recover_claude_goal(
     settings: &Settings,
     rows: &[Row],
 ) -> Option<GoalNotice> {
-    let last_index = rows.iter().rposition(|row| row.role == "goal")?;
-    let last = &rows[last_index];
-    let latest: GoalNotice = serde_json::from_str(&last.text).ok()?;
-    let mut since = last.sent_at?;
-    let condition = match latest.phase {
-        GoalPhase::Set => {
-            let condition = latest.condition?;
-            // The receipt may lag Claude's own writes. If the preceding user
-            // turn set exactly this goal, use its earlier submission time.
-            let prompt = rows[..last_index]
-                .iter()
-                .rev()
-                .take_while(|row| row.role != "goal")
-                .find(|row| row.role == "user" && row.first)
-                .filter(|row| {
-                    row.text.trim().strip_prefix("/goal ").map(str::trim)
-                        == Some(condition.as_str())
-                });
-            if let Some(sent_at) = prompt.and_then(|row| row.sent_at) {
-                since = since.min(sent_at);
-            }
-            condition
-        }
-        GoalPhase::Checkin | GoalPhase::Paused => {
-            rows[..last_index]
-                .iter()
-                .rev()
-                .filter(|row| row.role == "goal")
-                .filter_map(|row| serde_json::from_str::<GoalNotice>(&row.text).ok())
-                .find(|notice| notice.phase == GoalPhase::Set)?
-                .condition?
-        }
-        GoalPhase::Cleared | GoalPhase::Achieved | GoalPhase::Error => return None,
-    };
+    let (start, _, condition) = GoalNotice::active_message(rows)?;
+    if condition.is_empty() {
+        return None;
+    }
+    let receipt = rows[start].sent_at?;
+    let since = GoalNotice::command_time(&rows[..start], &condition)
+        .map_or(receipt, |submitted| receipt.min(submitted));
     let mut cursor = TranscriptCursor::for_session(cwd, session, settings)?;
     cursor.condition = Some(condition);
     cursor.find_completion(since)
@@ -68,6 +41,7 @@ pub(super) struct TranscriptCursor {
     started_at: u64,
     condition: Option<String>,
     terminal_seen: bool,
+    partial_line: bool,
 }
 
 impl TranscriptCursor {
@@ -83,6 +57,9 @@ impl TranscriptCursor {
             Err(_) => return None,
         }
         cursor.started_at = crate::time::now_ms();
+        cursor
+            .condition
+            .clone_from(&request.settings.claude_goal_condition);
         Some(cursor)
     }
 
@@ -117,6 +94,7 @@ impl TranscriptCursor {
             started_at: 0,
             condition: None,
             terminal_seen: false,
+            partial_line: false,
         })
     }
 
@@ -156,9 +134,22 @@ impl TranscriptCursor {
     }
 
     pub(super) fn completion(&mut self, session: &str) -> Option<GoalNotice> {
-        if session != self.session {
+        self.completion_with_retry(session, || {
+            std::thread::sleep(std::time::Duration::from_millis(100))
+        })
+    }
+
+    fn completion_with_retry(&mut self, session: &str, wait: impl FnOnce()) -> Option<GoalNotice> {
+        if session != self.session || self.terminal_seen {
             return None;
         }
+        let first = self.find_completion(self.started_at);
+        if first.is_some() || (self.condition.is_none() && !self.partial_line) {
+            return first;
+        }
+        // Claude can flush the attachment just after the successful result.
+        // Re-read from the last complete line on this provider worker only.
+        wait();
         self.find_completion(self.started_at)
     }
 
@@ -171,6 +162,7 @@ impl TranscriptCursor {
             line.clear();
             let bytes = reader.read_until(b'\n', &mut line).ok()?;
             if line.last() != Some(&b'\n') {
+                self.partial_line = bytes > 0;
                 break;
             }
             self.offset += bytes as u64;
@@ -441,6 +433,79 @@ mod tests {
             recover(&saved).is_none(),
             "an already closed goal needs no second row"
         );
+    }
+
+    #[test]
+    fn result_retries_a_partially_flushed_goal_attachment() {
+        let mut turn = Turn::new();
+        turn.start();
+        turn.status(true, "finish");
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(&turn.transcript)
+            .unwrap();
+        file.set_len(file.metadata().unwrap().len() - 1).unwrap();
+        drop(file);
+        let cursor = turn.protocol.claude_goal.as_mut().unwrap();
+        let completed = cursor
+            .completion_with_retry(SESSION, || {
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(&turn.transcript)
+                    .unwrap()
+                    .write_all(b"\n")
+                    .unwrap();
+            })
+            .unwrap();
+        assert_eq!(completed.phase, GoalPhase::Achieved);
+        assert!(!achieved(&turn.result()));
+    }
+
+    #[test]
+    fn resumed_active_goal_retries_when_the_whole_attachment_is_late() {
+        let mut turn = Turn::new();
+        turn.protocol.request.settings.claude_goal_condition = Some("finish".into());
+        turn.start();
+        let mut cursor = turn.protocol.claude_goal.take().unwrap();
+        let completed = cursor
+            .completion_with_retry(SESSION, || turn.status(true, "finish"))
+            .unwrap();
+        assert_eq!(completed.phase, GoalPhase::Achieved);
+    }
+
+    #[test]
+    fn reopened_split_goal_uses_the_command_echo_submission_time() {
+        let turn = Turn::new();
+        let condition = "修".repeat(400);
+        let mut t = crate::transcript::Transcript::default();
+        let i = t.begin("interjection");
+        t.rows[i].sent_at = Some(1_000);
+        t.append(
+            &json!({"custom_type":"command", "text":format!("/goal {condition}")}).to_string(),
+        );
+        let i = t.begin("goal");
+        t.rows[i].sent_at = Some(3_000);
+        t.append(
+            &serde_json::to_string(&goal_notice(&format!("Goal set: {condition}")).unwrap())
+                .unwrap(),
+        );
+        assert!(t.rows.len() > i + 1);
+        turn.status_at(true, &condition, "1970-01-01T00:00:02Z");
+        let recover = |rows: &[Row]| {
+            recover_claude_goal(
+                &turn.protocol.request.cwd,
+                SESSION,
+                &turn.protocol.request.settings,
+                rows,
+            )
+        };
+        assert_eq!(
+            GoalNotice::active(&t.rows),
+            Some((GoalPhase::Set, condition.clone()))
+        );
+        assert_eq!(recover(&t.rows).unwrap().phase, GoalPhase::Achieved);
+        t.rows[0].text = json!({"custom_type":"command", "text":"/goal other"}).to_string();
+        assert!(recover(&t.rows).is_none());
     }
 
     #[test]
