@@ -1343,11 +1343,7 @@ impl Conversation {
     fn goal_shelf(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let (phase, condition) = self.goal_state(cx)?;
         let paused = phase == GoalPhase::Paused;
-        let label = if paused {
-            "已暂停的目标"
-        } else {
-            "进行中的目标"
-        };
+        let label = if paused { "Paused goal" } else { "Active goal" };
         let toggle =
             |this: &mut Self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
                 this.goal_open = !this.goal_open;
@@ -1364,7 +1360,7 @@ impl Conversation {
             .map(focusable)
             .debug_selector(|| "goal-state".into())
             .role(Role::Button)
-            .aria_label(format!("{label}：{condition}"))
+            .aria_label(format!("{label}: {condition}"))
             .aria_expanded(self.goal_open)
             .cursor_pointer()
             .flex_1()
@@ -1406,11 +1402,11 @@ impl Conversation {
             .child(self.goal_anchor.probe())
             .child(summary)
             .child(
-                icon_button_enabled("goal-clear", "清除目标", "trash", can_clear)
+                icon_button_enabled("goal-clear", "Clear goal", "trash", can_clear)
                     .debug_selector(|| "goal-clear".into())
                     .when(!can_clear, |d| {
                         d.cursor_default()
-                            .aria_description("当前回合结束后可清除目标")
+                            .aria_description("You can clear the goal after this turn ends.")
                     })
                     .when(can_clear, |d| {
                         focusable(d).on_click(cx.listener(|this, _, _, cx| {
@@ -1422,7 +1418,7 @@ impl Conversation {
                     }),
             )
             .child(
-                icon_button("goal-expand", "查看完整目标", "maximize")
+                icon_button("goal-expand", "View full goal", "maximize")
                     .map(focusable)
                     .debug_selector(|| "goal-expand".into())
                     .aria_expanded(self.goal_open)
