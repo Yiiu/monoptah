@@ -87,35 +87,36 @@ impl GoalNotice {
         Some((phase, condition))
     }
 
-    pub(crate) fn active_message(rows: &[Row]) -> Option<(usize, GoalPhase, String)> {
+    // Older notifications may still name the goal for display, but a terminal
+    // event between Set and the latest notice rules out disk recovery for it.
+    pub(crate) fn active_message(rows: &[Row]) -> Option<(Option<usize>, GoalPhase, String)> {
         let mut goals = messages_rev(rows).filter(|(_, msg)| msg[0].role == "goal");
         let (index, message) = goals.next()?;
         let latest: Self = serde_json::from_str(&message_text(message)).ok()?;
         let phase = match latest.phase {
-            GoalPhase::Set => return Some((index, GoalPhase::Set, latest.condition?)),
+            GoalPhase::Set => return Some((Some(index), GoalPhase::Set, latest.condition?)),
             GoalPhase::Checkin => GoalPhase::Set,
             GoalPhase::Paused => GoalPhase::Paused,
             _ => return None,
         };
-        // A checkin or pause changes the displayed phase, not when this
-        // goal began. Recovery must still search from its original Set.
-        let set = goals
-            .filter_map(|(i, msg)| {
-                serde_json::from_str::<Self>(&message_text(msg))
-                    .ok()
-                    .map(|notice| (i, notice))
-            })
-            .take_while(|(_, n)| {
-                matches!(
-                    n.phase,
-                    GoalPhase::Set | GoalPhase::Checkin | GoalPhase::Paused
-                )
-            })
-            .find(|(_, notice)| notice.phase == GoalPhase::Set);
-        let (origin, condition) = set
-            .map(|(i, notice)| (i, notice.condition.unwrap_or_default()))
-            .unwrap_or((index, String::new()));
-        Some((origin, phase, condition))
+        let mut ended = false;
+        for (index, message) in goals {
+            let Ok(notice) = serde_json::from_str::<Self>(&message_text(message)) else {
+                continue;
+            };
+            match notice.phase {
+                GoalPhase::Set => {
+                    return Some((
+                        (!ended).then_some(index),
+                        phase,
+                        notice.condition.unwrap_or_default(),
+                    ));
+                }
+                GoalPhase::Checkin | GoalPhase::Paused => {}
+                GoalPhase::Achieved | GoalPhase::Cleared | GoalPhase::Error => ended = true,
+            }
+        }
+        Some((None, phase, String::new()))
     }
 
     /// Older sessions used user rows; current clients echo raw commands as

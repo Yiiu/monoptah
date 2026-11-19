@@ -18,7 +18,8 @@ pub fn recover_claude_goal(
     settings: &Settings,
     rows: &[Row],
 ) -> Option<GoalNotice> {
-    let (start, _, condition) = GoalNotice::active_message(rows)?;
+    let (origin, _, condition) = GoalNotice::active_message(rows)?;
+    let start = origin?;
     if condition.is_empty() {
         return None;
     }
@@ -524,8 +525,29 @@ mod tests {
             );
             assert_eq!(recover(&t.rows).unwrap().phase, GoalPhase::Achieved);
         }
+        let original_command = t.rows[0].text.clone();
         t.rows[0].text = json!({"custom_type":"command", "text":"/goal other"}).to_string();
         assert!(recover(&t.rows).is_none());
+        t.rows[0].text = original_command;
+        for phase in [GoalPhase::Error, GoalPhase::Paused] {
+            t.begin("goal");
+            t.append(
+                &serde_json::to_string(&GoalNotice {
+                    phase,
+                    condition: None,
+                    notice: "update".into(),
+                })
+                .unwrap(),
+            );
+        }
+        assert_eq!(
+            GoalNotice::active(&t.rows),
+            Some((GoalPhase::Paused, condition))
+        );
+        assert!(
+            recover(&t.rows).is_none(),
+            "do not replay a completion across the terminal notice"
+        );
     }
 
     #[test]
