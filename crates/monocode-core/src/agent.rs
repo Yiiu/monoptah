@@ -109,6 +109,9 @@ pub struct Settings {
     pub turn_model: Option<TurnInfo>,
     #[serde(skip)]
     pub disable_claude_hooks: bool,
+    /// Active goal at submission, used to reconcile Claude's delayed result attachment.
+    #[serde(skip)]
+    pub claude_goal_condition: Option<String>,
     #[serde(skip)]
     pub environment: std::collections::HashMap<String, String>,
     #[serde(skip)]

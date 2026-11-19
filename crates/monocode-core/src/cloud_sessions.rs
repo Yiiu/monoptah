@@ -801,9 +801,13 @@ pub fn require_claude(harness: &str) -> Result<(), String> {
 }
 
 fn origin_url(cwd: &str) -> Result<String, String> {
-    let out = std::process::Command::new("git")
+    let mut command = std::process::Command::new("git");
+    command
         .args(["-C", cwd, "remote", "get-url", "origin"])
-        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_TERMINAL_PROMPT", "0");
+    #[cfg(windows)]
+    crate::process::configure_child(&mut command);
+    let out = command
         .output()
         .map_err(|e| format!("Cannot run git: {e}"))?;
     let url = String::from_utf8_lossy(&out.stdout).trim().to_string();

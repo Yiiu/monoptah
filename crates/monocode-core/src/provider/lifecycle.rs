@@ -50,6 +50,9 @@ impl Protocol {
         } else {
             self.request.prompt.clone()
         };
+        if !self.probe && !self.command_probe && !self.request.settings.text_only {
+            self.claude_goal = goal::TranscriptCursor::before_prompt(&self.request);
+        }
         write_json(
             stdin,
             json!({"type":"user","session_id":"","parent_tool_use_id":null,
