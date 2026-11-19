@@ -161,7 +161,10 @@ pub(crate) fn restored_context(
     {
         let db = locked(store)?;
         saved = db.context_usage(session.id)?;
-        if session.provider != "claude" || saved.is_none() {
+        if session.provider != "claude"
+            || saved.is_none()
+            || db.cloud_location(session.id)?.is_cloud()
+        {
             return Ok(saved);
         }
         account.root = db.data_dir().map(std::path::Path::to_path_buf);
@@ -178,7 +181,16 @@ pub(crate) fn restored_context(
         })
         .and_then(|(_, t)| t.metrics);
     Ok(saved.and_then(|usage| {
-        usage.restore_local_claude(&account, cwd, session.provider_id.as_deref(), turn_metrics)
+        let config_dir = settings
+            .and_then(|s| s.environment.get("CLAUDE_CONFIG_DIR"))
+            .map(String::as_str);
+        usage.restore_local_claude(
+            &account,
+            config_dir,
+            cwd,
+            session.provider_id.as_deref(),
+            turn_metrics,
+        )
     }))
 }
 

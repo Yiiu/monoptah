@@ -6,7 +6,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 impl Usage {
     /// Older clients saved Claude's turn totals as context occupancy. Recover the
@@ -14,6 +14,7 @@ impl Usage {
     pub fn restore_local_claude(
         self,
         account: &Profile,
+        config_dir: Option<&str>,
         cwd: &str,
         thread: Option<&str>,
         turn_metrics: Option<crate::agent::TurnMetrics>,
@@ -21,6 +22,9 @@ impl Usage {
         let Some(window) = self.window.filter(|&w| w > 0) else {
             return Some(self);
         };
+        if self.current {
+            return Some(self);
+        }
         let turn_total = turn_metrics.map(|m| {
             m.input_tokens
                 .saturating_add(m.cache_read_tokens)
@@ -31,18 +35,8 @@ impl Usage {
         // precedence over the earlier assistant snapshot in the transcript.
         let keep_saved = self.used > 0 && self.used <= window && Some(self.used) != turn_total;
         let used = thread.and_then(|thread| {
-            crate::accounts::transfer::codex::validate_thread_id(thread).ok()?;
-            let home = account.home(Kind::Claude).ok()?;
-            let cwd = plain_path(cwd.into());
-            let project = claude_project_dir_name(cwd.to_str()?);
-            latest_used(
-                &home
-                    .join("projects")
-                    .join(project)
-                    .join(format!("{thread}.jsonl")),
-                thread,
-                keep_saved.then_some(self.used),
-            )
+            let file = transcript_file(account, config_dir, Path::new(cwd), thread)?;
+            latest_used(file, thread, keep_saved.then_some(self.used))
         });
         match used {
             Some(HistoryReading::Compacted(Some(used))) if used <= window => {
@@ -54,6 +48,48 @@ impl Usage {
             _ => (self.used > 0 && self.used <= window).then_some(self),
         }
     }
+}
+
+fn transcript_file(
+    account: &Profile,
+    config_dir: Option<&str>,
+    cwd: &Path,
+    thread: &str,
+) -> Option<File> {
+    crate::accounts::transfer::codex::validate_thread_id(thread).ok()?;
+    // Launch applies the account environment after the session overrides,
+    // then starts Claude in the project's working directory.
+    let home = match (account.directory(Kind::Claude).ok()?, config_dir) {
+        (Some(home), _) => home,
+        (None, Some("")) => crate::accounts::home()?.join(".claude"),
+        (None, Some(dir)) => PathBuf::from(dir),
+        (None, None) => account.home(Kind::Claude).ok()?,
+    };
+    let projects = cwd.join(home).join("projects");
+    let cwd = plain_path(cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf()));
+    let project = claude_project_dir_name(cwd.to_str()?);
+    let name = format!("{thread}.jsonl");
+    let preferred = projects.join(project).join(&name);
+    if preferred.is_file() {
+        return File::open(preferred).ok();
+    }
+    // Long project names have a CLI-specific hash. A resumed session can
+    // also live under its original directory. Never guess between copies.
+    let mut matched = None;
+    for entry in projects.read_dir().ok()? {
+        let entry = entry.ok()?;
+        if !entry.file_type().ok()?.is_dir() {
+            continue;
+        }
+        let candidate = entry.path().join(&name);
+        if candidate.symlink_metadata().is_ok_and(|m| m.is_file()) {
+            if matched.is_some() {
+                return None;
+            }
+            matched = Some(candidate);
+        }
+    }
+    File::open(matched?).ok()
 }
 
 #[derive(Deserialize)]
@@ -89,11 +125,10 @@ enum HistoryReading {
     Compacted(Option<u64>),
 }
 
-fn latest_used(path: &Path, thread: &str, saved: Option<u64>) -> Option<HistoryReading> {
+fn latest_used(mut file: File, thread: &str, saved: Option<u64>) -> Option<HistoryReading> {
     // A transcript can be hundreds of MB. Inspect only its tail and deserialize
     // the fields we need, without materializing tool results or message bodies.
     const TAIL: u64 = 2 * 1024 * 1024;
-    let mut file = File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
     let mut bytes = Vec::new();
     // Most recent readings fit in a few lines. Only expand the read when e.g.
@@ -145,7 +180,12 @@ fn latest_in_lines<'a>(
         }
         if latest_request.is_none() && row.kind == "assistant" {
             if let Some(message) = row.message.filter(|m| m.model != Some("<synthetic>")) {
-                let used = ClaudeMessageUsage::default().observe(&message.usage?)?;
+                let Some(used) = message
+                    .usage
+                    .and_then(|usage| ClaudeMessageUsage::default().observe(&usage))
+                else {
+                    continue;
+                };
                 if saved.is_none() || saved == Some(used) {
                     return Some(HistoryReading::Used(used));
                 }
@@ -160,6 +200,64 @@ fn latest_in_lines<'a>(
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn context_keeps_a_confirmed_request_equal_to_the_turn_total_after_reopen() {
+        use crate::store::Store;
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("config/projects/project-hash");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("thread.jsonl"), r#"{"type":"assistant","sessionId":"thread","message":{"usage":{"input_tokens":150001}}}"#).unwrap();
+        let cwd = dir.path().to_str().unwrap();
+        let metrics = crate::agent::TurnMetrics {
+            input_tokens: 170_000,
+            ..Default::default()
+        };
+        let recover = |usage: Usage| {
+            usage
+                .restore_local_claude(
+                    &Profile::default(),
+                    Some("config"),
+                    cwd,
+                    Some("thread"),
+                    Some(metrics),
+                )
+                .unwrap()
+        };
+        let mut reading = Usage::default();
+        reading.merge(Some(170_000), Some(200_000));
+        for (name, open) in [
+            ("native", Store::open as fn(&Path) -> Result<Store, String>),
+            ("shared", Store::open_monocode),
+        ] {
+            let path = dir.path().join(name);
+            let store = open(&path).unwrap();
+            let id = store.create("claude", cwd).unwrap().id;
+            store.save_context_usage(id, &reading).unwrap();
+            drop(store);
+            let store = open(&path).unwrap();
+            assert_eq!(recover(store.context_usage(id).unwrap().unwrap()), reading);
+            let mut legacy = reading;
+            legacy.current = false;
+            store.save_context_usage(id, &legacy).unwrap();
+            assert_eq!(
+                recover(store.context_usage(id).unwrap().unwrap()).used,
+                150_001
+            );
+        }
+        // Two same-ID transcripts under unrelated project keys are ambiguous.
+        let duplicate = dir.path().join("config/projects/other-project");
+        fs::create_dir_all(&duplicate).unwrap();
+        fs::copy(project.join("thread.jsonl"), duplicate.join("thread.jsonl")).unwrap();
+        assert_eq!(
+            recover(Usage {
+                current: false,
+                ..reading
+            })
+            .used,
+            170_000
+        );
+    }
 
     #[test]
     fn context_restores_the_last_main_request_for_a_saved_windows_session() {
@@ -181,6 +279,7 @@ mod tests {
             let saved = Usage {
                 used: old,
                 window: Some(500_000),
+                ..Default::default()
             };
             let metrics = crate::agent::TurnMetrics {
                 input_tokens: old,
@@ -189,6 +288,7 @@ mod tests {
             let restored = saved
                 .restore_local_claude(
                     &account,
+                    None,
                     r"\\?\C:\dev\monoptah",
                     Some("thread"),
                     Some(metrics),
@@ -198,13 +298,15 @@ mod tests {
                 restored,
                 Usage {
                     used: 46_894,
-                    window: Some(500_000)
+                    window: Some(500_000),
+                    ..Default::default()
                 }
             );
         }
         let final_iteration = Usage {
             used: 2050,
             window: Some(500_000),
+            ..Default::default()
         };
         let metrics = crate::agent::TurnMetrics {
             input_tokens: 90_000,
@@ -213,6 +315,7 @@ mod tests {
         assert_eq!(
             final_iteration.restore_local_claude(
                 &account,
+                None,
                 r"\\?\C:\dev\monoptah",
                 Some("thread"),
                 Some(metrics)
@@ -232,14 +335,17 @@ mod tests {
         fs::create_dir_all(&project).unwrap();
         fs::write(project.join("thread.jsonl"), concat!(
             "{\"type\":\"system\",\"subtype\":\"compact_boundary\",\"sessionId\":\"thread\",\"compactMetadata\":{\"trigger\":\"manual\",\"preTokens\":52966,\"postTokens\":12022,\"cumulativeDroppedTokens\":259361}}\n",
+            "{\"type\":\"assistant\",\"sessionId\":\"thread\",\"message\":{\"content\":[]}}\n",
+            "{\"type\":\"assistant\",\"sessionId\":\"thread\",\"message\":{\"usage\":{\"input_tokens\":0}}}\n",
             "{\"type\":\"user\",\"sessionId\":\"thread\",\"isCompactSummary\":true}\n"
         )).unwrap();
         let saved = Usage {
             used: 52_966,
             window: Some(272_000),
+            ..Default::default()
         };
         assert_eq!(
-            saved.restore_local_claude(&account, "/project", Some("thread"), None),
+            saved.restore_local_claude(&account, None, "/project", Some("thread"), None),
             Some(Usage {
                 used: 12_022,
                 ..saved
@@ -263,9 +369,10 @@ mod tests {
         let saved = Usage {
             used: 12_022,
             window: Some(272_000),
+            ..Default::default()
         };
         assert_eq!(
-            saved.restore_local_claude(&account, "/project", Some("thread"), None),
+            saved.restore_local_claude(&account, None, "/project", Some("thread"), None),
             Some(Usage {
                 used: 13_080,
                 ..saved
@@ -276,7 +383,7 @@ mod tests {
             ..saved
         };
         assert_eq!(
-            final_reading.restore_local_claude(&account, "/project", Some("thread"), None),
+            final_reading.restore_local_claude(&account, None, "/project", Some("thread"), None),
             Some(final_reading)
         );
     }
@@ -288,9 +395,10 @@ mod tests {
         let saved = Usage {
             used: 1_647_660,
             window: Some(500_000),
+            ..Default::default()
         };
         assert_eq!(
-            saved.restore_local_claude(&account, "/project", Some("../wrong"), None),
+            saved.restore_local_claude(&account, None, "/project", Some("../wrong"), None),
             None
         );
         let project = account
@@ -305,11 +413,11 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            valid.restore_local_claude(&account, "/project", Some("thread"), Some(metrics)),
+            valid.restore_local_claude(&account, None, "/project", Some("thread"), Some(metrics)),
             None
         );
         assert_eq!(
-            valid.restore_local_claude(&account, "/project", Some("missing"), None),
+            valid.restore_local_claude(&account, None, "/project", Some("missing"), None),
             Some(valid)
         );
     }

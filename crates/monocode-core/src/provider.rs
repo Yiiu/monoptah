@@ -359,8 +359,8 @@ impl Protocol {
         }
         events.push(Event::Text(text));
     }
-    /// A streamed assistant snapshot can precede the final usage delta. Keep the
-    /// counters for this main-thread request until its message stops.
+    /// Assistant snapshots can arrive before the final delta or after message_stop.
+    /// Keep the main request's counters until the next request or compaction.
     fn claude_context_used(&mut self, frame: &Value) -> Option<u64> {
         if !frame["parent_tool_use_id"].is_null() {
             return None;
@@ -380,14 +380,13 @@ impl Protocol {
                 match event["type"].as_str()? {
                     "message_start" => {
                         self.claude_after_boundary = false;
-                        self.claude_stream_usage = Some(Default::default());
-                        &event["message"]
+                        let message = &event["message"];
+                        self.claude_stream_usage
+                            .get_or_insert_with(Default::default)
+                            .start_message(message["id"].as_str());
+                        message
                     }
                     "message_delta" => event,
-                    "message_stop" => {
-                        self.claude_stream_usage = None;
-                        return None;
-                    }
                     _ => return None,
                 }
             }
@@ -2191,7 +2190,13 @@ mod tests {
                 stream(json!({"type":"message_delta","usage":{"output_tokens":7}})),
                 57,
             ),
-            // A retry can start with an identified snapshot before the old stop arrives.
+            (stream(json!({"type":"message_stop"})), 57),
+            // A snapshot for the stopped message still carries start-of-stream counts.
+            (
+                json!({"type":"assistant","message":{"id":"first","usage":{"input_tokens":50,"output_tokens":1}}}),
+                57,
+            ),
+            // A retry can start with an identified snapshot before its stream_start.
             (
                 json!({"type":"assistant","message":{"id":"retry","usage":{"cache_read_input_tokens":4000}}}),
                 4000,
@@ -2204,6 +2209,11 @@ mod tests {
                 stream(
                     json!({"type":"message_delta","usage":{"input_tokens":90000,"iterations":[{"input_tokens":60000},{"input_tokens":30000}]}}),
                 ),
+                30000,
+            ),
+            (stream(json!({"type":"message_stop"})), 30000),
+            (
+                json!({"type":"assistant","message":{"id":"retry","usage":{"iterations":[{"input_tokens":60000}]}}}),
                 30000,
             ),
         ] {
@@ -2226,6 +2236,7 @@ mod tests {
         let mut context = crate::context::Usage {
             used: 52_966,
             window: Some(272_000),
+            ..Default::default()
         };
         for (frame, expected) in [
             (
@@ -2286,6 +2297,7 @@ mod tests {
             let mut context = crate::context::Usage {
                 used: 300_000,
                 window: Some(500_000),
+                ..Default::default()
             };
             let events = claude
                 .frame(
@@ -2332,6 +2344,7 @@ mod tests {
                 crate::context::Usage {
                     used: 210_500,
                     window: Some(500_000),
+                    current: true,
                 }
             );
         }

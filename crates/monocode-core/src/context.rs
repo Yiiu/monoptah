@@ -7,6 +7,10 @@ use serde_json::Value;
 pub struct Usage {
     pub used: u64,
     pub window: Option<u64>,
+    /// Set when a provider supplies the current occupancy. Older saved counts
+    /// can instead be totals for several requests in one turn.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub current: bool,
 }
 impl Usage {
     pub fn ratio(self) -> Option<f32> {
@@ -17,6 +21,7 @@ impl Usage {
     pub fn merge(&mut self, used: Option<u64>, window: Option<u64>) {
         if let Some(used) = used {
             self.used = used;
+            self.current = true;
         }
         if let Some(window) = window.filter(|w| *w > 0) {
             self.window = Some(window);
@@ -35,10 +40,19 @@ const CLAUDE_TOKEN_FIELDS: [&str; 4] = [
 pub(crate) struct ClaudeMessageUsage {
     message_id: Option<String>,
     counts: [u64; CLAUDE_TOKEN_FIELDS.len()],
-    has_iteration_usage: bool,
+    iteration_count: usize,
 }
 
 impl ClaudeMessageUsage {
+    pub(crate) fn start_message(&mut self, id: Option<&str>) {
+        if id.is_none() || self.message_id.as_deref() != id {
+            *self = Self {
+                message_id: id.map(str::to_owned),
+                ..Self::default()
+            };
+        }
+    }
+
     pub(crate) fn select_message(&mut self, id: &str) {
         if self.message_id.as_deref().is_some_and(|old| old != id) {
             *self = Self::default();
@@ -48,18 +62,20 @@ impl ClaudeMessageUsage {
 
     /// Each frame can report just some of the cumulative counters for one request.
     pub(crate) fn observe(&mut self, usage: &Value) -> Option<u64> {
-        if let Some(used) = usage["iterations"]
-            .as_array()
-            .and_then(|v| v.last())
-            .and_then(claude_used)
-        {
-            self.has_iteration_usage = true;
-            return Some(used);
-        }
-        // After a server-side iteration breakdown, top-level totals span iterations.
-        if self.has_iteration_usage {
-            return None;
-        }
+        let iterations = usage["iterations"].as_array();
+        let usage = match iterations.and_then(|list| list.last().map(|last| (list.len(), last))) {
+            Some((count, last)) if claude_used(last).is_some() && count >= self.iteration_count => {
+                if count > self.iteration_count {
+                    self.counts = [0; CLAUDE_TOKEN_FIELDS.len()];
+                    self.iteration_count = count;
+                }
+                last
+            }
+            // Once an iteration is known, an older snapshot or a turn total
+            // cannot refine its per-request counters.
+            _ if self.iteration_count > 0 => return None,
+            _ => usage,
+        };
         let mut reported = false;
         for (count, field) in self.counts.iter_mut().zip(CLAUDE_TOKEN_FIELDS) {
             if let Some(value) = usage[field].as_u64() {

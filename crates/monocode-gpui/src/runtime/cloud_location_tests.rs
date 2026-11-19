@@ -34,6 +34,47 @@ fn moved_session(store: &mut Store) -> Session {
 }
 
 #[test]
+fn restored_context_keeps_cloud_usage_when_a_local_transcript_remains() {
+    let mut store = Store::open(std::path::Path::new(":memory:")).unwrap();
+    let mut summary = moved_session(&mut store);
+    summary.provider_id = Some("thread".into());
+    let home = std::env::temp_dir().join(format!(
+        "monoptah-cloud-context-{}",
+        monocode_core::mono::new_id()
+    ));
+    let project = home.join("projects/-Users-me-repo");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("thread.jsonl"), r#"{"type":"system","subtype":"compact_boundary","sessionId":"thread","compactMetadata":{"postTokens":12022}}"#).unwrap();
+    let mut settings = Settings::default();
+    settings
+        .environment
+        .insert("CLAUDE_CONFIG_DIR".into(), home.to_str().unwrap().into());
+    let saved = monocode_core::context::Usage {
+        used: 90_000,
+        window: Some(200_000),
+        ..Default::default()
+    };
+    store.save_context_usage(summary.id, &saved).unwrap();
+    let store = Arc::new(Mutex::new(store));
+    assert_eq!(
+        restored_context(&store, &summary, Some(&settings)).unwrap(),
+        Some(saved)
+    );
+    locked(&store)
+        .unwrap()
+        .reset_cloud_location_to_local(summary.id)
+        .unwrap();
+    assert_eq!(
+        restored_context(&store, &summary, Some(&settings))
+            .unwrap()
+            .unwrap()
+            .used,
+        12_022
+    );
+    std::fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
 fn the_local_runtime_refuses_a_cloud_session_before_it_starts_a_turn() {
     let mut store = Store::open(std::path::Path::new(":memory:")).unwrap();
     let summary = moved_session(&mut store);
