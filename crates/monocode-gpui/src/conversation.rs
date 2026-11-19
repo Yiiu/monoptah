@@ -1310,18 +1310,30 @@ impl Conversation {
     /// from the most recent `Goal set` row; checkins and pauses carry none.
     fn goal_state(&self, cx: &gpui::App) -> Option<(GoalPhase, String)> {
         let rows = self.transcript.read(cx).source_rows();
-        let last = rows.iter().rev().find(|row| row.role == "goal")?;
-        let notice = serde_json::from_str::<GoalNotice>(&last.text).ok()?;
-        let phase = match notice.phase {
-            GoalPhase::Set | GoalPhase::Checkin => GoalPhase::Set,
+        let mut notices = rows
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(_, row)| row.first && row.role == "goal")
+            .map(|(start, first)| {
+                let continuations = rows[start + 1..]
+                    .iter()
+                    .take_while(|row| !row.first && row.role == "goal");
+                let text: String = std::iter::once(first)
+                    .chain(continuations)
+                    .map(|row| row.text.as_str())
+                    .collect();
+                serde_json::from_str::<GoalNotice>(&text).ok()
+            });
+        let latest = notices.next()??;
+        let phase = match latest.phase {
+            GoalPhase::Set => return Some((GoalPhase::Set, latest.condition.unwrap_or_default())),
+            GoalPhase::Checkin => GoalPhase::Set,
             GoalPhase::Paused => GoalPhase::Paused,
             GoalPhase::Cleared | GoalPhase::Achieved | GoalPhase::Error => return None,
         };
-        let condition = rows
-            .iter()
-            .rev()
-            .filter(|row| row.role == "goal")
-            .filter_map(|row| serde_json::from_str::<GoalNotice>(&row.text).ok())
+        let condition = notices
+            .flatten()
             .find(|notice| notice.phase == GoalPhase::Set)
             .and_then(|notice| notice.condition)
             .unwrap_or_default();
@@ -1341,8 +1353,15 @@ impl Conversation {
                 this.goal_open = !this.goal_open;
                 cx.notify();
             };
+        let focusable = |button: gpui::Stateful<gpui::Div>| {
+            button
+                .tab_index(0)
+                .focus_visible(|s| s.border_2().border_color(content(0.8)))
+        };
+        let can_clear = !self.busy && !self.stopping;
         let summary = div()
             .id("goal-state")
+            .map(focusable)
             .debug_selector(|| "goal-state".into())
             .role(Role::Button)
             .aria_label(format!("{label}：{condition}"))
@@ -1363,7 +1382,14 @@ impl Conversation {
                     .text_color(content(0.85))
                     .child(label),
             )
-            .child(div().min_w_0().truncate().child(condition))
+            .child(
+                div()
+                    .id("goal-summary-text")
+                    .debug_selector(|| "goal-summary-text".into())
+                    .min_w_0()
+                    .truncate()
+                    .child(condition.lines().collect::<Vec<_>>().join(" ")),
+            )
             .on_click(cx.listener(toggle));
         let card = composer_shelf::card("goal-card", self.classic_layout)
             .debug_selector(|| "goal-card".into())
@@ -1380,15 +1406,24 @@ impl Conversation {
             .child(self.goal_anchor.probe())
             .child(summary)
             .child(
-                icon_button("goal-clear", "清除目标", "trash")
+                icon_button_enabled("goal-clear", "清除目标", "trash", can_clear)
                     .debug_selector(|| "goal-clear".into())
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.goal_open = false;
-                        this.launch_prompt("/goal clear".into(), cx);
-                    })),
+                    .when(!can_clear, |d| {
+                        d.cursor_default()
+                            .aria_description("当前回合结束后可清除目标")
+                    })
+                    .when(can_clear, |d| {
+                        focusable(d).on_click(cx.listener(|this, _, _, cx| {
+                            if !this.busy && !this.stopping {
+                                this.goal_open = false;
+                                this.launch_prompt("/goal clear".into(), cx);
+                            }
+                        }))
+                    }),
             )
             .child(
                 icon_button("goal-expand", "查看完整目标", "maximize")
+                    .map(focusable)
                     .debug_selector(|| "goal-expand".into())
                     .aria_expanded(self.goal_open)
                     .on_click(cx.listener(toggle)),
@@ -1419,6 +1454,7 @@ impl Conversation {
                 .child(
                     div()
                         .id("goal-condition-text")
+                        .debug_selector(|| "goal-condition-text".into())
                         .p_3()
                         .text_size(px(12.5))
                         .line_height(px(20.))
