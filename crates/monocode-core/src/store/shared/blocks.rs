@@ -160,7 +160,7 @@ fn project_content(block: &Value) -> Result<Vec<Row>, String> {
         }
         t.begin(match role {
             "user" if block["internal"] == true => "mono-system",
-            "user" | "assistant" | "reasoning" | "error" | "mono-card" | "visual" => role,
+            "user" | "assistant" | "reasoning" | "error" | "mono-card" | "visual" | "goal" => role,
             "system" if block["notice"] == "error" => "error",
             "plan" | "tasks" => "assistant",
             _ => "system",

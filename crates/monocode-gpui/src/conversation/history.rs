@@ -3,6 +3,47 @@ use super::*;
 
 pub(super) type HistoryAction = Box<dyn FnOnce(&mut Conversation, &mut Context<Conversation>)>;
 
+/// Commit disk evidence only while the local binding and transcript it was
+/// scanned for still match. Another load may already have appended the notice.
+pub(super) fn finish_goal_recovery(
+    db: &mut monocode_core::store::Store,
+    id: i64,
+    session: &str,
+    cwd: &str,
+    config: &Settings,
+    history: &mut monocode_core::transcript::Transcript,
+    notice: &GoalNotice,
+) -> Result<(), String> {
+    if db.cloud_location(id)?.is_cloud() {
+        return Ok(());
+    }
+    let current = db.load(id)?;
+    if current.rows != history.rows {
+        *history = current;
+        return Ok(());
+    }
+    let saved = db.agent_settings(id)?.unwrap_or_default();
+    if saved.account.id != config.account.id
+        || saved.environment.get("CLAUDE_CONFIG_DIR") != config.environment.get("CLAUDE_CONFIG_DIR")
+        || !db.sessions()?.iter().any(|s| {
+            s.id == id
+                && s.provider == Kind::Claude.id()
+                && s.provider_id.as_deref() == Some(session)
+                && saved.worktree_cwd.as_deref().unwrap_or(&s.cwd) == cwd
+        })
+    {
+        return Ok(());
+    }
+    let text = serde_json::to_string(notice).map_err(|e| e.to_string())?;
+    let at = history.begin("goal");
+    history.append(&text);
+    if let Err(error) = db.write_rows(id, at, &history.rows[at..]) {
+        history.rows.truncate(at);
+        eprintln!("Could not save recovered Claude Goal state: {error}");
+    }
+    Ok(())
+}
+
 impl Conversation {
     pub(super) fn history_ready(&self) -> bool {
         self.loaded && !self.history_unloaded && !self.loading

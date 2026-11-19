@@ -768,6 +768,12 @@ fn run_turn_using(
                 prompt = discovery.prepend(prompt);
             }
         }
+        if kind == Kind::Claude {
+            settings.claude_goal_condition =
+                monocode_core::transcript::GoalNotice::active(&transcript.rows)
+                    .map(|(_, condition)| condition)
+                    .filter(|condition| !condition.is_empty());
+        }
         let request = Request {
             kind,
             binary,
