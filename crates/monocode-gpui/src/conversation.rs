@@ -910,25 +910,68 @@ impl Conversation {
         let store = self.store.clone();
         let id = self.summary.id;
         let mono = self.settings.mono.is_some();
+        let recover_goal = (self.summary.provider == Kind::Claude.id() && !self.busy)
+            .then(|| {
+                let session = self.summary.provider_id.clone()?;
+                let root = crate::accounts::get(cx).map(|center| center.read(cx).root.clone());
+                Some((session, self.summary.cwd.clone(), root))
+            })
+            .flatten();
         let work = cx.background_executor().spawn(async move {
             let settings = locked(&store).and_then(|s| s.agent_settings(id));
             (
-                locked(&store)
-                    .and_then(|s| {
-                        let history = s.load(id)?;
-                        let edits = if mono {
-                            Vec::new()
-                        } else {
-                            git_actions::restored_session_edits(&s, id, &history.rows)?
-                        };
-                        Ok((history, edits))
-                    })
-                    .map(|(history, edits)| {
+                (|| {
+                    let (mut history, local) = {
+                        let db = locked(&store)?;
                         (
-                            crate::transcript::PreparedHistory::new(history.rows, mono),
-                            edits,
+                            db.load(id)?,
+                            recover_goal.is_some()
+                                && db
+                                    .cloud_location(id)
+                                    .is_ok_and(|location| !location.is_cloud()),
                         )
-                    }),
+                    };
+                    if local
+                        && let Some((session, cwd, root)) = recover_goal
+                        && let Ok(config) = &settings
+                    {
+                        let mut config = config.clone().unwrap_or_default();
+                        config.account.root = root;
+                        let cwd = config.worktree_cwd.as_deref().unwrap_or(&cwd);
+                        // Reading a local provider's full JSONL can be slow. No
+                        // store guard is held during this scan.
+                        if let Some(notice) = monocode_core::provider::recover_claude_goal(
+                            Path::new(cwd),
+                            &session,
+                            &config,
+                            &history.rows,
+                        ) {
+                            let mut db = locked(&store)?;
+                            history::finish_goal_recovery(
+                                &mut db,
+                                id,
+                                &session,
+                                cwd,
+                                &config,
+                                &mut history,
+                                &notice,
+                            )?;
+                        }
+                    }
+                    let edits = if mono {
+                        Vec::new()
+                    } else {
+                        let db = locked(&store)?;
+                        git_actions::restored_session_edits(&db, id, &history.rows)?
+                    };
+                    Ok((history, edits))
+                })()
+                .map(|(history, edits)| {
+                    (
+                        crate::transcript::PreparedHistory::new(history.rows, mono),
+                        edits,
+                    )
+                }),
                 settings,
                 locked(&store).and_then(|s| s.context_usage(id)),
                 locked(&store).and_then(|s| s.follow_ups(id)),
@@ -1309,23 +1352,7 @@ impl Conversation {
     /// alone, and a cleared or achieved one shows nothing. The condition comes
     /// from the most recent `Goal set` row; checkins and pauses carry none.
     fn goal_state(&self, cx: &gpui::App) -> Option<(GoalPhase, String)> {
-        let rows = self.transcript.read(cx).source_rows();
-        let last = rows.iter().rev().find(|row| row.role == "goal")?;
-        let notice = serde_json::from_str::<GoalNotice>(&last.text).ok()?;
-        let phase = match notice.phase {
-            GoalPhase::Set | GoalPhase::Checkin => GoalPhase::Set,
-            GoalPhase::Paused => GoalPhase::Paused,
-            GoalPhase::Cleared | GoalPhase::Achieved | GoalPhase::Error => return None,
-        };
-        let condition = rows
-            .iter()
-            .rev()
-            .filter(|row| row.role == "goal")
-            .filter_map(|row| serde_json::from_str::<GoalNotice>(&row.text).ok())
-            .find(|notice| notice.phase == GoalPhase::Set)
-            .and_then(|notice| notice.condition)
-            .unwrap_or_default();
-        Some((phase, condition))
+        GoalNotice::active(self.transcript.read(cx).source_rows())
     }
     /// The active goal as a capsule above the composer, in the stroked-pill
     /// family of the Commit shelf: a breathing accent dot while the goal
