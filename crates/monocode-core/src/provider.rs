@@ -2316,6 +2316,8 @@ mod tests {
                 }
             }
             assert_eq!(context.used, 210_500);
+            let observed_at_ms = context.observed_at_ms;
+            assert!(observed_at_ms.is_some());
             let mut result = json!({
                 "type":"result",
                 "usage":{"input_tokens":1_800_000,"output_tokens":125},
@@ -2345,6 +2347,7 @@ mod tests {
                     used: 210_500,
                     window: Some(500_000),
                     current: true,
+                    observed_at_ms,
                 }
             );
         }

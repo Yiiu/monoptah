@@ -22,28 +22,36 @@ impl Usage {
         let Some(window) = self.window.filter(|&w| w > 0) else {
             return Some(self);
         };
-        if self.current {
-            return Some(self);
-        }
-        let turn_total = turn_metrics.map(|m| {
-            m.input_tokens
-                .saturating_add(m.cache_read_tokens)
-                .saturating_add(m.cache_write_tokens)
-                .saturating_add(m.output_tokens)
-        });
-        // A valid per-request reading (possibly from a final iteration) takes
-        // precedence over the earlier assistant snapshot in the transcript.
-        let keep_saved = self.used > 0 && self.used <= window && Some(self.used) != turn_total;
+        let retention = if self.current {
+            let Some(at) = self.observed_at_ms else {
+                // This older marker has no ordering information.
+                return Some(self);
+            };
+            Retention::Confirmed(at)
+        } else {
+            let turn_total = turn_metrics.map(|m| {
+                m.input_tokens
+                    .saturating_add(m.cache_read_tokens)
+                    .saturating_add(m.cache_write_tokens)
+                    .saturating_add(m.output_tokens)
+            });
+            let plausible = self.used > 0 && self.used <= window && Some(self.used) != turn_total;
+            Retention::Legacy(plausible.then_some(self.used))
+        };
         let used = thread.and_then(|thread| {
             let file = transcript_file(account, config_dir, Path::new(cwd), thread)?;
-            latest_used(file, thread, keep_saved.then_some(self.used))
+            latest_used(file, thread, retention)
         });
         match used {
-            Some(HistoryReading::Compacted(Some(used))) if used <= window => {
+            Some(HistoryReading::NewerBoundary(used)) => used
+                .filter(|used| *used <= window)
+                .map(|used| Self { used, ..self }),
+            Some(HistoryReading::Compacted(Some(used)) | HistoryReading::Used(used))
+                if used <= window =>
+            {
                 Some(Self { used, ..self })
             }
-            Some(HistoryReading::Used(used)) if used <= window => Some(Self { used, ..self }),
-            _ if keep_saved => Some(self),
+            _ if !matches!(retention, Retention::Legacy(None)) => Some(self),
             Some(HistoryReading::Compacted(_)) => None,
             _ => (self.used > 0 && self.used <= window).then_some(self),
         }
@@ -102,6 +110,7 @@ struct Record<'a> {
     is_sidechain: bool,
     #[serde(rename = "parent_tool_use_id")]
     parent: Option<&'a str>,
+    timestamp: Option<&'a str>,
     subtype: Option<&'a str>,
     compact_metadata: Option<CompactMetadata>,
     #[serde(borrow)]
@@ -120,12 +129,32 @@ struct CompactMetadata {
     post_tokens: Option<u64>,
 }
 
+#[derive(Clone, Copy)]
+enum Retention {
+    /// A plausible (but unverified) legacy count, if available.
+    Legacy(Option<u64>),
+    /// Unix milliseconds at which a main-thread provider reading was received.
+    Confirmed(u64),
+}
+
 enum HistoryReading {
     Used(u64),
     Compacted(Option<u64>),
+    /// A boundary newer than the last live measurement invalidates that count,
+    /// even if Claude didn't record a replacement.
+    NewerBoundary(Option<u64>),
+    Preserve,
 }
 
-fn latest_used(mut file: File, thread: &str, saved: Option<u64>) -> Option<HistoryReading> {
+fn recorded_at(timestamp: Option<&str>) -> Option<u64> {
+    chrono::DateTime::parse_from_rfc3339(timestamp?)
+        .ok()?
+        .timestamp_millis()
+        .try_into()
+        .ok()
+}
+
+fn latest_used(mut file: File, thread: &str, retention: Retention) -> Option<HistoryReading> {
     // A transcript can be hundreds of MB. Inspect only its tail and deserialize
     // the fields we need, without materializing tool results or message bodies.
     const TAIL: u64 = 2 * 1024 * 1024;
@@ -142,7 +171,7 @@ fn latest_used(mut file: File, thread: &str, saved: Option<u64>) -> Option<Histo
         if start > 0 {
             lines.next();
         }
-        if let Some(reading) = latest_in_lines(lines.rev(), thread, saved) {
+        if let Some(reading) = latest_in_lines(lines.rev(), thread, retention) {
             return Some(reading);
         }
         if start == 0 {
@@ -155,9 +184,9 @@ fn latest_used(mut file: File, thread: &str, saved: Option<u64>) -> Option<Histo
 fn latest_in_lines<'a>(
     lines: impl Iterator<Item = &'a [u8]>,
     thread: &str,
-    saved: Option<u64>,
+    retention: Retention,
 ) -> Option<HistoryReading> {
-    let mut latest_request = None;
+    let mut latest_request: Option<(u64, Option<u64>)> = None;
     for line in lines {
         let Ok(row) = serde_json::from_slice::<Record>(line) else {
             continue;
@@ -167,7 +196,19 @@ fn latest_in_lines<'a>(
         }
         if row.kind == "system" && row.subtype == Some("compact_boundary") {
             let post = row.compact_metadata.and_then(|m| m.post_tokens);
-            if let (Some(latest), Some(saved)) = (latest_request, saved) {
+            if let Retention::Confirmed(observed) = retention {
+                // A fresh file mtime or a late copy of an assistant snapshot is
+                // not evidence that compaction happened after the live event.
+                let Some(at) = recorded_at(row.timestamp).filter(|at| *at > observed) else {
+                    return Some(HistoryReading::Preserve);
+                };
+                let after = latest_request.filter(|(_, time)| time.is_some_and(|t| t >= at));
+                return Some(HistoryReading::NewerBoundary(
+                    after.map(|(used, _)| used).or(post),
+                ));
+            }
+            if let (Some((latest, _)), Retention::Legacy(Some(saved))) = (latest_request, retention)
+            {
                 // Only replace a plausible saved reading when it is still the
                 // previous boundary's count, not a later final iteration.
                 return Some(HistoryReading::Used(if post == Some(saved) {
@@ -186,10 +227,11 @@ fn latest_in_lines<'a>(
                 else {
                     continue;
                 };
-                if saved.is_none() || saved == Some(used) {
+                if matches!(retention, Retention::Legacy(saved) if saved.is_none() || saved == Some(used))
+                {
                     return Some(HistoryReading::Used(used));
                 }
-                latest_request = Some(used);
+                latest_request = Some((used, recorded_at(row.timestamp)));
             }
         }
     }
@@ -200,6 +242,75 @@ fn latest_in_lines<'a>(
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn confirmed_context_yields_only_to_a_provably_newer_main_compaction() {
+        use serde_json::json;
+        let home = tempfile::tempdir().unwrap();
+        let account = Profile::new("fixture", home.path());
+        let project = account
+            .home(Kind::Claude)
+            .unwrap()
+            .join("projects/-project");
+        fs::create_dir_all(&project).unwrap();
+        let path = project.join("thread.jsonl");
+        let at = "2030-01-01T00:00:00.000Z";
+        let after = "2030-01-01T00:00:03.000Z";
+        let saved = Usage {
+            used: 170_000,
+            window: Some(200_000),
+            current: true,
+            observed_at_ms: Some(1_893_456_000_000),
+        };
+        let boundary = |time: Option<&str>, count: Option<u64>| json!({"type":"system","subtype":"compact_boundary","sessionId":"thread","timestamp":time,"compactMetadata":{"postTokens":count}});
+        let snapshot = |time: &str, used| json!({"type":"assistant","sessionId":"thread","timestamp":time,"message":{"usage":{"input_tokens":used}}});
+        let restore = |rows: &[Value]| {
+            fs::write(
+                &path,
+                rows.iter()
+                    .map(Value::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+            .unwrap();
+            saved
+                .restore_local_claude(&account, None, "/project", Some("thread"), None)
+                .map(|u| u.used)
+        };
+        let old_snapshot = snapshot(at, 150_001);
+        for time in [
+            None,
+            Some("no clock"),
+            Some("2029-12-31T23:59:59.999Z"),
+            Some(at),
+        ] {
+            assert_eq!(
+                restore(&[boundary(time, Some(12022)), old_snapshot.clone()]),
+                Some(170_000)
+            );
+        }
+        // Even a late-written snapshot isn't a compaction. Cross-thread and
+        // sidechain boundaries must also leave the main reading alone.
+        let mut other = boundary(Some(after), Some(42));
+        other["sessionId"] = json!("other");
+        let mut side = boundary(Some(after), Some(33));
+        side["isSidechain"] = json!(true);
+        assert_eq!(
+            restore(&[snapshot(after, 150_001), other, side]),
+            Some(170_000)
+        );
+        let fresh = boundary(Some(after), Some(12_022));
+        assert_eq!(
+            restore(&[old_snapshot.clone(), fresh.clone()]),
+            Some(12_022)
+        );
+        assert_eq!(restore(&[fresh.clone(), old_snapshot]), Some(12_022));
+        assert_eq!(
+            restore(&[fresh, snapshot("2030-01-01T00:00:04Z", 13_080)]),
+            Some(13_080)
+        );
+        assert_eq!(restore(&[boundary(Some(after), None)]), None);
+    }
 
     #[test]
     fn context_keeps_a_confirmed_request_equal_to_the_turn_total_after_reopen() {

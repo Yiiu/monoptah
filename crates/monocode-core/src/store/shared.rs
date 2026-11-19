@@ -1103,15 +1103,15 @@ impl Store {
         };
         let used = used as u64;
         let window = window.filter(|w| *w > 0).map(|w| w as u64);
-        let current = self
+        let confirmed = self
             .shared_setting(&format!("context:{id}"))?
             .and_then(|raw| serde_json::from_str::<Usage>(&raw).ok())
-            .is_some_and(|saved| saved.current && saved.used == used && saved.window == window);
-        Ok(Some(Usage {
+            .filter(|saved| saved.current && saved.used == used && saved.window == window);
+        Ok(Some(confirmed.unwrap_or(Usage {
             used,
             window,
-            current,
-        }))
+            ..Default::default()
+        })))
     }
     /// The blocks whose rows this store numbers: an indexed Mono's window, the
     /// chunked backend's stored blocks, or the whole history of one stored as

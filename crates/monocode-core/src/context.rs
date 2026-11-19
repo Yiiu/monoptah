@@ -11,6 +11,10 @@ pub struct Usage {
     /// can instead be totals for several requests in one turn.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub current: bool,
+    /// Unix milliseconds when a used count arrived, not when it was saved or
+    /// the window size changed. Claude's local transcript uses the same clock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at_ms: Option<u64>,
 }
 impl Usage {
     pub fn ratio(self) -> Option<f32> {
@@ -22,6 +26,7 @@ impl Usage {
         if let Some(used) = used {
             self.used = used;
             self.current = true;
+            self.observed_at_ms = Some(crate::time::now_ms());
         }
         if let Some(window) = window.filter(|w| *w > 0) {
             self.window = Some(window);
