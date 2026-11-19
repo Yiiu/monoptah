@@ -97,14 +97,25 @@ impl GoalNotice {
             GoalPhase::Paused => GoalPhase::Paused,
             _ => return None,
         };
+        // A checkin or pause changes the displayed phase, not when this
+        // goal began. Recovery must still search from its original Set.
         let set = goals
-            .filter_map(|(_, msg)| serde_json::from_str::<Self>(&message_text(msg)).ok())
-            .find(|notice| notice.phase == GoalPhase::Set);
-        Some((
-            index,
-            phase,
-            set.and_then(|notice| notice.condition).unwrap_or_default(),
-        ))
+            .filter_map(|(i, msg)| {
+                serde_json::from_str::<Self>(&message_text(msg))
+                    .ok()
+                    .map(|notice| (i, notice))
+            })
+            .take_while(|(_, n)| {
+                matches!(
+                    n.phase,
+                    GoalPhase::Set | GoalPhase::Checkin | GoalPhase::Paused
+                )
+            })
+            .find(|(_, notice)| notice.phase == GoalPhase::Set);
+        let (origin, condition) = set
+            .map(|(i, notice)| (i, notice.condition.unwrap_or_default()))
+            .unwrap_or((index, String::new()));
+        Some((origin, phase, condition))
     }
 
     /// Older sessions used user rows; current clients echo raw commands as

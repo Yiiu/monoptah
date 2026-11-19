@@ -504,6 +504,26 @@ mod tests {
             Some((GoalPhase::Set, condition.clone()))
         );
         assert_eq!(recover(&t.rows).unwrap().phase, GoalPhase::Achieved);
+        for (phase, displayed) in [
+            (GoalPhase::Checkin, GoalPhase::Set),
+            (GoalPhase::Paused, GoalPhase::Paused),
+        ] {
+            let i = t.begin("goal");
+            t.rows[i].sent_at = Some(4_000);
+            t.append(
+                &serde_json::to_string(&GoalNotice {
+                    phase,
+                    condition: None,
+                    notice: "update".into(),
+                })
+                .unwrap(),
+            );
+            assert_eq!(
+                GoalNotice::active(&t.rows),
+                Some((displayed, condition.clone()))
+            );
+            assert_eq!(recover(&t.rows).unwrap().phase, GoalPhase::Achieved);
+        }
         t.rows[0].text = json!({"custom_type":"command", "text":"/goal other"}).to_string();
         assert!(recover(&t.rows).is_none());
     }
