@@ -9,6 +9,8 @@ use std::{
     time::Instant,
 };
 
+pub(super) const RADIUS: f32 = 10.;
+
 #[derive(Default)]
 pub(super) struct Motion {
     card: RefCell<Option<PaneSlide>>,
@@ -37,7 +39,7 @@ pub(super) fn frame(classic_layout: bool) -> Div {
         0.08
     };
     div()
-        .rounded_t(px(10.))
+        .rounded_t(px(RADIUS))
         .border_1()
         .border_b_0()
         .border_color(content(border_alpha))
