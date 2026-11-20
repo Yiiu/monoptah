@@ -84,7 +84,7 @@ impl Target {
     }
 }
 #[cfg(all(test, windows))]
-mod tests {
+mod windows_tests {
     use super::*;
 
     #[test]
@@ -117,7 +117,8 @@ mod tests {
                 path,
                 location: actual_location,
                 ..
-            } = Target::resolve(url, Some(r"D:\other\workspace")).expect("absolute file target")
+            } = Target::resolve(url, Some(r"D:\other\workspace"), &[])
+                .expect("absolute file target")
             else {
                 panic!("expected a file target: {source}");
             };
