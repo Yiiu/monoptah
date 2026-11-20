@@ -409,13 +409,22 @@ impl Store {
     }
     pub fn save_context_usage(&self, id: i64, usage: &crate::context::Usage) -> Result<(), String> {
         if self.shared.is_some() {
-            return self.shared_patch(
+            self.shared_patch(
                 id,
                 &[
                     ("context_used", serde_json::json!(usage.used)),
                     ("context_window", serde_json::json!(usage.window)),
                 ],
-            );
+            )?;
+            // The desktop schema has no provenance field. Bind our marker to
+            // the exact reading so a different desktop write invalidates it.
+            let key = format!("context:{id}");
+            return if usage.current {
+                let reading = serde_json::to_string(usage).map_err(|e| e.to_string())?;
+                self.shared_save_setting(&key, &reading)
+            } else {
+                self.shared_delete_setting(&key)
+            };
         }
 
         self.conn.execute("INSERT INTO native_settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![format!("context:{id}"), serde_json::to_string(usage).map_err(|e| e.to_string())?]).map_err(|e| e.to_string())?;

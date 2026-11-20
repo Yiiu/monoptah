@@ -1098,10 +1098,20 @@ impl Store {
             [self.persisted_session_id(id)?],
             |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<i64>>(1)?)),
         ))?;
-        Ok(used.filter(|u| *u >= 0).map(|used| Usage {
-            used: used as u64,
-            window: window.filter(|w| *w > 0).map(|w| w as u64),
-        }))
+        let Some(used) = used.filter(|u| *u >= 0) else {
+            return Ok(None);
+        };
+        let used = used as u64;
+        let window = window.filter(|w| *w > 0).map(|w| w as u64);
+        let confirmed = self
+            .shared_setting(&format!("context:{id}"))?
+            .and_then(|raw| serde_json::from_str::<Usage>(&raw).ok())
+            .filter(|saved| saved.current && saved.used == used && saved.window == window);
+        Ok(Some(confirmed.unwrap_or(Usage {
+            used,
+            window,
+            ..Default::default()
+        })))
     }
     /// The blocks whose rows this store numbers: an indexed Mono's window, the
     /// chunked backend's stored blocks, or the whole history of one stored as
@@ -2560,6 +2570,7 @@ impl Store {
         sql(self
             .conn
             .execute("DELETE FROM sessions WHERE id=?1", [original]))?;
+        self.shared_delete_setting(&format!("context:{id}"))?;
         sql(tx.commit())?;
         self.shared
             .as_ref()

@@ -155,8 +155,15 @@ impl Conversation {
         self.transcript.update(cx, |view, cx| {
             view.patch(compact_start, vec![compact_row.clone()], cx);
         });
-        let compact_draft = self.input.read(cx).content.clone();
-        let clear_command = compact_draft.trim().eq_ignore_ascii_case("/compact");
+        if self
+            .input
+            .read(cx)
+            .content
+            .trim()
+            .eq_ignore_ascii_case("/compact")
+        {
+            self.input.update(cx, |input, cx| input.take(cx));
+        }
         let store = self.store.clone();
         let session = self.summary.id;
         let source_provider = self.summary.provider.clone();
@@ -238,14 +245,7 @@ impl Conversation {
                     this.context = Some(context);
                 }
                 this.status = match result {
-                    Ok(()) => {
-                        if clear_command && this.input.read(cx).content == compact_draft {
-                            this.input.update(cx, |input, cx| {
-                                input.take(cx);
-                            });
-                        }
-                        "Ready".into()
-                    }
+                    Ok(()) => "Ready".into(),
                     Err(error) if error == "Stopped" => "Ready".into(),
                     Err(error) => error,
                 };

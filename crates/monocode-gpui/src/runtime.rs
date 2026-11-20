@@ -151,6 +151,49 @@ pub(crate) fn run_turn(
     );
 }
 
+pub(crate) fn restored_context(
+    store: &Database,
+    session: &Session,
+    settings: Option<&Settings>,
+) -> Result<Option<monocode_core::context::Usage>, String> {
+    let saved;
+    let mut account = settings.map(|s| s.account.clone()).unwrap_or_default();
+    {
+        let db = locked(store)?;
+        saved = db.context_usage(session.id)?;
+        if session.provider != "claude"
+            || saved.is_none()
+            || db.cloud_location(session.id)?.is_cloud()
+        {
+            return Ok(saved);
+        }
+        account.root = db.data_dir().map(std::path::Path::to_path_buf);
+    }
+    let cwd = settings
+        .and_then(|s| s.worktree_cwd.as_deref())
+        .unwrap_or(&session.cwd);
+    let turn_metrics = settings
+        .and_then(|s| {
+            s.turns
+                .iter()
+                .filter(|(_, t)| t.provider == "claude" && t.metrics.is_some())
+                .max_by_key(|(row, _)| *row)
+        })
+        .and_then(|(_, t)| t.metrics);
+    Ok(saved.and_then(|usage| {
+        let config_dir = settings
+            .and_then(|s| s.environment.get("CLAUDE_CONFIG_DIR"))
+            .map(String::as_str);
+        usage.restore_local_claude(
+            &account,
+            config_dir,
+            cwd,
+            session.provider_id.as_deref(),
+            turn_metrics,
+        )
+    }))
+}
+
 fn run_turn_using(
     input: TurnInput,
     controls: std::sync::mpsc::Receiver<Control>,
@@ -198,9 +241,9 @@ fn run_turn_using(
     // SessionReview's recorded turn: its project and id, once the baseline is taken.
     let mut checkpoint: Option<(String, String)> = None;
     let mut created_worktree = None;
-    let mut context = locked(&store)
+    let mut context = restored_context(&store, &summary, Some(&settings))
         .ok()
-        .and_then(|s| s.context_usage(summary.id).ok().flatten())
+        .flatten()
         .unwrap_or_default();
     let mut usage_limit = None;
     let result = (|| {

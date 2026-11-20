@@ -910,15 +910,21 @@ impl Conversation {
         let store = self.store.clone();
         let id = self.summary.id;
         let mono = self.settings.mono.is_some();
-        let recover_goal = (self.summary.provider == Kind::Claude.id() && !self.busy)
+        let summary = self.summary.clone();
+        let recover_goal = (summary.provider == Kind::Claude.id() && !self.busy)
             .then(|| {
-                let session = self.summary.provider_id.clone()?;
+                let session = summary.provider_id.clone()?;
                 let root = crate::accounts::get(cx).map(|center| center.read(cx).root.clone());
-                Some((session, self.summary.cwd.clone(), root))
+                Some((session, summary.cwd.clone(), root))
             })
             .flatten();
         let work = cx.background_executor().spawn(async move {
             let settings = locked(&store).and_then(|s| s.agent_settings(id));
+            let context = crate::runtime::restored_context(
+                &store,
+                &summary,
+                settings.as_ref().ok().and_then(Option::as_ref),
+            );
             (
                 (|| {
                     let (mut history, local) = {
@@ -973,7 +979,7 @@ impl Conversation {
                     )
                 }),
                 settings,
-                locked(&store).and_then(|s| s.context_usage(id)),
+                context,
                 locked(&store).and_then(|s| s.follow_ups(id)),
                 locked(&store).and_then(|s| s.history_before(id)),
             )
