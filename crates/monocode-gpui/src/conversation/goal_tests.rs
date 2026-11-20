@@ -147,6 +147,7 @@ fn goal_shelf_keeps_queue_approval_and_actions_accessible(cx: &mut TestAppContex
                 title: "Allow this command?".into(),
                 detail: String::new(),
                 can_remember: true,
+                can_allow_once: true,
             });
             cx.notify();
         })

@@ -21,11 +21,12 @@ pub(crate) mod git_actions;
 mod goal_tests;
 mod history;
 mod mobile;
+mod mobile_pending_send;
 mod mono;
 mod notifications;
 mod question_api;
 pub(crate) use question_api::{QuestionAsked, QuestionSettled};
-mod cloud_branches;
+pub(crate) mod cloud_branches;
 mod cloud_location;
 pub(crate) use cloud_location::CloudLocationReset;
 mod cloud_move;
@@ -63,6 +64,8 @@ use gpui::{
     AnyElement, Context, Entity, EventEmitter, Focusable, MouseButton, Role, SharedString,
     StyleRefinement, Subscription, Window, canvas, div, prelude::*, px,
 };
+#[cfg(test)]
+pub(crate) use mobile::MobileApproval;
 pub(crate) use mobile::{
     Waiting as MobileWaiting, mobile_access_modes, usage_state as mobile_usage_state,
 };
@@ -272,11 +275,21 @@ pub(crate) struct Conversation {
     /// workflow or app API send reaches the same code with this false, and may not resume a
     /// Docker sandbox.
     pub(super) user_send: bool,
+    /// True while a remote device's send runs without the consent to wake the instance
+    /// (`mobile_submit`): the send never reconnects a cloud workspace by itself.
+    pub(super) mobile_no_wake: bool,
+    /// The message of a confirmed wake-send, waiting for the link (`mobile_wake_submit`).
+    wake_send: Option<mobile_pending_send::WakeSend>,
+    /// Queued messages of remote devices that may not wake a cloud workspace when they run.
+    mobile_no_wake_ids: std::collections::HashSet<String>,
     /// True while the Resume pill's own click runs: only that may resume with an empty prompt.
     pub(super) resume_click: bool,
     /// Every prompt `launch_prompt` was asked to send, for tests that count sends.
     #[cfg(test)]
     pub(super) launched: Vec<String>,
+    /// For each run that started, whether it was marked no-wake.
+    #[cfg(test)]
+    pub(super) launched_no_wake: Vec<bool>,
     notification_cancelled: bool,
     /// The store's saved-draft flag, until the conversation loads its own.
     pub(crate) draft_hint: bool,
@@ -298,6 +311,8 @@ pub(crate) struct Conversation {
     auto_resume_shown: Option<monocode_core::usage::AutoResume>,
     approvals: std::collections::VecDeque<Approval>,
     approval_ui: approvals::State,
+    /// Approvals a remote device was shown, by the desktop's own opaque id.
+    remote_approvals: std::cell::RefCell<Vec<mobile::RemoteApproval>>,
     questions:
         std::collections::VecDeque<(Entity<crate::questions::QuestionCard>, Vec<Subscription>)>,
     question_overlay: crate::questions::Overlay,
@@ -776,9 +791,14 @@ impl Conversation {
             stopping: false,
             cloud_locked: false,
             user_send: false,
+            mobile_no_wake: false,
+            wake_send: None,
+            mobile_no_wake_ids: Default::default(),
             resume_click: false,
             #[cfg(test)]
             launched: Vec::new(),
+            #[cfg(test)]
+            launched_no_wake: Vec::new(),
             notification_cancelled: false,
             draft_hint: false,
             model: std::env::var(format!(
@@ -803,6 +823,7 @@ impl Conversation {
             auto_resume_shown: None,
             approvals: Default::default(),
             approval_ui: Default::default(),
+            remote_approvals: Default::default(),
             questions: Default::default(),
             question_overlay: Default::default(),
             controls: None,
@@ -1509,6 +1530,11 @@ impl Conversation {
                 None
             };
             self.enqueue_follow_up(prompt, mode.map(str::to_owned), cx);
+            if self.mobile_no_wake
+                && let Some(message) = self.follow_ups.state.messages.last()
+            {
+                self.mobile_no_wake_ids.insert(message.id.clone());
+            }
             if let Some(id) = self
                 .follow_ups
                 .state
@@ -1524,7 +1550,16 @@ impl Conversation {
             return;
         }
         if !self.history_ready() {
-            self.defer_history_action(move |this, cx| this.launch_prompt(prompt, cx), cx);
+            // The no-wake flag of a remote message survives the wait for the history.
+            let no_wake = self.mobile_no_wake;
+            self.defer_history_action(
+                move |this, cx| {
+                    let outer = std::mem::replace(&mut this.mobile_no_wake, no_wake);
+                    this.launch_prompt(prompt, cx);
+                    this.mobile_no_wake = outer;
+                },
+                cx,
+            );
             return;
         }
         if self.account_switching {
@@ -1677,15 +1712,25 @@ impl Conversation {
             .is_remote()
             .then(|| self.remote_state.client.clone())
             .flatten();
+        // A run of a remote device's message that did not consent to waking the workspace
+        // never starts it (the flag travels with the message, see `pump_follow_ups`).
+        let no_wake = self.mobile_no_wake;
+        if let Some(id) = &self.settings.mono_message_id {
+            self.mobile_no_wake_ids.remove(id);
+        }
+        #[cfg(test)]
+        self.launched_no_wake.push(no_wake);
         cx.background_executor()
             .spawn(async move {
-                if let Some(client) = remote_client {
-                    crate::runtime::remote::run_with_client(
-                        client, summary, prompt, settings, control_rx, store, cancel, tx,
-                    );
-                } else {
-                    run_turn(summary, prompt, settings, control_rx, store, cancel, tx);
-                }
+                crate::runtime::remote::run_without_waking(no_wake, || {
+                    if let Some(client) = remote_client {
+                        crate::runtime::remote::run_with_client(
+                            client, summary, prompt, settings, control_rx, store, cancel, tx,
+                        );
+                    } else {
+                        run_turn(summary, prompt, settings, control_rx, store, cancel, tx);
+                    }
+                })
             })
             .detach();
         cx.spawn(async move |this, cx| {
@@ -2166,20 +2211,32 @@ impl Conversation {
         cx.emit(SessionChanged);
         cx.notify();
     }
-    fn execution_cwd(&self) -> &str {
-        if self.settings.worktree_removed {
-            return &self.summary.cwd;
-        }
+    pub(crate) fn execution_cwd(&self) -> &str {
+        self.settings.execution_cwd(&self.summary.cwd)
+    }
+    /// A Mono's chat runs in the home folder, which is no place for its file links: they name
+    /// files of the projects it works on. The links are bound to its first local project, and
+    /// resolved among all of them when clicked (`file_links::resolve_link`).
+    fn link_roots(&self) -> Vec<String> {
         self.settings
-            .worktree_cwd
-            .as_deref()
-            .unwrap_or(&self.summary.cwd)
+            .mono
+            .as_ref()
+            .map(|context| crate::file_links::candidate_roots(None, &context.mono.projects))
+            .unwrap_or_default()
     }
     fn sync_tool_paths(&mut self, cx: &mut Context<Self>) {
-        let cwd = self.execution_cwd().to_owned();
+        let roots = self.link_roots();
+        let cwd = roots
+            .first()
+            .cloned()
+            .unwrap_or_else(|| self.execution_cwd().to_owned());
         self.transcript.update(cx, |view, cx| {
-            if view.file_link_base.as_deref() != Some(cwd.as_str()) {
+            let changed = view.file_link_base.as_deref() != Some(cwd.as_str());
+            if changed {
                 view.file_link_base = Some(cwd);
+            }
+            if changed || view.link_roots() != roots.as_slice() {
+                view.set_link_roots(roots);
                 cx.notify();
             }
         });

@@ -5,7 +5,8 @@
 # so it can gate a merge.
 set -uo pipefail
 
-cd "$(dirname "$0")/.."
+# BRANDING_ROOT lets scripts/check-web-isolation.mjs run this check against a test tree.
+cd "${BRANDING_ROOT:-$(dirname "$0")/..}" || { echo "check-fork-branding: cannot enter the repo root" >&2; exit 2; }
 
 # Only string literals and links. A bare `MonoCode` inside an identifier
 # (MonoCodeMark, MonoCodeToolCall, MonoCodeDockMenuTarget) is a symbol name, not
@@ -40,6 +41,23 @@ hits=$(grep -rnE "$PATTERN" \
   | grep -vE "^[^:]+: *(//|///|//!|\*)" \
   | grep -vE "^($allow_re):")
 
+# The web app (web/): same pattern, same string-literal rule. Docs, dependencies, build
+# output and the lockfile are not product copy. Tests are dropped below like everywhere else.
+# `docs` is excluded only at web/docs (a source folder named docs deeper down is scanned). The PWA
+# manifest, JSON with comments, CommonJS, JSX, YAML and SVG carry user-visible names too.
+web_hits=$(grep -rnE "$PATTERN" web/ \
+  --include="*.ts" --include="*.tsx" --include="*.js" --include="*.mjs" --include="*.cjs" \
+  --include="*.jsx" --include="*.mts" --include="*.cts" \
+  --include="*.html" --include="*.css" --include="*.json" --include="*.jsonc" \
+  --include="*.webmanifest" --include="*.yaml" --include="*.yml" --include="*.svg" \
+  --exclude-dir=node_modules --exclude-dir=dist --exclude-dir=.wrangler \
+  --exclude=pnpm-lock.yaml --exclude=package-lock.json --exclude=yarn.lock 2>/dev/null \
+  | grep -vE '^web/docs/' \
+  | grep -v '\.test\.' \
+  | grep -vE "^[^:]+: *(//|///|//!|\*)" \
+  | grep -vE "^($allow_re):")
+hits=$(printf '%s\n%s\n' "$hits" "$web_hits")
+
 # Test fixtures inside src-tauri/src/fs.rs (its `mod tests`). They feed the GitHub repo
 # parsers (parse_github_repositories, github_pr_head_filter, split_github_repo) sample
 # `owner/repo` slugs and assert the parsed result, so the upstream name is data, not
@@ -62,6 +80,11 @@ hits=$(printf '%s\n' "$hits" | grep -vE '^crates/monocode-core/src/(remote/proto
 # desktop_preferences.rs fixtures (its `mod tests`): sample saved localStorage values the
 # preference importer reads back and asserts, so "Monocode" is data, not product copy.
 hits=$(printf '%s\n' "$hits" | grep -vE '^crates/monocode-core/src/desktop_preferences\.rs:[0-9]+: *(\("production", "tauri", "Monocode 🦀"\),|assert_eq!\(preferences\.get\("monocode\.test"\), Some\("Monocode 🦀"\)\);|json!\(\{"/code/agent-terminal":"Monocode"\}\),|"Monocode")$' || true)
+
+# credential_guard.rs APP_DATA_NAMES entry: "MonoCode" is the legacy upstream app data folder
+# name (Application Support/MonoCode). The remote-file deny-list must keep blocking it so a
+# remote file preview cannot read the old app's data, so it is a path, not product copy.
+hits=$(printf '%s\n' "$hits" | grep -vE '^crates/monocode-core/src/credential_guard\.rs:[0-9]+: *"MonoCode",$' || true)
 
 hits=$(printf '%s\n' "$hits" | grep -v '^[[:space:]]*$' || true)
 

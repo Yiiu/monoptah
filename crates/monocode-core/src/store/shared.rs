@@ -322,6 +322,9 @@ impl Store {
         // write path surfaces the distinct UnsupportedStorageMode kind instead
         // of silently writing the older format alongside the newer one.
         let storage_mode_refusal = sql(native_chunks::unsupported_storage_mode_refusal(&conn))?;
+        if !read_only {
+            super::restrict_database_files(path);
+        }
         let (extras, extras_db) = settings::open(path, read_only)?;
         let store = Self {
             conn,
@@ -664,6 +667,18 @@ impl Store {
             )
             .optional())?;
         Ok(Surface::from_stored(stored.flatten().as_deref()))
+    }
+    /// When the session was created (Unix milliseconds), for a session of the shared database.
+    pub(super) fn shared_created_at(&self, id: i64) -> Result<Option<u64>, String> {
+        let created: Option<Option<i64>> = sql(self
+            .conn
+            .query_row(
+                "SELECT created_at FROM sessions WHERE id=?1",
+                [self.persisted_session_id(id)?],
+                |r| r.get(0),
+            )
+            .optional())?;
+        Ok(created.flatten().and_then(|at| u64::try_from(at).ok()))
     }
     pub(super) fn shared_create(
         &self,
