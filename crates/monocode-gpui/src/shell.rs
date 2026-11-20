@@ -45,6 +45,9 @@ mod idle_agents;
 mod image_lightbox_tests;
 mod layout;
 mod live_agents;
+mod preview_path;
+#[cfg(test)]
+mod preview_path_tests;
 mod sandbox_picker;
 pub(crate) use app_commands::CLOUD_ARCHIVING;
 pub(crate) use cloud_app_archive::ArchiveFailure;
@@ -96,6 +99,7 @@ mod title_tabs;
 mod today_sessions;
 mod tui_busy;
 mod tui_sessions;
+mod web_link;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 mod window_chrome;
 mod worktrees;
@@ -672,6 +676,8 @@ pub(crate) struct Shell {
         Entity<crate::document_lightbox::DocumentLightbox>,
         Subscription,
     )>,
+    /// The notice for a file mentioned in a chat that cannot be previewed.
+    cannot_preview: Option<(Entity<crate::file_preview::CannotPreview>, Subscription)>,
     app_bridge: Option<monocode_core::mono::bridge::Server>,
     mobile: mobile_host::Mobile,
     app_results: HashMap<(i64, String), (String, Result<serde_json::Value, String>)>,
@@ -757,6 +763,9 @@ pub(crate) struct Shell {
     move_labels: HashMap<i64, Option<String>>,
     /// Sessions that live in a codespace, by id, and the cached state of each codespace.
     cloud_marks: HashMap<i64, cloud::CloudMark>,
+    /// Whether a cloud snapshot has filled `cloud_marks` at least once. Until then a session
+    /// that is missing from it may still be a cloud one, so the mobile host says nothing of it.
+    cloud_marks_loaded: bool,
     /// The Claude setup block of each workspace, by `CloudRef::key`; see [`claude_setup`].
     claude_setups: claude_setup::Setups,
     /// Which side of a cloud session its Files and Changes panels show. In memory only; a
@@ -1241,6 +1250,7 @@ impl Shell {
             quick_open: None,
             image_lightbox: None,
             document_lightbox: None,
+            cannot_preview: None,
             app_bridge: None,
             mobile: mobile_host::Mobile::default(),
             app_results: HashMap::new(),
@@ -1307,6 +1317,7 @@ impl Shell {
             gh,
             codespaces_usage: Default::default(),
             cloud_marks: HashMap::new(),
+            cloud_marks_loaded: false,
             claude_setups: Default::default(),
             panel_modes: HashMap::new(),
             cloud_view: None,
@@ -1635,6 +1646,7 @@ impl Shell {
         this.resume_cloud_moves(cx);
         this.resume_return_cleanups(cx);
         this.init_mobile_host(cx);
+        this.init_web_link(cx);
         if let Some(id) = this.workspace.active {
             this.ensure_session(this.workspace.session_for_pane(id), cx);
             this.record_worktree_session(id, cx);
@@ -7611,6 +7623,7 @@ impl Shell {
             let search = settings.update(cx, |v, cx| v.search_field(true, cx));
             let select = cx.weak_entity();
             let back = select.clone();
+            let web_waiting = self.web_badge(cx);
             return crate::settings::nav(
                 section,
                 search,
@@ -7620,6 +7633,7 @@ impl Shell {
                 move |window, cx| {
                     let _ = back.update(cx, |this, cx| this.close_settings(window, cx));
                 },
+                web_waiting,
             );
         }
         if self.workspace.classic_layout {
@@ -9451,6 +9465,7 @@ impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.keep_visible_idle_agents(cx);
         self.sync_ui_scale(window, cx);
+        crate::file_links::note_window_project(window, &self.workspace.project, cx);
         if !self.cloud_archive_request.is_empty() {
             let ids = std::mem::take(&mut self.cloud_archive_request);
             let this = cx.entity();
@@ -9488,7 +9503,9 @@ impl Render for Shell {
         if let Some(m) = &self.monos {
             m.read(cx).hide_html(cx);
             // A native web view paints above the barrier, so a blocking dialog hides it too.
-            let covered = self.document_lightbox.is_some() || self.blocking_modal().is_some();
+            let covered = self.document_lightbox.is_some()
+                || self.cannot_preview.is_some()
+                || self.blocking_modal().is_some();
             m.update(cx, |m, cx| {
                 m.set_suppress_html(covered);
                 m.bind_window(window, cx)
@@ -9787,32 +9804,12 @@ impl Render for Shell {
             }))
             .on_action(
                 cx.listener(|this, open: &crate::image_lightbox::Open, window, cx| {
-                    let view = cx.new(|cx| {
-                        crate::image_lightbox::ImageLightbox::new(open.clone(), window, cx)
-                    });
-                    let closed =
-                        cx.subscribe(&view, |this, _, _: &crate::image_lightbox::Closed, cx| {
-                            this.image_lightbox = None;
-                            cx.notify();
-                        });
-                    this.image_lightbox = Some((view, closed));
-                    cx.notify();
+                    this.show_image_lightbox(open.clone(), window, cx)
                 }),
             )
             .on_action(
                 cx.listener(|this, open: &crate::document_lightbox::Open, window, cx| {
-                    let view = cx.new(|cx| {
-                        crate::document_lightbox::DocumentLightbox::new(open.clone(), window, cx)
-                    });
-                    let closed = cx.subscribe(
-                        &view,
-                        |this, _, _: &crate::document_lightbox::Closed, cx| {
-                            this.document_lightbox = None;
-                            cx.notify();
-                        },
-                    );
-                    this.document_lightbox = Some((view, closed));
-                    cx.notify();
+                    this.show_document_lightbox(open.clone(), window, cx)
                 }),
             )
             .flex()
@@ -9845,25 +9842,15 @@ impl Render for Shell {
                     if this.open_cloud_path(&event.0, window, cx) {
                         return;
                     }
-                    let cwd = this.git.read(cx).project().to_owned();
-                    let (path, location) = crate::file_editor::file_location(&event.0, &cwd);
-                    this.open_review(crate::review::ReviewTab::File { cwd, path }, window, cx);
-                    // Monos render above the session pane tree. Give its file
-                    // an independent visible tab using the normal navigation
-                    // path, which retains the Mono tab and live conversation.
-                    if this.mono_active(cx)
-                        && let Some(owner) = this.workspace.active
-                        && let Some(pane) = this.independent_file_pane(owner, cx)
-                    {
-                        this.open_file_pane(pane, window, cx);
-                    }
-                    if let Some((line, column)) = location
-                        && let Some(pane) = this.active_review(cx)
-                    {
-                        pane.update(cx, |pane, cx| pane.navigate_file(line, column, cx));
-                    }
+                    let (cwd, path, location) = this.link_target(&event.0, cx);
+                    this.open_file_at(cwd, path, location, window, cx);
                 }),
             )
+            .on_action(cx.listener(
+                |this, event: &crate::file_preview::PreviewPath, window, cx| {
+                    this.preview_path(&event.0, window, cx)
+                },
+            ))
             .on_action(
                 cx.listener(|this, _: &crate::Quit, window, cx| this.request_quit(window, cx)),
             )
@@ -10372,6 +10359,11 @@ impl Render for Shell {
                 self.document_lightbox
                     .as_ref()
                     .map(|(view, _)| crate::document_lightbox::overlay(view)),
+            )
+            .children(
+                self.cannot_preview
+                    .as_ref()
+                    .map(|(view, _)| crate::modal::window_overlay(window, view.clone())),
             )
             .map(|root| {
                 #[cfg(target_os = "linux")]

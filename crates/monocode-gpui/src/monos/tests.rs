@@ -7027,6 +7027,7 @@ fn a_usage_limited_session_names_its_account_label_in_the_report() {
     let timed = Limit {
         resets_at: Some(now + 90 * 60_000),
         resume_at_reset: false,
+        ..Default::default()
     };
     let note = host::usage_limit_note("codex", "Codex Pro", &timed, now);
     assert!(
@@ -7038,6 +7039,7 @@ fn a_usage_limited_session_names_its_account_label_in_the_report() {
     let past = Limit {
         resets_at: Some(now - 1),
         resume_at_reset: false,
+        ..Default::default()
     };
     assert!(!host::usage_limit_note("claude", "Home", &past, now).contains("resets"));
     // The note reaches the Mono ahead of the session's own text, with the label only.

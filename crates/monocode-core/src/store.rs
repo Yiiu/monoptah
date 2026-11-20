@@ -169,6 +169,7 @@ impl Store {
         let conn = Connection::open(path).map_err(|e| e.to_string())?;
         conn.busy_timeout(std::time::Duration::from_secs(5))
             .map_err(|e| e.to_string())?;
+        restrict_database_files(path);
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;
           CREATE TABLE IF NOT EXISTS native_settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS native_sessions(id INTEGER PRIMARY KEY, title TEXT NOT NULL,
@@ -247,6 +248,7 @@ impl Store {
                 }
             }
         }
+        restrict_database_files(path);
         Ok(Self {
             conn,
             path: path.into(),
@@ -782,6 +784,14 @@ impl Store {
             return self.create(provider, cwd);
         }
         self.local_create_as(provider, cwd, surface)
+    }
+    /// When the session was created (Unix milliseconds), when the database records it: the
+    /// shared database does, the native one does not (then `None`).
+    pub fn session_created_at(&self, id: i64) -> Result<Option<u64>, String> {
+        if id < 0 || self.shared.is_none() {
+            return Ok(None);
+        }
+        self.shared_created_at(id)
     }
     /// A session's surface. Sessions without a stored one, and sessions on
     /// another machine, are chats.
@@ -1675,8 +1685,60 @@ impl Store {
     }
 }
 
+/// Makes a database and its WAL and SHM side files owner-only (0600) on unix.
+/// SQLite creates them with the umask (0644 by default), which would leave
+/// sealed identities and history readable by other local users. It only
+/// tightens, and a failure (a missing file, a foreign owner) is ignored so
+/// opening never fails because of it. A no-op elsewhere.
+pub(crate) fn restrict_database_files(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if path == Path::new(":memory:") {
+            return;
+        }
+        for suffix in ["", "-wal", "-shm"] {
+            let mut name = path.as_os_str().to_owned();
+            name.push(suffix);
+            let file = std::path::PathBuf::from(name);
+            if std::fs::metadata(&file).is_ok_and(|m| m.is_file()) {
+                let _ = std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn database_and_side_files_are_owner_only_even_when_reopened() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode =
+            |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("store.db");
+        drop(super::Store::open(&path).unwrap());
+        // An install created before the fix: world-readable database and side files.
+        for suffix in ["", "-wal", "-shm"] {
+            let file = tmp.path().join(format!("store.db{suffix}"));
+            if file.exists() {
+                std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+            }
+        }
+        let store = super::Store::open(&path).unwrap();
+        store.save_setting("probe", "1").unwrap();
+        assert_eq!(mode(&path), 0o600);
+        for suffix in ["-wal", "-shm"] {
+            let file = tmp.path().join(format!("store.db{suffix}"));
+            if file.exists() {
+                assert_eq!(mode(&file), 0o600, "{suffix}");
+            }
+        }
+    }
+
     #[test]
     fn removed_worktree_keeps_history_and_requires_reattachment() {
         let mut store = super::Store::open(std::path::Path::new(":memory:")).unwrap();

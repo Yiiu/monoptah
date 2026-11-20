@@ -3,10 +3,13 @@ pub(crate) mod burst;
 pub(crate) mod cloud_moved;
 pub(crate) mod cloud_start;
 pub(crate) mod dates;
+mod document_images;
 #[cfg(test)]
 mod document_selection_tests;
 mod drafts;
 pub(crate) mod emoji;
+#[cfg(test)]
+mod file_chip_tests;
 #[cfg(test)]
 mod follow_tests;
 pub(crate) mod git_turns;
@@ -808,8 +811,12 @@ pub(crate) struct TranscriptView {
     work_tiles: HashMap<usize, Entity<crate::phase_tile::PhaseTile>>,
     pub(crate) target_action: Option<(usize, monocode_core::response::TransferKind)>,
     document: bool,
+    /// A document opened from disk draws its `![alt](path)` pictures from `file_link_base`.
+    document_images: bool,
     side_question: bool,
     pub(crate) file_link_base: Option<String>,
+    /// A Mono chat's local projects: the folders a relative file link may belong to.
+    link_roots: Vec<String>,
     expanded: HashSet<usize>,
     agent_panels: tasks::AgentPanels,
     /// User messages opened past their four-line clamp, by start.
@@ -896,6 +903,13 @@ impl TranscriptView {
         view
     }
     /// AgentTranscript with `agentMascot`, `bottomAligned` and `inlineWork`.
+    /// The local projects of the Mono this chat belongs to, for resolving its file links.
+    pub(crate) fn set_link_roots(&mut self, roots: Vec<String>) {
+        self.link_roots = roots;
+    }
+    pub(crate) fn link_roots(&self) -> &[String] {
+        &self.link_roots
+    }
     pub(crate) fn mono_mode(&mut self, mascot: &str, color: u32, name: &str) {
         self.mono_look = Some((mascot.into(), color, name.to_owned().into()));
         if self.mono {
@@ -1029,8 +1043,21 @@ impl TranscriptView {
         self.history_before.is_none()
     }
     pub(crate) fn document(text: String, cx: &mut Context<Self>) -> Self {
+        Self::document_in(text, None, cx)
+    }
+    /// A markdown document that lives in `folder`: its relative links open files there, and its
+    /// `![alt](path)` pictures are drawn from there. Without a folder it is `document`.
+    pub(crate) fn document_in(
+        text: String,
+        folder: Option<std::path::PathBuf>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let mut view = Self::new();
         view.document = true;
+        if let Some(folder) = folder {
+            view.file_link_base = Some(folder.to_string_lossy().into_owned());
+            view.document_images = true;
+        }
         // A document reads from its top. Chat's tail-follow would open it
         // scrolled to the end and keep it pinned there on every rebuild.
         view.list.set_follow_mode(FollowMode::Normal);
@@ -2745,6 +2772,8 @@ impl TranscriptView {
             document: false,
             side_question: false,
             file_link_base: None,
+            document_images: false,
+            link_roots: Vec::new(),
             expanded: HashSet::new(),
             agent_panels: Default::default(),
             expanded_prompts: HashSet::new(),
@@ -3058,8 +3087,14 @@ impl TranscriptView {
             info.model = model.into();
         }
     }
-    /// Latest assistant message, including its virtualized continuation rows.
-    pub(crate) fn notification_reply_body(&self) -> String {
+    /// The latest assistant message, not yet reduced to one paragraph: a notice
+    /// clips it for the desktop and the phone, and the web preview strips its
+    /// markdown itself. Only the first ~480 UTF-16 units are kept. When the turn
+    /// ended in an error (not a stop), `Error: <text>` instead.
+    pub(crate) fn notification_reply_text(&self) -> String {
+        if let Some(error) = self.notification_error() {
+            return format!("Error: {error}");
+        }
         let Some(end) = self
             .source
             .iter()
@@ -3085,7 +3120,23 @@ impl TranscriptView {
         if self.mono {
             text = monocode_core::mono::emoji::token::strip(&text);
         }
-        crate::notifications::delivery::clip_body(&text)
+        text
+    }
+
+    /// The error that ended the turn: the last assistant or error row is an
+    /// error with text, and not the "Stopped" notice of a cancel.
+    fn notification_error(&self) -> Option<String> {
+        let row = self.source.iter().rfind(|row| {
+            matches!(row.role.as_str(), "assistant" | "error") && !row.text.trim().is_empty()
+        })?;
+        let text = row.text.trim();
+        (row.role == "error" && text != "Stopped").then(|| text.to_owned())
+    }
+
+    /// The reply as the desktop notice shows it: first paragraph, one line.
+    #[cfg(test)]
+    pub(crate) fn notification_reply_body(&self) -> String {
+        crate::notifications::delivery::clip_body(&self.notification_reply_text())
     }
 
     /// The latest assistant message in full, including its virtualized continuation rows.
@@ -3561,6 +3612,7 @@ impl TranscriptView {
                         Vec::new(),
                     )
                 });
+            parser.set_images(self.document_images);
             let message = self.messages.len();
             let first = self.rows.len();
             if at >= turn_end {
@@ -5539,6 +5591,8 @@ impl TranscriptView {
                     self.code(fence.clone(), lines.clone(), ix, cx)
                 } else if let Part::Visual { id, caption } = &md.part {
                     self.placed_visual(id, caption, cx)
+                } else if let Part::Image { src, alt } = &md.part {
+                    self.document_image(ix, src, alt)
                 } else {
                     markdown::body_selected(
                         md,

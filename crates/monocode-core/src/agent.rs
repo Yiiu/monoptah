@@ -146,6 +146,17 @@ pub struct Settings {
     pub pending_provider_switch: Option<ProviderSwitch>,
     pub turns: std::collections::HashMap<usize, TurnInfo>,
 }
+
+impl Settings {
+    /// The folder a session with this configuration runs in: its worktree unless that is gone,
+    /// else `cwd` (the session's own folder).
+    pub fn execution_cwd<'a>(&'a self, cwd: &'a str) -> &'a str {
+        if self.worktree_removed {
+            return cwd;
+        }
+        self.worktree_cwd.as_deref().unwrap_or(cwd)
+    }
+}
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProviderSwitch {
@@ -229,6 +240,10 @@ pub struct Approval {
     pub title: String,
     pub detail: String,
     pub can_remember: bool,
+    /// Whether "allow" is exactly one time. False when the provider offers
+    /// no one-time option, so an allow would fall back to "always"; a remote
+    /// device never answers such a request (U-13).
+    pub can_allow_once: bool,
 }
 #[derive(Clone, Debug)]
 pub enum Decision {
