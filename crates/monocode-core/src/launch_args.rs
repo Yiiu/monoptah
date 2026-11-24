@@ -110,7 +110,11 @@ pub fn extract_structured(kind: Kind, args: &[String]) -> Extracted {
         let takes = |index: usize| -> Option<(String, usize)> {
             match &inline {
                 Some(value) => Some((value.clone(), 1)),
-                None => args.get(index + 1).map(|value| (value.clone(), 2)),
+                // The end-of-options marker is never a value: the flag stays, unmoved.
+                None => args
+                    .get(index + 1)
+                    .filter(|value| *value != "--")
+                    .map(|value| (value.clone(), 2)),
             }
         };
         let mut taken: Option<usize> = None;
@@ -329,13 +333,20 @@ pub fn claude_chat_effort<'a>(effort: &'a str, model: Option<&str>) -> Option<&'
         "claude-sonnet-4-0",
         "claude-sonnet-4-5",
     ];
-    Some(match effort {
+    // In order, each step on the previous one's result: `ultracode` becomes `xhigh`, an
+    // older model's `xhigh` becomes `max`, and Sonnet 4.6's `max` becomes `high`.
+    let mut effort = match effort {
         "ultrathink" => return None,
         "ultracode" => "xhigh",
-        "xhigh" if model.is_some_and(|m| BEFORE_XHIGH.contains(&m)) => "max",
-        "max" if model == Some("claude-sonnet-4-6") => "high",
         other => other,
-    })
+    };
+    if effort == "xhigh" && model.is_some_and(|m| BEFORE_XHIGH.contains(&m)) {
+        effort = "max";
+    }
+    if effort == "max" && model == Some("claude-sonnet-4-6") {
+        effort = "high";
+    }
+    Some(effort)
 }
 
 /// Whether Settings keeps model, effort and permission flags typed into `kind`'s arguments
@@ -655,6 +666,10 @@ mod tests {
 
     #[test]
     fn nothing_after_the_end_of_options_marker_is_moved() {
+        let marker_as_value = strings(&["--model", "--", "--effort", "high"]);
+        let out = extract_structured(Kind::Claude, &marker_as_value);
+        assert_eq!((out.model, out.effort), (None, None));
+        assert_eq!(out.rest, marker_as_value);
         let out = extract_structured(
             Kind::Codex,
             &strings(&[
@@ -703,6 +718,15 @@ mod tests {
         assert_eq!(effort("claude-sonnet-4-6", "high").as_deref(), Some("high"));
         assert_eq!(effort("claude-opus-4-5", "ultrathink"), None);
         assert_eq!(claude_chat_effort("ultracode", None), Some("xhigh"));
+        // Each step applies to the previous one's result.
+        assert_eq!(
+            effort("claude-sonnet-4-6", "xhigh").as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            effort("claude-sonnet-4-6", "ultracode").as_deref(),
+            Some("high")
+        );
         assert_eq!(
             claude_chat_effort("max", Some("claude-opus-4-6")),
             Some("max")

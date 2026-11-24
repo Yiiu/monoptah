@@ -476,9 +476,12 @@ fn remote_runtime_modes() -> Vec<Value> {
 }
 
 /// Desktop default access, never full access for a session a remote device starts.
+/// The agent's own settings are capped too: with no flag the CLI's own configuration
+/// decides, and that may grant full access, which a remote start must never get. A phone
+/// cannot pick "own" explicitly (`mobile_access_modes`), so this is the only way in.
 fn remote_default_access(access: AccessMode) -> AccessMode {
     match access {
-        AccessMode::FullAccess => AccessMode::Supervised,
+        AccessMode::FullAccess | AccessMode::AgentDefault => AccessMode::Supervised,
         other => other,
     }
 }
@@ -4333,6 +4336,11 @@ mod tests {
                     AccessMode::Supervised
                 );
                 assert_eq!(remote_default_access(AccessMode::Auto), AccessMode::Auto);
+                assert_eq!(
+                    remote_default_access(AccessMode::AgentDefault),
+                    AccessMode::Supervised
+                );
+                assert_eq!(remote_access(&json!({"runtimeMode": "own"})), Ok(None));
                 let modes = remote_runtime_modes();
                 assert!(!modes.is_empty());
                 assert!(modes.iter().all(|m| m["id"] != "full-access"));

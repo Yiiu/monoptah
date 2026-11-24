@@ -304,12 +304,15 @@ fn service_url(output: &str) -> Option<String> {
 }
 /// OpenCode's shared v2 service is started once, outside any thread, so its
 /// shell tools never see a thread's app credentials. Threads with app access
-/// (/operator and Monos) run their own `serve` child instead.
-fn shared_service(request: &Request, v2: bool) -> bool {
-    v2 && !request
-        .settings
-        .environment
-        .contains_key("MONOCODE_APP_ENDPOINT")
+/// (/operator and Monos) run their own `serve` child instead. So does an agent with
+/// Settings → Agents arguments or environment: the running service keeps the launch it
+/// was started with, so a changed `HTTP_PROXY` would never reach it.
+fn shared_service(request: &Request, launch: &crate::launch_args::Launch, v2: bool) -> bool {
+    v2 && launch.is_empty()
+        && !request
+            .settings
+            .environment
+            .contains_key("MONOCODE_APP_ENDPOINT")
 }
 fn serve_command(
     request: &Request,
@@ -334,7 +337,10 @@ fn connect(
     v2: bool,
 ) -> Result<(Client, Option<Server>), String> {
     let directory = request.cwd.to_string_lossy().into_owned();
-    if shared_service(request, v2) {
+    // One read of Settings → Agents for the service choice, the lookup, the spawn and the
+    // parking key.
+    let launch = crate::cli::launch(request.kind);
+    if shared_service(request, &launch, v2) {
         let mut url = exec(request, &["service", "status"], cancel)
             .ok()
             .and_then(|output| service_url(&output));
@@ -353,8 +359,6 @@ fn connect(
         }
         return Ok((Client::new(url, directory, true, Some(password)), None));
     }
-    // One read of Settings → Agents for the lookup, the spawn and the parking key.
-    let launch = crate::cli::launch(request.kind);
     if let Some(id) = request.provider_id.as_deref() {
         let found = {
             let mut pool = idle().lock().unwrap_or_else(|e| e.into_inner());
@@ -845,13 +849,20 @@ mod tests {
             model: None,
             settings: Settings::default(),
         };
-        assert!(shared_service(&request, true));
-        assert!(!shared_service(&request, false));
+        let none = crate::launch_args::Launch::default();
+        assert!(shared_service(&request, &none, true));
+        assert!(!shared_service(&request, &none, false));
+        // A user launch the running service may not have been started with.
+        let proxy = crate::launch_args::Launch {
+            args: Vec::new(),
+            env: vec![("HTTP_PROXY".into(), "http://127.0.0.1:9".into())],
+        };
+        assert!(!shared_service(&request, &proxy, true));
         request
             .settings
             .environment
             .insert("MONOCODE_APP_ENDPOINT".into(), "127.0.0.1:1".into());
-        assert!(!shared_service(&request, true));
+        assert!(!shared_service(&request, &none, true));
     }
 
     #[test]
