@@ -4861,7 +4861,7 @@ impl TranscriptView {
     /// A code block inside a tool panel, such as a subagent's report or a note.
     /// That Markdown is no transcript row, so the block is never the search's
     /// current match and, like the prose around it, it takes no text selection.
-    /// `scope` only tells its element ids from other blocks.
+    /// `scope` only scopes the block's element ids. It is no row index.
     fn panel_code(
         &mut self,
         fence: Arc<Fence>,
