@@ -102,6 +102,14 @@ impl Shell {
         }
     }
 
+    /// The file the active editor shows, for tests in other modules.
+    #[cfg(test)]
+    pub(crate) fn active_editor_path(&mut self, cx: &mut Context<Self>) -> Option<String> {
+        let review = self.active_review(cx)?;
+        let editor = review.read(cx).active_editor()?;
+        Some(editor.read(cx).path.clone())
+    }
+
     /// The file the document lightbox shows, for tests in other modules.
     #[cfg(test)]
     pub(crate) fn document_preview_path(&self, cx: &App) -> Option<PathBuf> {
@@ -169,6 +177,18 @@ impl Shell {
             return;
         }
         self.preview_local_path(raw, window, cx);
+    }
+
+    /// Opens a file a floating Mono forwarded, already resolved against its own projects, in
+    /// the editor: the `OpenPath` counterpart of [`Shell::preview_local_path`].
+    pub(crate) fn open_local_path(
+        &mut self,
+        raw: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (cwd, path, location) = self.link_target(raw, cx);
+        self.open_file_at(cwd, path, location, window, cx);
     }
 
     /// [`Shell::preview_path`] for a link that is known to name a file of this machine: one a
