@@ -21,8 +21,8 @@ These guides help you **ask the right questions before coding**.
 
 | Guide | Purpose | When to Use |
 |-------|---------|-------------|
-| [Code Reuse Thinking Guide](./code-reuse-thinking-guide.md) | Identify patterns and reduce duplication | When you notice repeated patterns |
-| [Cross-Layer Thinking Guide](./cross-layer-thinking-guide.md) | Think through data flow across layers | Features spanning multiple layers |
+| [Code Reuse Thinking Guide](./code-reuse-thinking-guide.md) | Identify patterns and reduce duplication; this repo's shared components | Before writing a new dialog, menu, runner or helper |
+| [Cross-Layer Thinking Guide](./cross-layer-thinking-guide.md) | Think through data flow across layers; this repo's boundaries and persisted-data contracts | Features spanning multiple layers, anything stored or sent between apps |
 
 ---
 

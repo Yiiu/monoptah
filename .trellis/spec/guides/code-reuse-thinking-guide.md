@@ -144,80 +144,20 @@ of that replay model.
 
 ---
 
-## Gotcha: Python if/elif/else Exhaustive Check
+## Shared Pieces in This Repository
 
-**Problem**: Python's if/elif/else chains have no compile-time exhaustive check. When you add a new value to a `Literal` type (e.g., `Platform`), existing if/elif/else chains silently fall through to `else` with wrong defaults.
+Fix behavior in the shared piece so every caller gets it (`CLAUDE.md`, "Fix at the root, in
+the shared component": the first fix for the dialog input barrier went into individual
+dialogs and reached 2 of about 35). Search for these before writing a new one:
 
-**Symptom**: New platform works partially — some methods return Claude defaults instead of platform-specific values. No error is raised.
+| Need | Reuse | Spec |
+|---|---|---|
+| Native dialog, overlay, input barrier | `crates/monocode-gpui/src/modal.rs` | [native/component-guidelines.md](../native/component-guidelines.md) |
+| Native menu, dropdown, choice select | `crates/monocode-gpui/src/popover.rs` | [native/component-guidelines.md](../native/component-guidelines.md) |
+| Native colors | `crates/monocode-gpui/src/theme.rs` | [native/component-guidelines.md](../native/component-guidelines.md) |
+| Running a sandbox (`sbx`) command | the one runner in `crates/monocode-core/src/sandboxes.rs` | [core/processes-and-platforms.md](../core/processes-and-platforms.md) |
+| Writing a file safely | `write_atomic` in `crates/monocode-core/src/mono/files.rs` | [core/persistence-and-compat.md](../core/persistence-and-compat.md) |
+| React UI primitives and hooks | `src/shared/` | [frontend/component-guidelines.md](../frontend/component-guidelines.md) |
 
-**Example** (`cli_adapter.py`):
-```python
-# BAD: "gemini" falls through to else, returns "claude"
-@property
-def cli_name(self) -> str:
-    if self.platform == "opencode":
-        return "opencode"
-    else:
-        return "claude"  # gemini silently gets "claude"!
-
-# GOOD: explicit branch for every platform
-@property
-def cli_name(self) -> str:
-    if self.platform == "opencode":
-        return "opencode"
-    elif self.platform == "gemini":
-        return "gemini"
-    else:
-        return "claude"
-```
-
-**Prevention**: When adding a new value to a Python `Literal` type, search for ALL if/elif/else chains that switch on that type and add explicit branches. Don't rely on `else` being correct for new values.
-
----
-
-## Gotcha: Asymmetric Mechanisms Producing Same Output
-
-**Problem**: When two different mechanisms must produce the same file set (e.g., recursive directory copy for init vs. manual `files.set()` for update), structural changes (renaming, moving, adding subdirectories) only propagate through the automatic mechanism. The manual one silently drifts.
-
-**Symptom**: Init works perfectly, but update creates files at wrong paths or misses files entirely.
-
-**Prevention**:
-- **Best**: Eliminate the asymmetry — have the manual path call the automatic one (e.g., `collectTemplateFiles()` calls `getAllScripts()` instead of maintaining its own list)
-- **If asymmetry is unavoidable**: Add a regression test that compares outputs from both mechanisms
-- When migrating directory structures, search for ALL code paths that reference the old structure
-
-**Real example**: `trellis update` had a manual `files.set()` list for 11 scripts that `getAllScripts()` already tracked. Fix: replaced the manual list with a `for..of getAllScripts()` loop. See `update.ts` refactor in v0.4.0-beta.3.
-
----
-
-## Template File Registration (Trellis-specific)
-
-When adding new files to `src/templates/trellis/scripts/`:
-
-**Single registration point**: `src/templates/trellis/index.ts`
-
-1. Add `export const xxxScript = readTemplate("scripts/path/file.py");`
-2. Add to `getAllScripts()` Map
-
-That's it. `commands/update.ts` uses `getAllScripts()` directly — no manual sync needed.
-
-**Why this matters**: Without registration in `getAllScripts()`, `trellis update` won't sync the file to user projects. Bug fixes and features won't propagate.
-
-**History**: Before v0.4.0-beta.3, `update.ts` had its own hand-maintained file list that frequently fell out of sync with `getAllScripts()`. This caused 11 Python files to be silently skipped during `trellis update`. The fix was to eliminate the duplicate list and use `getAllScripts()` as the single source of truth.
-
-### Quick Checklist for New Scripts
-
-```bash
-# After adding a new .py file, verify it's in getAllScripts():
-grep -l "newFileName" src/templates/trellis/index.ts  # Should match
-```
-
-### Template Sync Convention
-
-`.trellis/scripts/` (dogfooded) and `packages/cli/src/templates/trellis/scripts/` (template) must stay identical. After editing `.trellis/scripts/`, always sync:
-
-```bash
-rsync -av --delete --exclude='__pycache__' .trellis/scripts/ packages/cli/src/templates/trellis/scripts/
-```
-
-**Gotcha**: Running rsync with wrong source/destination paths can create nested garbage directories (e.g., `.trellis/scripts/packages/cli/...`). Always double-check paths before running.
+Logic that is not drawing (parsing, storage, process control) belongs in `monocode-core`,
+not in a native view, so it can be tested without a window and shared across views.
