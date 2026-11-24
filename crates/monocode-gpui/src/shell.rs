@@ -67,6 +67,7 @@ mod project_removal;
 pub(crate) use project_removal::FilesOutcome;
 mod cloud_workspaces;
 mod mono_terminals;
+pub(crate) use mono_terminals::CAN_INSPECT as SESSIONS_CAN_READ_TERMINALS;
 mod project_cloud;
 mod project_settings;
 mod provider_prompt;
