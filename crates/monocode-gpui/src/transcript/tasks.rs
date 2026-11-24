@@ -984,7 +984,7 @@ fn markdown_text(
             markdown::resolve_file_links(&mut row, base);
         }
         let rendered = if let markdown::Part::Code { fence, lines } = &row.part {
-            view.code(fence.clone(), lines.clone(), fence.key as usize, cx)
+            view.panel_code(fence.clone(), lines.clone(), fence.key as usize, cx)
         } else {
             markdown::body(
                 &row,
