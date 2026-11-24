@@ -483,6 +483,11 @@ fn remote_default_access(access: AccessMode) -> AccessMode {
     }
 }
 
+/// A phone start's permission when it names none: `kind`'s Settings permission.
+fn mobile_default_access(kind: Kind, cx: &App) -> AccessMode {
+    remote_default_access(crate::conversation::default_access(kind.id(), cx))
+}
+
 impl Shell {
     pub(super) fn init_mobile_host(&mut self, cx: &mut Context<Self>) {
         // GPUI's deterministic executor cannot be woken by the link's threads.
@@ -703,11 +708,7 @@ impl Shell {
         let model = choice
             .model
             .and_then(|model| monocode_core::store::native_model(&model, choice.kind.id()));
-        (
-            choice.kind,
-            model,
-            remote_default_access(crate::conversation::default_access(choice.kind.id(), cx)),
-        )
+        (choice.kind, model, mobile_default_access(choice.kind, cx))
     }
 
     fn mobile_catalog_sessions(&self, paths: &[String], cx: &App) -> Vec<CatalogEntry> {
@@ -834,7 +835,7 @@ impl Shell {
                     "deletions": 0,
                     "defaultHarness": kind.id(),
                     "defaultModelName": pickers::cached_model_name(kind, model.as_deref()).to_string(),
-                    "defaultRuntimeMode": access.id(),
+                    "defaultRuntimeMode": access.peer_id(),
                 });
                 if let Some(model) = model {
                     project["defaultModel"] = json!(mobile_catalog::model_id(kind, Some(&model)));
@@ -2530,7 +2531,7 @@ impl Shell {
             if let Some(plan) = cloud::start_target(self, &request.device, &cwd, &params, cx)? {
                 return Ok::<_, Failure>(Err((text, cwd, requested, plan)));
             }
-            let (default_kind, default_model, default_access) = self.mobile_defaults(&cwd, cx);
+            let (default_kind, default_model, _) = self.mobile_defaults(&cwd, cx);
             let chosen = string(&params, "harness").as_deref().and_then(Kind::parse);
             let kind = chosen.unwrap_or(default_kind);
             let model = start_model(
@@ -2540,7 +2541,8 @@ impl Shell {
                 string(&params, "model"),
                 default_model,
             );
-            let access = requested.unwrap_or(default_access);
+            // The permission of the agent that runs, not of the default one.
+            let access = requested.unwrap_or_else(|| mobile_default_access(kind, cx));
             let account = self.mobile_account(kind, &cwd, &params, cx)?;
             Ok::<_, Failure>(Ok((text, cwd, kind, model, access, account)))
         })();
@@ -4340,6 +4342,62 @@ mod tests {
     }
 
     #[gpui::test]
+    fn a_phone_start_takes_the_permission_of_the_agent_it_runs(cx: &mut gpui::TestAppContext) {
+        let (window, _, _) = super::super::tests::window(cx);
+        window
+            .update(cx, |_, _, cx| {
+                cx.update_global::<crate::settings::Preferences, _>(|prefs, _| {
+                    prefs.default_provider = Some("codex".into());
+                    prefs.agents.permission = Some("ask".into());
+                    prefs.agents.permissions = [
+                        ("codex".to_owned(), "auto".to_owned()),
+                        ("grok".to_owned(), "full".to_owned()),
+                    ]
+                    .into();
+                });
+                // Claude follows the global level, not the default provider's.
+                assert_eq!(
+                    mobile_default_access(Kind::Claude, cx),
+                    AccessMode::Supervised
+                );
+                assert_eq!(mobile_default_access(Kind::Codex, cx), AccessMode::Auto);
+                // Full access is never a remote default.
+                assert_eq!(
+                    mobile_default_access(Kind::Grok, cx),
+                    AccessMode::Supervised
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn the_project_catalog_sends_older_phones_a_mode_they_know(cx: &mut gpui::TestAppContext) {
+        let (window, _, _) = super::super::tests::window(cx);
+        window
+            .update(cx, |shell, _, cx| {
+                cx.update_global::<crate::settings::Preferences, _>(|prefs, _| {
+                    prefs.agents.permission = Some("own".into());
+                    prefs.agents.permissions.clear();
+                });
+                let work = shell.mobile_catalog_work(cx);
+                let (catalog, _, _) = cx
+                    .foreground_executor()
+                    .block_test(work)
+                    .expect("the catalog builds");
+                let projects = catalog["projects"].as_array().expect("projects");
+                assert!(!projects.is_empty());
+                // The agent's own settings read as supervised there, as in models.list.
+                assert!(
+                    projects
+                        .iter()
+                        .all(|p| p["defaultRuntimeMode"] == AccessMode::Supervised.id()),
+                    "{projects:?}"
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
     fn mobile_catalog_matches_sidebar_visibility_for_saved_and_open_sessions(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -5026,23 +5084,22 @@ mod tests {
             ..Default::default()
         };
         let choice = new_chat_choice::resolve(&prefs, "/work/project");
-        assert_eq!(choice.kind, Kind::Claude);
-        let recent = choice
-            .model
-            .and_then(|model| monocode_core::store::native_model(&model, "claude"));
-        assert_eq!(recent.as_deref(), Some("claude-haiku-5-5"));
+        // The recent provider is the default; its model stays in its session.
+        assert_eq!((choice.kind, choice.model), (Kind::Claude, None));
+        // A new-chat default model, as the Settings model would supply one.
+        let fallback = Some("claude-haiku-5-5".to_owned());
         let start = |prefs: &crate::settings::Preferences, chosen, requested: Option<&str>| {
             start_model(
                 prefs,
                 "/work/project",
                 chosen,
                 requested.map(Into::into),
-                recent.clone(),
+                fallback.clone(),
             )
         };
-        // Omitted: the new-chat default, recent model included.
-        assert_eq!(start(&prefs, None, None).as_deref(), recent.as_deref());
-        // Explicit without a model: the harness default, not the recent model.
+        // Omitted: the new-chat default.
+        assert_eq!(start(&prefs, None, None).as_deref(), fallback.as_deref());
+        // Explicit without a model: the harness default, not the new-chat default.
         assert_eq!(start(&prefs, Some(Kind::Claude), None), None);
         prefs
             .default_models

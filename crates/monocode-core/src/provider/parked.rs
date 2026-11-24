@@ -293,6 +293,9 @@ pub(super) fn enforce_idle_limit() {
     drop(retired);
     opencode::retire_idle(&retire);
 }
+/// The key under the Settings → Agents launch as saved now. Live paths key a process by
+/// the launch it was started with (`key_for`).
+#[cfg(test)]
 pub(super) fn key(request: &Request) -> String {
     key_for(request, &crate::cli::launch(request.kind))
 }

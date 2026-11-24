@@ -510,7 +510,7 @@ pub(crate) const INDEX: &[(&str, Section, &str, &str)] = &[
     (
         "settings-agent-grok",
         Section::Providers,
-        "Grok",
+        "Grok Build",
         "agent cli command path model effort permission arguments args env environment install update",
     ),
     (
@@ -546,7 +546,7 @@ pub(crate) const INDEX: &[(&str, Section, &str, &str)] = &[
     (
         "settings-agent-hermes",
         Section::Providers,
-        "Hermes",
+        "Hermes Agent",
         "agent cli command path model effort permission arguments args env environment install update",
     ),
     (
@@ -684,7 +684,14 @@ pub(crate) fn search(query: &str, compositor: &str) -> Vec<SearchResult> {
         if id == "wayland-window-decorations" && compositor != "Wayland" {
             continue;
         }
-        if let Some(s) = score(&needle, label, keywords) {
+        if let Some(mut s) = score(&needle, label, keywords) {
+            // Every agent row shares the same words ("update", "model", ...): one found by
+            // those alone ranks after the other settings that have the word, so eleven agent
+            // rows cannot push them out of the results. A search by the agent's name is
+            // a name match and keeps its rank.
+            if s >= 2. && id.starts_with("settings-agent-") {
+                s += 0.25;
+            }
             scored.push((
                 s,
                 SearchResult {
@@ -819,5 +826,52 @@ mod tests {
                 .iter()
                 .any(|r| r.section == Section::Archive && r.setting.is_none())
         );
+    }
+
+    #[test]
+    fn update_finds_the_app_version_and_the_agent_clis_before_single_agents() {
+        let results = search("update", "Wayland");
+        let at = |id: &str| results.iter().position(|r| r.setting == Some(id));
+        let version = at("update").expect("General → Version is a result for update");
+        let group = at("agent-clis").expect("the Agent CLIs group is a result for update");
+        assert_eq!(results[version].section, Section::General);
+        for (ix, result) in results.iter().enumerate() {
+            if result
+                .setting
+                .is_some_and(|id| id.starts_with("settings-agent-"))
+            {
+                assert!(ix > version && ix > group, "{results:?}");
+            }
+        }
+        // A search by an agent's name still lands on its row first.
+        assert_eq!(
+            search("claude", "Wayland")[0].setting,
+            Some("settings-agent-claude")
+        );
+    }
+
+    #[test]
+    fn agent_rows_are_found_by_the_names_they_show() {
+        for kind in monocode_core::provider::Kind::ALL {
+            let id = format!("settings-agent-{}", kind.id());
+            let label = INDEX
+                .iter()
+                .find(|(setting, ..)| *setting == id)
+                .map(|(_, _, label, _)| *label);
+            assert_eq!(label, Some(kind.label()), "{id}");
+        }
+        for query in ["Grok Build", "grok", "Hermes Agent", "hermes"] {
+            let id = if query.to_lowercase().starts_with("grok") {
+                "settings-agent-grok"
+            } else {
+                "settings-agent-hermes"
+            };
+            assert!(
+                search(query, "Wayland")
+                    .iter()
+                    .any(|r| r.setting == Some(id)),
+                "{query}"
+            );
+        }
     }
 }

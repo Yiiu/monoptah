@@ -182,8 +182,24 @@ fn codex_flags(
     let flags: &[&str] = match access {
         AccessMode::AgentDefault => &[],
         AccessMode::ReadOnly => &["-a", "never", "-s", "read-only"],
-        AccessMode::Supervised => &["-a", "on-request", "-s", "read-only"],
-        AccessMode::AutoAcceptEdits => &["-a", "on-request", "-s", "workspace-write"],
+        // The reviewer is resolved apart from `-a` and `-s`, so a configured
+        // `auto_review` would otherwise still answer for the user (`AccessMode::codex`).
+        AccessMode::Supervised => &[
+            "-a",
+            "on-request",
+            "-s",
+            "read-only",
+            "-c",
+            "approvals_reviewer=\"user\"",
+        ],
+        AccessMode::AutoAcceptEdits => &[
+            "-a",
+            "on-request",
+            "-s",
+            "workspace-write",
+            "-c",
+            "approvals_reviewer=\"user\"",
+        ],
         AccessMode::Auto => &[
             "-a",
             "on-request",
@@ -650,11 +666,25 @@ mod tests {
             (AccessMode::ReadOnly, &["-a", "never", "-s", "read-only"]),
             (
                 AccessMode::Supervised,
-                &["-a", "on-request", "-s", "read-only"],
+                &[
+                    "-a",
+                    "on-request",
+                    "-s",
+                    "read-only",
+                    "-c",
+                    "approvals_reviewer=\"user\"",
+                ],
             ),
             (
                 AccessMode::AutoAcceptEdits,
-                &["-a", "on-request", "-s", "workspace-write"],
+                &[
+                    "-a",
+                    "on-request",
+                    "-s",
+                    "workspace-write",
+                    "-c",
+                    "approvals_reviewer=\"user\"",
+                ],
             ),
             (
                 AccessMode::Auto,

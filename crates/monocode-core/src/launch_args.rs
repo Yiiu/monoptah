@@ -89,14 +89,19 @@ pub struct Extracted {
 
 /// Take the model, effort and permission flags this agent is known to accept out of `args`.
 /// Anything else, including a known flag with a value that maps to no permission level,
-/// stays in `rest`.
+/// stays in `rest`. Nothing at or after the end-of-options marker `--` is taken.
 pub fn extract_structured(kind: Kind, args: &[String]) -> Extracted {
     let mut out = Extracted::default();
-    let mut sandbox_moved = false;
-    let mut approval: Option<Vec<String>> = None;
+    // Codex's `-a` and `-s` are decided together once every flag is seen. In typed order:
+    // where in `rest` the flag goes back if it stays, whether it is the sandbox, its tokens.
+    let mut pending: Vec<(usize, bool, Vec<String>)> = Vec::new();
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
+        if arg == "--" {
+            out.rest.extend(args[index..].iter().cloned());
+            break;
+        }
         let (flag, inline) = match arg.split_once('=') {
             Some((flag, value)) if flag.starts_with("--") => (flag, Some(value.to_owned())),
             _ => (arg.as_str(), None),
@@ -165,25 +170,14 @@ pub fn extract_structured(kind: Kind, args: &[String]) -> Extracted {
                 out.permission = Some(AccessMode::Auto);
                 taken = Some(1);
             }
-            (Kind::Codex, "-s" | "--sandbox") => {
-                if let Some((value, used)) = takes(index) {
-                    let level = match value.as_str() {
-                        "read-only" => Some(AccessMode::Supervised),
-                        "workspace-write" => Some(AccessMode::AutoAcceptEdits),
-                        "danger-full-access" => Some(AccessMode::FullAccess),
-                        _ => None,
-                    };
-                    if let Some(level) = level {
-                        out.permission = Some(level);
-                        sandbox_moved = true;
-                        taken = Some(used);
-                    }
-                }
-            }
-            (Kind::Codex, "-a" | "--ask-for-approval") => {
-                // Only part of a permission level together with a sandbox; decided below.
+            (Kind::Codex, "-s" | "--sandbox" | "-a" | "--ask-for-approval") => {
+                // A permission level only together with the other flag; decided below.
                 if let Some((_, used)) = takes(index) {
-                    approval = Some(args[index..index + used].to_vec());
+                    pending.push((
+                        out.rest.len(),
+                        matches!(flag, "-s" | "--sandbox"),
+                        args[index..index + used].to_vec(),
+                    ));
                     index += used;
                     continue;
                 }
@@ -201,11 +195,37 @@ pub fn extract_structured(kind: Kind, args: &[String]) -> Extracted {
             }
         }
     }
-    if let Some(approval) = approval {
-        if sandbox_moved {
-            out.moved.push(approval.join(" "));
-        } else {
-            out.rest.extend(approval);
+    // Only a pair that a level launches with exactly moves (`tui_launch::codex_flags`):
+    // any other pair, or either flag alone, would change the approval policy or the
+    // sandbox Codex runs with, so both stay where they were typed.
+    let value = |sandbox: bool| -> Option<String> {
+        let (_, _, tokens) = pending.iter().rev().find(|(_, is, _)| *is == sandbox)?;
+        Some(match tokens.as_slice() {
+            [_, value] => value.clone(),
+            [inline] => inline
+                .split_once('=')
+                .map(|(_, value)| value.to_owned())
+                .unwrap_or_default(),
+            _ => String::new(),
+        })
+    };
+    let level = match (value(false), value(true)) {
+        (Some(approval), Some(sandbox)) => match (approval.as_str(), sandbox.as_str()) {
+            ("on-request", "read-only") => Some(AccessMode::Supervised),
+            ("on-request", "workspace-write") => Some(AccessMode::AutoAcceptEdits),
+            ("never", "danger-full-access") => Some(AccessMode::FullAccess),
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some(level) = level {
+        out.permission = Some(level);
+        out.moved
+            .extend(pending.into_iter().map(|(_, _, tokens)| tokens.join(" ")));
+    } else {
+        // Back where they were typed, last first so earlier positions stay valid.
+        for (at, _, tokens) in pending.into_iter().rev() {
+            out.rest.splice(at..at, tokens);
         }
     }
     out
@@ -266,7 +286,7 @@ pub fn structured_flags(
                     args.push("--allow-dangerously-skip-permissions".into());
                 }
             }
-            if let Some(effort) = effort {
+            if let Some(effort) = effort.and_then(|e| claude_chat_effort(e, model.as_deref())) {
                 args.extend(["--effort".into(), effort.into()]);
             }
             if let Some(model) = model {
@@ -292,6 +312,50 @@ pub fn structured_flags(
         _ => {}
     }
     args
+}
+
+/// The `--effort` value a Claude chat launch passes for `effort` with native `model`, or
+/// none. `ultrathink` is a prompt keyword, not a flag; `ultracode` runs at `xhigh` (the
+/// launch also turns on its setting); models older than `xhigh` take `max` instead, and
+/// Sonnet 4.6, which has no `max`, takes `high`.
+pub fn claude_chat_effort<'a>(effort: &'a str, model: Option<&str>) -> Option<&'a str> {
+    const BEFORE_XHIGH: [&str; 8] = [
+        "claude-opus-4-6",
+        "claude-sonnet-4-6",
+        "claude-opus-4-5",
+        "claude-haiku-4-5",
+        "claude-opus-4-1",
+        "claude-opus-4-0",
+        "claude-sonnet-4-0",
+        "claude-sonnet-4-5",
+    ];
+    Some(match effort {
+        "ultrathink" => return None,
+        "ultracode" => "xhigh",
+        "xhigh" if model.is_some_and(|m| BEFORE_XHIGH.contains(&m)) => "max",
+        "max" if model == Some("claude-sonnet-4-6") => "high",
+        other => other,
+    })
+}
+
+/// Whether Settings keeps model, effort and permission flags typed into `kind`'s arguments
+/// where they are, instead of moving them into its fields, for agents that open in a
+/// terminal. Such a terminal passes no flags of its own (`tui_caps`), so a moved flag
+/// would never reach it.
+pub fn terminal_keeps_typed_flags(kind: Kind) -> bool {
+    !crate::surface::tui_caps(kind).launch_flags
+}
+
+/// The user's arguments as a chat launch passes them. Where a terminal kept typed model,
+/// effort and permission flags (`terminal_keeps_typed_flags`), a chat drops them: the chat
+/// takes those from Settings and places them itself, and a subcommand's flag in front of
+/// the subcommand (Grok's `--model` before `agent`) would not parse.
+pub fn chat_user_args(kind: Kind, args: &[String]) -> Vec<String> {
+    if terminal_keeps_typed_flags(kind) {
+        extract_structured(kind, args).rest
+    } else {
+        args.to_vec()
+    }
 }
 
 /// Whether a chat session of `kind` sends its model, effort and permission over the
@@ -526,6 +590,123 @@ mod tests {
         assert_eq!(yolo.permission, Some(AccessMode::FullAccess));
         let auto = extract_structured(Kind::Codex, &strings(&["--approve-for-me"]));
         assert_eq!(auto.permission, Some(AccessMode::Auto));
+    }
+
+    #[test]
+    fn codex_moves_only_an_approval_and_sandbox_pair_a_level_launches_with() {
+        let pairs: [(&[&str], AccessMode); 3] = [
+            (
+                &["-a", "on-request", "-s", "read-only"],
+                AccessMode::Supervised,
+            ),
+            (
+                &[
+                    "--sandbox=workspace-write",
+                    "--ask-for-approval",
+                    "on-request",
+                ],
+                AccessMode::AutoAcceptEdits,
+            ),
+            (
+                &["-s", "danger-full-access", "-a", "never"],
+                AccessMode::FullAccess,
+            ),
+        ];
+        for (pair, level) in pairs {
+            let out = extract_structured(Kind::Codex, &strings(pair));
+            assert_eq!(out.permission, Some(level), "{pair:?}");
+            assert!(out.rest.is_empty(), "{pair:?}");
+        }
+        // `never` with a writable sandbox is no level: Auto-accept edits asks on request.
+        // Both stay exactly where they were typed.
+        let typed = strings(&[
+            "--search",
+            "-a",
+            "never",
+            "--verbose",
+            "-s",
+            "workspace-write",
+        ]);
+        let out = extract_structured(Kind::Codex, &typed);
+        assert_eq!(out.permission, None);
+        assert!(out.moved.is_empty());
+        assert_eq!(out.rest, typed);
+        // A sandbox alone keeps the configured approval policy, so it stays too.
+        let alone = extract_structured(Kind::Codex, &strings(&["-s", "read-only"]));
+        assert_eq!(alone.permission, None);
+        assert_eq!(alone.rest, strings(&["-s", "read-only"]));
+    }
+
+    #[test]
+    fn a_chat_drops_the_flags_a_terminal_kept_and_claude_keeps_its_arguments() {
+        assert!(terminal_keeps_typed_flags(Kind::Grok));
+        assert!(!terminal_keeps_typed_flags(Kind::Claude));
+        let typed = strings(&[
+            "--verbose",
+            "--model",
+            "grok-4",
+            "--reasoning-effort",
+            "high",
+        ]);
+        assert_eq!(chat_user_args(Kind::Grok, &typed), strings(&["--verbose"]));
+        let claude = strings(&["--add-dir", "/work"]);
+        assert_eq!(chat_user_args(Kind::Claude, &claude), claude);
+    }
+
+    #[test]
+    fn nothing_after_the_end_of_options_marker_is_moved() {
+        let out = extract_structured(
+            Kind::Codex,
+            &strings(&[
+                "-m",
+                "gpt-5",
+                "--",
+                "--model",
+                "literal",
+                "-a",
+                "on-request",
+            ]),
+        );
+        assert_eq!(out.model.as_deref(), Some("gpt-5"));
+        assert_eq!(out.moved, strings(&["-m gpt-5"]));
+        assert_eq!(
+            out.rest,
+            strings(&["--", "--model", "literal", "-a", "on-request"])
+        );
+        let pair = extract_structured(
+            Kind::Codex,
+            &strings(&["-a", "on-request", "--", "-s", "read-only"]),
+        );
+        assert_eq!(pair.permission, None);
+        assert_eq!(
+            pair.rest,
+            strings(&["-a", "on-request", "--", "-s", "read-only"])
+        );
+    }
+
+    #[test]
+    fn the_claude_chat_preview_passes_the_effort_the_launch_does() {
+        let effort = |model: &str, effort: &str| {
+            let args = structured_flags(
+                Kind::Claude,
+                false,
+                Some(model),
+                Some(effort),
+                AccessMode::AgentDefault,
+            );
+            args.iter()
+                .position(|a| a == "--effort")
+                .map(|at| args[at + 1].clone())
+        };
+        assert_eq!(effort("claude-sonnet-4-6", "max").as_deref(), Some("high"));
+        assert_eq!(effort("claude-opus-4-5", "xhigh").as_deref(), Some("max"));
+        assert_eq!(effort("claude-sonnet-4-6", "high").as_deref(), Some("high"));
+        assert_eq!(effort("claude-opus-4-5", "ultrathink"), None);
+        assert_eq!(claude_chat_effort("ultracode", None), Some("xhigh"));
+        assert_eq!(
+            claude_chat_effort("max", Some("claude-opus-4-6")),
+            Some("max")
+        );
     }
 
     #[test]

@@ -870,6 +870,13 @@ mod agent_clis {
         std::path::PathBuf::from(format!("/opt/agents/{}", kind.binary_name()))
     }
 
+    /// A command the fixture's inspector accepts, as a working override would be.
+    const WORKING_COMMAND: &str = "claude-beta";
+
+    fn working_cli() -> std::path::PathBuf {
+        std::path::PathBuf::from("/opt/custom/claude-beta")
+    }
+
     fn agent_prefs(open_mode: &str) -> Preferences {
         let mut prefs = Preferences::default();
         prefs.agents.open_mode = open_mode.into();
@@ -898,10 +905,15 @@ mod agent_clis {
                     .into_iter()
                     .map(|kind| (kind, installed.contains(&kind).then(|| fake_cli(kind))))
                     .collect();
-                // The auto-detected CLI "answers" without being started; a command a test
-                // types is resolved for real, which starts nothing unless it exists.
+                // No CLI on the machine is resolved or started: the auto-detected CLI and
+                // `WORKING_COMMAND` answer, any other command a test types is not found.
+                // Real command resolution is covered by the `cli` tests in core.
                 view.agents.inspector = Some(std::sync::Arc::new(|kind, command| match command {
-                    Some(_) => monocode_core::cli::inspect(kind, command),
+                    Some(WORKING_COMMAND) => Ok(Inspection {
+                        path: working_cli(),
+                        version: "2.0.0".into(),
+                    }),
+                    Some(command) => Err(format!("Could not find {command} on your PATH.")),
                     None => Ok(Inspection {
                         path: fake_cli(kind),
                         version: "1.2.3".into(),
@@ -1635,5 +1647,282 @@ mod agent_clis {
         // The button hands the update to the existing flow.
         press(visual, "settings-agent-update-codex");
         assert_eq!(*events.borrow(), [Kind::Codex]);
+    }
+
+    #[gpui::test]
+    fn an_update_offer_for_a_replaced_command_asks_for_a_new_check(cx: &mut TestAppContext) {
+        let window = agents_window(&[Kind::Codex], agent_prefs(OPEN_CHAT), cx);
+        window
+            .update(cx, |view, _, cx| {
+                view.ctx.agent_updates = vec![AgentUpdate {
+                    kind: Kind::Codex,
+                    latest: "9.9.9".into(),
+                    state: AgentUpdateState::Available,
+                }];
+                cx.notify();
+            })
+            .unwrap();
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let _subscription = cx.update(|cx| {
+            let events = events.clone();
+            let view = window.root(cx).unwrap();
+            cx.subscribe(&view, move |_, event: &SettingsEvent, _| match event {
+                SettingsEvent::UpdateAgent(kind) => events.borrow_mut().push(Some(*kind)),
+                SettingsEvent::CheckHarnessUpdates => events.borrow_mut().push(None),
+                _ => {}
+            })
+        });
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        settle(visual);
+        // The offer was found for the auto-detected CLI.
+        assert!(drawn(visual, "settings-agent-update-codex"));
+        // Another command takes effect: the offer is not run against it.
+        window
+            .update(visual, |view, _, cx| {
+                view.prefs
+                    .binary_paths
+                    .insert("codex".into(), "/opt/other/codex".into());
+                cx.notify();
+            })
+            .unwrap();
+        settle(visual);
+        assert!(!drawn(visual, "settings-agent-update-codex"));
+        press(visual, "settings-agent-update-check-codex");
+        assert_eq!(*events.borrow(), [None], "a new check, no update");
+        // What that check finds is for the command in effect.
+        settle(visual);
+        assert!(drawn(visual, "settings-agent-update-codex"));
+        press(visual, "settings-agent-update-codex");
+        assert_eq!(*events.borrow(), [None, Some(Kind::Codex)]);
+    }
+
+    #[gpui::test]
+    fn the_antigravity_terminal_runs_agy_and_its_command_is_for_chat(cx: &mut TestAppContext) {
+        let mut prefs = agent_prefs(OPEN_TUI);
+        prefs
+            .binary_paths
+            .insert("antigravity".into(), "/opt/agy-custom".into());
+        let window = agents_window(&[Kind::Antigravity], prefs, cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        press(visual, "settings-agent-header-antigravity");
+        assert!(drawn(visual, "settings-agent-command-chat-only"));
+        let copied = |visual: &mut VisualTestContext| {
+            press(visual, "settings-agent-copy-launch-antigravity");
+            visual
+                .read_from_clipboard()
+                .and_then(|item| item.text())
+                .unwrap_or_default()
+        };
+        // `tui_launch::tui_binary` starts `agy` whatever the command says.
+        let terminal = copied(visual);
+        assert!(terminal.starts_with("agy"), "{terminal}");
+        assert!(!terminal.contains("/opt/agy-custom"), "{terminal}");
+        // Chat sessions run the configured command.
+        press(visual, "settings-agent-open-mode-chat");
+        let chat = copied(visual);
+        assert!(chat.starts_with("/opt/agy-custom"), "{chat}");
+    }
+
+    #[gpui::test]
+    fn a_project_on_another_machine_previews_the_chat_launch(cx: &mut TestAppContext) {
+        let mut prefs = agent_prefs(OPEN_TUI);
+        prefs.agents.permission = Some(Permission::AcceptEdits.id().into());
+        prefs.default_models.insert("claude".into(), "opus".into());
+        let window = agents_window(&[Kind::Claude], prefs, cx);
+        window
+            .update(cx, |view, _, cx| {
+                view.selected_project =
+                    format!("{}host/work/app", monocode_core::remote::REMOTE_PATH_PREFIX);
+                cx.notify();
+            })
+            .unwrap();
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        settle(visual);
+        press(visual, "settings-agent-header-claude");
+        press(visual, "settings-agent-copy-launch-claude");
+        let copied = visual
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .unwrap_or_default();
+        // New sessions in that project open as chat, so the chat launch is the one shown.
+        assert_eq!(copied, "claude --permission-mode acceptEdits --model opus");
+    }
+
+    #[gpui::test]
+    fn resetting_or_reverting_the_command_cancels_a_save_under_way(cx: &mut TestAppContext) {
+        let saved = fake_cli(Kind::Claude).display().to_string();
+        let mut prefs = agent_prefs(OPEN_CHAT);
+        prefs.binary_paths.insert("claude".into(), saved.clone());
+        let window = agents_window(&[Kind::Claude], prefs, cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        press(visual, "settings-agent-header-claude");
+        // A working command is being checked when the saved one is entered again.
+        window
+            .update(visual, |view, _, cx| {
+                view.commit_agent_command(Kind::Claude, WORKING_COMMAND.into(), cx);
+                view.commit_agent_command(Kind::Claude, saved.clone(), cx);
+            })
+            .unwrap();
+        settle(visual);
+        assert_eq!(
+            prefs_of(window, visual).agent(Kind::Claude).command,
+            Some(saved.clone())
+        );
+        // ... or when Reset goes back to the auto-detected CLI.
+        window
+            .update(visual, |view, _, cx| {
+                view.commit_agent_command(Kind::Claude, WORKING_COMMAND.into(), cx);
+                view.commit_agent_command(Kind::Claude, String::new(), cx);
+            })
+            .unwrap();
+        settle(visual);
+        let prefs = prefs_of(window, visual);
+        assert_eq!(prefs.agent(Kind::Claude).command, None);
+        assert!(prefs.binary_paths.is_empty());
+        // A check that is not cancelled still saves.
+        window
+            .update(visual, |view, _, cx| {
+                view.commit_agent_command(Kind::Claude, WORKING_COMMAND.into(), cx)
+            })
+            .unwrap();
+        settle(visual);
+        assert_eq!(
+            prefs_of(window, visual)
+                .agent(Kind::Claude)
+                .command
+                .as_deref(),
+            Some(WORKING_COMMAND)
+        );
+    }
+
+    #[gpui::test]
+    fn a_version_check_of_a_replaced_command_is_dropped(cx: &mut TestAppContext) {
+        let window = agents_window(&[Kind::Claude], agent_prefs(OPEN_CHAT), cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        press(visual, "settings-agent-header-claude");
+        // A refresh of the auto-detected CLI is under way when a working command is saved.
+        window
+            .update(visual, |view, _, cx| {
+                view.inspect_agent(Kind::Claude, None, false, false, cx);
+                view.prefs
+                    .binary_paths
+                    .insert("claude".into(), WORKING_COMMAND.into());
+                view.agents.inspections.insert(
+                    Kind::Claude,
+                    Ok(Inspection {
+                        path: working_cli(),
+                        version: "2.0.0".into(),
+                    }),
+                );
+            })
+            .unwrap();
+        settle(visual);
+        window
+            .update(visual, |view, _, _| {
+                let inspection = view.agents.inspections.get(&Kind::Claude).cloned();
+                assert_eq!(
+                    inspection.and_then(Result::ok).map(|i| i.path),
+                    Some(working_cli()),
+                    "the refresh of the replaced command is dropped"
+                );
+                // "Open CLI location" in the row menu opens the command in effect, as the
+                // Command field's folder button does, not what detection found.
+                assert_eq!(view.active_cli_path(Kind::Claude), Some(working_cli()));
+                assert_ne!(fake_cli(Kind::Claude), working_cli());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn undo_puts_a_moved_argument_with_a_space_back_as_one_argument(cx: &mut TestAppContext) {
+        let window = agents_window(&[Kind::Claude], agent_prefs(OPEN_CHAT), cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        press(visual, "settings-agent-header-claude");
+        type_into(
+            visual,
+            "settings-agent-args-claude",
+            "--verbose --model \"team model\"",
+        );
+        visual.simulate_keystrokes("enter");
+        settle(visual);
+        let prefs = prefs_of(window, visual);
+        assert_eq!(
+            prefs.default_models.get("claude").map(String::as_str),
+            Some("team model")
+        );
+        press(visual, "settings-toast-undo");
+        let prefs = prefs_of(window, visual);
+        assert_eq!(
+            prefs.agent(Kind::Claude).args,
+            ["--verbose", "--model", "team model"]
+        );
+        assert!(prefs.default_models.is_empty());
+    }
+
+    #[gpui::test]
+    fn a_terminal_that_passes_no_flags_keeps_the_typed_ones(cx: &mut TestAppContext) {
+        let window = agents_window(&[Kind::Grok], agent_prefs(OPEN_TUI), cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        press(visual, "settings-agent-header-grok");
+        type_into(
+            visual,
+            "settings-agent-args-grok",
+            "--model grok-4 --reasoning-effort high",
+        );
+        visual.simulate_keystrokes("enter");
+        settle(visual);
+        let prefs = prefs_of(window, visual);
+        assert_eq!(
+            prefs.agent(Kind::Grok).args,
+            ["--model", "grok-4", "--reasoning-effort", "high"]
+        );
+        assert!(!prefs.default_models.contains_key("grok"));
+        assert!(!prefs.agents.efforts.contains_key("grok"));
+    }
+
+    /// Enter and Space press the focused element on key-up, as GPUI's buttons do.
+    fn press_key(visual: &mut VisualTestContext, key: &str) {
+        visual.simulate_keystrokes(key);
+        visual.update(|window, cx| {
+            let keystroke = gpui::Keystroke::parse(key).unwrap();
+            window.dispatch_event(
+                gpui::PlatformInput::KeyUp(gpui::KeyUpEvent { keystroke }),
+                cx,
+            );
+        });
+        settle(visual);
+    }
+
+    fn focus_next(visual: &mut VisualTestContext) {
+        visual.update(|window, cx| window.focus_next(cx));
+        settle(visual);
+    }
+
+    #[gpui::test]
+    fn the_open_mode_cards_and_effort_steps_work_from_the_keyboard(cx: &mut TestAppContext) {
+        let window = agents_window(&[Kind::Claude], agent_prefs(OPEN_CHAT), cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        // Clicking the selected card only focuses it; Tab moves on to the next card.
+        press(visual, "settings-agent-open-mode-chat");
+        focus_next(visual);
+        press_key(visual, "enter");
+        assert_eq!(prefs_of(window, visual).open_mode(), OPEN_TUI);
+        focus_next(visual);
+        press_key(visual, "space");
+        assert_eq!(prefs_of(window, visual).open_mode(), OPEN_PER_AGENT);
+
+        // The reasoning-effort steps: "Default", then the lowest level.
+        press(visual, "settings-agent-header-claude");
+        press(visual, "settings-agent-effort-claude-default");
+        assert_eq!(prefs_of(window, visual).agent(Kind::Claude).effort, None);
+        focus_next(visual);
+        press_key(visual, "enter");
+        assert!(
+            prefs_of(window, visual)
+                .agent(Kind::Claude)
+                .effort
+                .is_some(),
+            "Enter on the focused step picks its level"
+        );
     }
 }

@@ -64,13 +64,31 @@ impl HarnessUpdates {
                     return;
                 }
                 this.checking = false;
-                this.updates = updates;
-                this.rows.clear();
+                this.take_scan(updates);
                 cx.emit(HarnessUpdatesEvent::Changed);
                 cx.notify();
             });
         })
         .detach();
+    }
+    /// Replaces the offers with a finished scan's. An install that started while the scan
+    /// ran keeps its row and its offer: the scan may have read the old version, and
+    /// restoring that offer as Available would let a second click start a second
+    /// installer. Finished and failed rows are dropped, so a failed install can be retried.
+    fn take_scan(&mut self, updates: Vec<Update>) {
+        let running: Vec<Update> = self
+            .updates
+            .iter()
+            .filter(|u| matches!(self.rows.get(&u.harness), Some(RowState::Updating)))
+            .cloned()
+            .collect();
+        self.rows
+            .retain(|_, state| matches!(state, RowState::Updating));
+        self.updates = updates
+            .into_iter()
+            .filter(|u| !self.rows.contains_key(&u.harness))
+            .chain(running)
+            .collect();
     }
     /// Each pending update and how far it is, for the Agent CLIs settings.
     pub(crate) fn settings_rows(&self) -> Vec<crate::settings::AgentUpdate> {
@@ -330,5 +348,66 @@ impl Render for HarnessUpdates {
                 ),
             )
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn offer(harness: Kind, installed: &str) -> Update {
+        Update {
+            harness,
+            installed: installed.into(),
+            latest: "2.0.0".into(),
+        }
+    }
+
+    fn state(this: &HarnessUpdates, kind: Kind) -> Option<crate::settings::AgentUpdateState> {
+        this.settings_rows()
+            .into_iter()
+            .find(|row| row.kind == kind)
+            .map(|row| row.state)
+    }
+
+    #[test]
+    fn a_scan_that_ends_during_an_install_keeps_it_running() {
+        use crate::settings::AgentUpdateState;
+        let mut this = HarnessUpdates {
+            updates: vec![
+                offer(Kind::Codex, "1.0.0"),
+                offer(Kind::Claude, "1.0.0"),
+                offer(Kind::Pi, "1.0.0"),
+            ],
+            rows: HashMap::from([
+                (Kind::Codex, RowState::Updating),
+                (Kind::Claude, RowState::Failed("network".into())),
+                (Kind::Pi, RowState::Updated("2.0.0".into())),
+            ]),
+            checking: true,
+            generation: 1,
+        };
+        // The scan still reads Codex's old version and offers it again.
+        this.take_scan(vec![
+            offer(Kind::Codex, "1.0.0"),
+            offer(Kind::Claude, "1.0.0"),
+        ]);
+        assert!(matches!(
+            state(&this, Kind::Codex),
+            Some(AgentUpdateState::Updating)
+        ));
+        assert_eq!(
+            this.updates
+                .iter()
+                .filter(|u| u.harness == Kind::Codex)
+                .count(),
+            1
+        );
+        // A failed install is offered again so it can be retried; a finished one is gone.
+        assert!(matches!(
+            state(&this, Kind::Claude),
+            Some(AgentUpdateState::Available)
+        ));
+        assert!(state(&this, Kind::Pi).is_none());
     }
 }

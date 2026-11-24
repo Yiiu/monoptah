@@ -129,8 +129,15 @@ pub(in crate::settings) struct AgentsState {
     /// The agent whose model is being typed instead of picked.
     custom_model: Option<Kind>,
     /// Each CLI's resolved path and version, or why it could not be checked.
+    /// Only a result for the command in effect is kept: a check of a command that has
+    /// since been replaced is dropped when it lands.
     pub(in crate::settings) inspections: HashMap<Kind, Result<Inspection, String>>,
-    inspecting: HashSet<Kind>,
+    /// How many checks of each agent's CLI are under way, of either kind.
+    inspecting: HashMap<Kind, usize>,
+    /// The command each update offer on screen was found for. An offer belongs to the CLI
+    /// that was checked: once the command changes, the row asks for a new check instead
+    /// of running that offer's update against another installation.
+    offer_commands: HashMap<Kind, Option<String>>,
     /// The latest background version check of each agent, and separately the latest check
     /// of a command being saved: a refresh must not supersede a save that is under way.
     inspect_generation: HashMap<Kind, u64>,
@@ -192,12 +199,35 @@ fn surface_name(surface: Surface) -> &'static str {
 
 /// The command a session of `kind` runs: the configured path, else the CLI's name.
 fn command_name(kind: Kind, command: Option<&str>, terminal: bool) -> String {
+    // The Antigravity terminal is always `agy` from the PATH (`tui_launch::tui_binary`):
+    // its configured command is the ACP server chat sessions talk to, not a terminal UI.
+    if kind == Kind::Antigravity && terminal {
+        return "agy".into();
+    }
     match command {
         Some(path) => path.to_owned(),
-        // The Antigravity terminal is `agy`; its chat transport is the ACP server.
-        None if kind == Kind::Antigravity && terminal => "agy".into(),
         None => kind.binary_name().into(),
     }
+}
+
+/// The arguments `parts` had that `rest` no longer has, in their order and with their
+/// boundaries: what `launch_args::extract_structured` moved out of an argument list.
+fn moved_tokens(parts: &[String], rest: &[String]) -> Vec<String> {
+    let mut kept: HashMap<&str, usize> = HashMap::new();
+    for arg in rest {
+        *kept.entry(arg.as_str()).or_default() += 1;
+    }
+    parts
+        .iter()
+        .filter(|arg| match kept.get_mut(arg.as_str()) {
+            Some(count) if *count > 0 => {
+                *count -= 1;
+                false
+            }
+            _ => true,
+        })
+        .cloned()
+        .collect()
 }
 
 /// The flag line a permission level passes to this agent, for the picker's rows.
@@ -255,6 +285,30 @@ impl SettingsView {
             })
     }
 
+    /// The CLI the agent runs now, for "Open CLI location": the checked command (a saved
+    /// override that passed), else what detection found.
+    pub(in crate::settings) fn active_cli_path(&self, kind: Kind) -> Option<PathBuf> {
+        self.agents
+            .inspections
+            .get(&kind)
+            .and_then(|result| result.as_ref().ok())
+            .map(|inspection| inspection.path.clone())
+            .or_else(|| self.agent_path(kind))
+    }
+
+    /// Whether a new session of `kind` opens in a terminal: the agent's surface as session
+    /// creation resolves it for the selected project (a project on another machine opens
+    /// as chat), and never when the database cannot store a terminal session.
+    fn launches_in_terminal(&self, kind: Kind) -> bool {
+        !self.ctx.no_terminal_sessions
+            && monocode_core::surface::new_session_surface(
+                kind,
+                &self.selected_project,
+                self.prefs.agent(kind).surface,
+            )
+            .is_tui()
+    }
+
     /// The arguments a new session of `kind` starts with, in the order the launch passes
     /// them, split around the permission flags so the preview can tint those: what comes
     /// before them, the permission flags, and what comes after. The list itself comes from
@@ -262,7 +316,7 @@ impl SettingsView {
     /// for a chat.
     fn agent_launch_args(&self, kind: Kind) -> (Vec<String>, Vec<String>, Vec<String>) {
         let agent = self.prefs.agent(kind);
-        let terminal = agent.surface.is_tui() && !self.ctx.no_terminal_sessions;
+        let terminal = self.launches_in_terminal(kind);
         let mut argv = if terminal {
             let mut argv = launch_args::structured_flags(
                 kind,
@@ -303,7 +357,7 @@ impl SettingsView {
     /// The launch command as one line; `mask` hides secret values that are not revealed.
     fn agent_launch_line(&self, kind: Kind, mask: bool) -> String {
         let agent = self.prefs.agent(kind);
-        let terminal = agent.surface.is_tui() && !self.ctx.no_terminal_sessions;
+        let terminal = self.launches_in_terminal(kind);
         let (lead, permission, rest) = self.agent_launch_args(kind);
         let mut parts: Vec<String> = agent
             .env
@@ -358,6 +412,7 @@ impl SettingsView {
         {
             window.request_animation_frame();
         }
+        self.bind_update_offers();
         let (installed, available): (Vec<Kind>, Vec<Kind>) = Kind::ALL
             .into_iter()
             .partition(|kind| self.agent_path(*kind).is_some());
@@ -729,7 +784,7 @@ impl SettingsView {
         let summary = if installed {
             // The launch command without its variables, which the summary only counts.
             let (lead, permission, rest) = self.agent_launch_args(kind);
-            let terminal = agent.surface.is_tui() && !self.ctx.no_terminal_sessions;
+            let terminal = self.launches_in_terminal(kind);
             let mut parts = vec![command_name(kind, agent.command.as_deref(), terminal)];
             parts.extend(lead.into_iter().chain(permission).chain(rest));
             let mut text = launch_args::join(&parts);
@@ -975,6 +1030,19 @@ impl SettingsView {
                 .child("Updating…")
                 .into_any_element(),
             Some((AgentUpdateState::Updated(installed), _)) => version(format!("v{installed}")),
+            // The offer was found for a command that has since changed: check the CLI in
+            // effect now rather than update another installation.
+            Some(_) if self.update_offer_stale(kind) => secondary_button(
+                SharedString::from(format!("recheck-update-{}", kind.id())),
+                format!("Check for a {} update", kind.label()),
+                false,
+                false,
+            )
+            .debug_selector(move || format!("settings-agent-update-check-{}", kind.id()))
+            .child(icon("refresh-cw", 12.))
+            .child("Check for update")
+            .on_click(cx.listener(move |this, _, _, cx| this.recheck_update_offer(kind, cx)))
+            .into_any_element(),
             Some((state, latest)) => {
                 let failed = matches!(state, AgentUpdateState::Failed(_));
                 let label = if failed {
@@ -994,7 +1062,13 @@ impl SettingsView {
                 .text_color(accent_color())
                 .child(icon("arrow-up", 12.).text_color(accent_color()))
                 .child(label)
-                .on_click(cx.listener(move |_, _, _, cx| cx.emit(SettingsEvent::UpdateAgent(kind))))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if this.update_offer_stale(kind) {
+                        this.recheck_update_offer(kind, cx);
+                    } else {
+                        cx.emit(SettingsEvent::UpdateAgent(kind));
+                    }
+                }))
                 .into_any_element()
             }
             None => match self.agents.inspections.get(&kind) {
@@ -1032,13 +1106,7 @@ impl SettingsView {
                              notes: Vec<AnyElement>,
                              cx: &mut Context<Self>| {
             let override_set = agent.command.is_some();
-            let path = self
-                .agents
-                .inspections
-                .get(&kind)
-                .and_then(|result| result.as_ref().ok())
-                .map(|inspection| inspection.path.clone())
-                .or_else(|| self.agent_path(kind));
+            let path = self.active_cli_path(kind);
             let mut line = div().flex().items_center().gap_2().child(
                 text_box(inputs.command.clone(), true, command_error.is_some())
                     .debug_selector(move || format!("settings-agent-command-{}", kind.id())),
@@ -1083,7 +1151,7 @@ impl SettingsView {
                         28.,
                         14.,
                         0.6,
-                        self.agents.inspecting.contains(&kind),
+                        self.agents.inspecting.contains_key(&kind),
                     )
                     .debug_selector(move || format!("settings-agent-check-{}", kind.id()))
                     .on_click(
@@ -1271,8 +1339,21 @@ impl SettingsView {
             ));
         }
 
-        // Command.
-        fields.push(command_field(fields.is_empty(), None, Vec::new(), cx));
+        // Command. Antigravity's is the ACP server its chat sessions use; its terminal
+        // always runs `agy`, so the field says it applies to chat only.
+        let (hint, notes) = if kind == Kind::Antigravity {
+            (
+                Some("Chat sessions".into()),
+                vec![
+                    help("Terminal sessions always run agy from your PATH.")
+                        .debug_selector(|| "settings-agent-command-chat-only".into())
+                        .into_any_element(),
+                ],
+            )
+        } else {
+            (None, Vec::new())
+        };
+        fields.push(command_field(fields.is_empty(), hint, notes, cx));
 
         // Model.
         {
@@ -1585,7 +1666,7 @@ impl SettingsView {
         }
 
         // Launch preview.
-        let terminal = agent.surface.is_tui() && !self.ctx.no_terminal_sessions;
+        let terminal = self.launches_in_terminal(kind);
         let (lead, permission, rest) = self.agent_launch_args(kind);
         let token = |text: String, color| div().text_color(color).child(text);
         let mut tokens: Vec<gpui::Div> = agent
@@ -1719,7 +1800,7 @@ impl SettingsView {
     /// The line under the Command field: where the CLI is and which version answered.
     fn command_status(&self, kind: Kind) -> AnyElement {
         let configured = self.prefs.agent(kind).command.is_some();
-        if self.agents.inspecting.contains(&kind) {
+        if self.agents.inspecting.contains_key(&kind) {
             return status_line(content(0.3), vec![("Checking the CLI…".into(), false)]);
         }
         match self.agents.inspections.get(&kind) {
@@ -1993,12 +2074,16 @@ impl SettingsView {
         let key = (kind, Field::Command);
         let stored = self.prefs.agent(kind).command.unwrap_or_default();
         if draft == stored {
+            // The saved command is the latest choice again: a check of another one still
+            // under way must not replace it when it passes.
+            self.cancel_command_save(kind);
             if self.agents.errors.remove(&key).is_some() {
                 cx.notify();
             }
             return;
         }
         if draft.is_empty() {
+            self.cancel_command_save(kind);
             self.agents.errors.remove(&key);
             self.update(cx, |p| {
                 p.binary_paths.remove(kind.id());
@@ -2013,6 +2098,11 @@ impl SettingsView {
             return;
         }
         self.inspect_agent(kind, Some(draft), true, false, cx);
+    }
+
+    /// Supersede the check of a command being saved, so its result saves nothing.
+    fn cancel_command_save(&mut self, kind: Kind) {
+        *self.agents.save_generation.entry(kind).or_default() += 1;
     }
 
     fn commit_agent_args(&mut self, kind: Kind, draft: String, cx: &mut Context<Self>) {
@@ -2036,7 +2126,20 @@ impl SettingsView {
                 return;
             }
         };
-        let extracted = launch_args::extract_structured(kind, &parts);
+        // A terminal that passes no flags of its own would lose a moved flag, so its typed
+        // flags stay in the arguments (chat launches drop them: `chat_user_args`).
+        let extracted =
+            if self.launches_in_terminal(kind) && launch_args::terminal_keeps_typed_flags(kind) {
+                launch_args::Extracted {
+                    rest: parts.clone(),
+                    ..Default::default()
+                }
+            } else {
+                launch_args::extract_structured(kind, &parts)
+            };
+        // `extracted.moved` is text for the notice; Undo needs the arguments themselves,
+        // so that one with a space in it goes back as one argument.
+        let moved_args = moved_tokens(&parts, &extracted.rest);
         let permission = extracted
             .permission
             .map(Permission::from_access)
@@ -2097,7 +2200,7 @@ impl SettingsView {
                 // now and restores the fields they wrote. Everything else typed in the
                 // same edit, or since, stays.
                 Some(Box::new({
-                    let moved = extracted.moved.join(" ");
+                    let moved = launch_args::join(&moved_args);
                     move |p: &mut Preferences| {
                         let line = p.agents.args.get(id).cloned().unwrap_or_default();
                         let line = [line.trim(), moved.as_str()]
@@ -2320,6 +2423,7 @@ impl SettingsView {
             p.agents.args.remove(id);
             p.agents.env.remove(id);
         });
+        self.cancel_command_save(kind);
         self.agents.errors.retain(|(agent, _), _| *agent != kind);
         self.agents.revealed.retain(|(agent, _)| *agent != kind);
         self.agents.inspections.remove(&kind);
@@ -2371,8 +2475,9 @@ impl SettingsView {
             *generation += 1;
             *generation
         };
-        self.agents.inspecting.insert(kind);
+        *self.agents.inspecting.entry(kind).or_default() += 1;
         let path = draft.clone().or_else(|| self.prefs.agent(kind).command);
+        let checked = path.clone();
         let inspector = self.agents.inspector.clone();
         let work = cx.background_executor().spawn(async move {
             match inspector {
@@ -2383,6 +2488,15 @@ impl SettingsView {
         cx.spawn(async move |this, cx| {
             let result = work.await;
             let _ = this.update(cx, |this, cx| {
+                // Every check ends here, superseded or not, so "Checking" lasts until the
+                // last one has.
+                if let Some(count) = this.agents.inspecting.get_mut(&kind) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        this.agents.inspecting.remove(&kind);
+                    }
+                }
+                cx.notify();
                 let generations = if save {
                     &this.agents.save_generation
                 } else {
@@ -2391,7 +2505,11 @@ impl SettingsView {
                 if generations.get(&kind) != Some(&generation) {
                     return;
                 }
-                this.agents.inspecting.remove(&kind);
+                // A refresh of a command that has since been replaced describes a CLI that
+                // new sessions no longer run.
+                if !save && checked != this.prefs.agent(kind).command {
+                    return;
+                }
                 let key = (kind, Field::Command);
                 match (&result, save) {
                     (Ok(_), true) => {
@@ -2437,6 +2555,58 @@ impl SettingsView {
         cx.notify();
     }
 
+    /// Tie each update offer to the command in effect when it first shows, and forget the
+    /// offers the shell no longer has.
+    fn bind_update_offers(&mut self) {
+        let offered: Vec<Kind> = self
+            .ctx
+            .agent_updates
+            .iter()
+            .map(|update| update.kind)
+            .collect();
+        self.agents
+            .offer_commands
+            .retain(|kind, _| offered.contains(kind));
+        for kind in offered {
+            let command = self.prefs.agent(kind).command;
+            self.agents.offer_commands.entry(kind).or_insert(command);
+        }
+    }
+
+    /// The shell's updates changed: an offer that is new or changed comes from a check or
+    /// an update that resolved the command in effect now, so it is tied again to that
+    /// command when it next shows. An unchanged offer keeps its command.
+    pub(in crate::settings) fn agent_updates_changed(
+        &mut self,
+        updates: &[crate::settings::AgentUpdate],
+    ) {
+        let before = &self.ctx.agent_updates;
+        self.agents.offer_commands.retain(|kind, _| {
+            let find = |list: &[crate::settings::AgentUpdate]| {
+                list.iter().find(|update| update.kind == *kind).cloned()
+            };
+            find(before) == find(updates)
+        });
+    }
+
+    /// The agent's update offer was found for a command other than the one in effect.
+    fn update_offer_stale(&self, kind: Kind) -> bool {
+        self.agents
+            .offer_commands
+            .get(&kind)
+            .is_some_and(|command| *command != self.prefs.agent(kind).command)
+    }
+
+    /// Replace a stale update offer with a check of the CLI in effect: the offer is tied to
+    /// the current command, and the shell's new check replaces or confirms it.
+    fn recheck_update_offer(&mut self, kind: Kind, cx: &mut Context<Self>) {
+        self.agents
+            .offer_commands
+            .insert(kind, self.prefs.agent(kind).command);
+        cx.emit(SettingsEvent::CheckHarnessUpdates);
+        cx.notify();
+    }
+
     /// Detection finished: note when, and ask each installed CLI its version for its row.
     pub(in crate::settings) fn agents_detected(&mut self, cx: &mut Context<Self>) {
         self.agents.checked_at = Some(Instant::now());
@@ -2457,7 +2627,7 @@ impl SettingsView {
             .filter(|(kind, path)| {
                 path.is_some()
                     && !self.agents.inspections.contains_key(kind)
-                    && !self.agents.inspecting.contains(kind)
+                    && !self.agents.inspecting.contains_key(kind)
             })
             .map(|(kind, _)| *kind)
             .collect();
@@ -2628,7 +2798,7 @@ impl SettingsView {
             return items;
         };
         let config = self.prefs.agent(kind);
-        let terminal = config.surface.is_tui() && !self.ctx.no_terminal_sessions;
+        let terminal = self.launches_in_terminal(kind);
         let own = config.permission_overridden.then_some(config.permission);
         let follows = {
             let mut prefs = self.prefs.clone();
@@ -2705,7 +2875,8 @@ impl SettingsView {
                 cx.emit(SettingsEvent::CheckHarnessUpdates);
             }
             "reveal" => {
-                if let Some(path) = self.agent_path(kind) {
+                // The same CLI as the Command field's folder button: the one in effect.
+                if let Some(path) = self.active_cli_path(kind) {
                     cx.reveal_path(&path);
                 }
             }

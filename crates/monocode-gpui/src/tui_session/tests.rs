@@ -215,7 +215,14 @@ fn codex_gets_its_verified_permission_flags_and_the_agents_own_settings_pass_non
     // A session saved before Settings → Agents existed is supervised.
     assert_eq!(
         args(&prepare(request(&store, &summary)).unwrap()),
-        ["-a", "on-request", "-s", "read-only"]
+        [
+            "-a",
+            "on-request",
+            "-s",
+            "read-only",
+            "-c",
+            "approvals_reviewer=\"user\""
+        ]
     );
     save_settings(&store, summary.id, |settings| {
         settings.access = monocode_core::agent::AccessMode::AgentDefault
@@ -381,7 +388,7 @@ fn claude_hooks_need_the_preference_a_data_folder_and_a_non_windows_host() {
         ..request(&store, &codex)
     })
     .unwrap();
-    assert!(bare.launch.args.is_empty());
+    assert_eq!(settings_json(&bare), None);
 }
 
 fn account_book(root: &Path) -> (Book, String) {

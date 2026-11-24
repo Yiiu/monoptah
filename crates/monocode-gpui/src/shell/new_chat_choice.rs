@@ -1,10 +1,11 @@
 //! The provider and model a new conversation starts with. One resolver, so
 //! every way of starting a chat agrees.
 //!
-//! Order: Settings default, last choice (`recent_models[0]`), then Codex (or the
-//! first allowed provider). A step is skipped when its provider is disabled.
-//! Per-project provider defaults are retired and no longer apply. Hidden providers are ignored for remote projects, as
-//! the model picker ignores them there.
+//! Order: Settings default, last choice's provider (`recent_models[0]`), then Codex (or
+//! the first allowed provider). The model is always the agent's Settings model. A step is
+//! skipped when its provider is disabled. Per-project provider defaults are retired and no
+//! longer apply. Hidden providers are ignored for remote projects, as the model picker
+//! ignores them there.
 use super::*;
 use crate::settings::Preferences;
 
@@ -48,10 +49,8 @@ pub(crate) fn resolve(prefs: &Preferences, cwd: &str) -> NewChatChoice {
     if let Some(recent) = prefs.recent_models.first()
         && let Some(kind) = Kind::parse(&recent.provider).filter(|k| allowed(prefs, cwd, *k))
     {
-        return NewChatChoice::of(
-            kind,
-            default_model(prefs, kind).or_else(|| recent.model.clone()),
-        );
+        // Only the provider: its model stays in that session (`None` is the agent's default).
+        return NewChatChoice::of(kind, default_model(prefs, kind));
     }
     // 3. Codex, or the first provider left.
     let kind = [Kind::Codex]

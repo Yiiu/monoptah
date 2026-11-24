@@ -600,6 +600,9 @@ impl SettingsView {
                 (None, None) => false,
                 _ => true,
             };
+            if self.ctx.agent_updates != ctx.agent_updates {
+                self.agent_updates_changed(&ctx.agent_updates);
+            }
             self.ctx = ctx;
             self.mobile_context_changed(cx);
             self.web_context_changed(cx);

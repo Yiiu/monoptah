@@ -1560,6 +1560,7 @@ pub fn chat_launch_args(
     access: AccessMode,
     user_args: &[String],
 ) -> Vec<String> {
+    let user_args = &crate::launch_args::chat_user_args(kind, user_args);
     let lead = crate::launch_args::args_lead(kind);
     let mut args: Vec<String> = Vec::new();
     if lead {
@@ -1623,7 +1624,10 @@ pub(crate) fn launch_command(
     crate::launch_args::apply_env(&mut command, &launch.env);
     request.settings.account.apply(request.kind, &mut command)?;
     if crate::launch_args::args_lead(request.kind) {
-        command.args(&launch.args);
+        command.args(crate::launch_args::chat_user_args(
+            request.kind,
+            &launch.args,
+        ));
     }
     Ok(command)
 }
@@ -1769,31 +1773,12 @@ fn run_operation(
             if settings.thinking == Some(true) {
                 config["alwaysThinkingEnabled"] = true.into();
             }
-            if let Some(effort) = settings.effort.as_deref().filter(|e| *e != "ultrathink") {
-                let effort = if effort == "ultracode" {
+            if let Some(effort) = settings.effort.as_deref().and_then(|effort| {
+                crate::launch_args::claude_chat_effort(effort, request.model.as_deref())
+            }) {
+                if settings.effort.as_deref() == Some("ultracode") {
                     config["ultracode"] = true.into();
-                    "xhigh"
-                } else if effort == "xhigh"
-                    && request.model.as_deref().is_some_and(|m| {
-                        matches!(
-                            m,
-                            "claude-opus-4-6"
-                                | "claude-sonnet-4-6"
-                                | "claude-opus-4-5"
-                                | "claude-haiku-4-5"
-                                | "claude-opus-4-1"
-                                | "claude-opus-4-0"
-                                | "claude-sonnet-4-0"
-                                | "claude-sonnet-4-5"
-                        )
-                    })
-                {
-                    "max"
-                } else if effort == "max" && request.model.as_deref() == Some("claude-sonnet-4-6") {
-                    "high"
-                } else {
-                    effort
-                };
+                }
                 command.args(["--effort", effort]);
             }
             command.args(["--settings", &config.to_string()]);
@@ -1823,7 +1808,10 @@ fn run_operation(
         _ => acp::configure(&mut command, &request)?,
     }
     if !crate::launch_args::args_lead(request.kind) {
-        command.args(&launch.args);
+        command.args(crate::launch_args::chat_user_args(
+            request.kind,
+            &launch.args,
+        ));
     }
     command
         .current_dir(if request.kind == Kind::Antigravity {
@@ -1840,7 +1828,7 @@ fn run_operation(
     }
     let eligible = !probe && !command_probe && !request.settings.text_only;
     let cached = eligible
-        .then(|| parked::take(&parked::key(&request)))
+        .then(|| parked::take(&parked::key_for(&request, &launch)))
         .flatten();
     let (mut wire, mut protocol, warm) = if let Some(cached) = cached {
         let mut protocol = Protocol::new(request);

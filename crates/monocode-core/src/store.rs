@@ -283,14 +283,26 @@ impl Store {
     /// One time per database: Codex terminal sessions launched the bare CLI before
     /// Settings → Agents existed, so the access they carry was never applied. They are
     /// set to the agent's own settings, so they keep launching without permission flags.
-    /// The marker is written after the rewrite and lives with the sessions (native-only
-    /// settings), so sessions created afterwards are never touched. Claude terminals
-    /// (which always passed their mode) and chats are left alone. Returns how many changed.
+    /// The marker lives with the sessions (native-only settings), so sessions created
+    /// afterwards are never touched. Claude terminals (which always passed their mode) and
+    /// chats are left alone. Returns how many changed.
+    ///
+    /// The migration must never run twice: a second run would reset a permission the user
+    /// picked after the first. In the native database the marker and the rewrites commit in
+    /// one transaction, so a failure leaves nothing behind and the retry starts clean. The
+    /// shared database keeps settings in a separate file, so there the marker is claimed
+    /// before any rewrite: a failure part way leaves some terminals unmigrated (they launch
+    /// with their stored mode), never a later choice overwritten.
     pub fn migrate_codex_terminal_access(&self) -> Result<usize, String> {
         const MARKER: &str = "migration:codex-terminal-own-access";
         if self.setting(MARKER)?.is_some() {
             return Ok(0);
         }
+        let tx = (self.shared.is_none() && self.conn.is_autocommit())
+            .then(|| self.conn.unchecked_transaction())
+            .transpose()
+            .map_err(|e| e.to_string())?;
+        self.save_setting(MARKER, "1")?;
         let mut changed = 0;
         for session in self.sessions()? {
             if session.provider != crate::provider::Kind::Codex.id()
@@ -307,7 +319,9 @@ impl Store {
                 changed += 1;
             }
         }
-        self.save_setting(MARKER, "1")?;
+        if let Some(tx) = tx {
+            tx.commit().map_err(|e| e.to_string())?;
+        }
         Ok(changed)
     }
     pub fn save_setting(&self, key: &str, value: &str) -> Result<(), String> {

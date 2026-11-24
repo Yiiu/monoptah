@@ -50,9 +50,14 @@ const COMMANDS: [(Command, &str); 4] = [
         "Save this message without starting the agent.",
     ),
 ];
-/// RUNTIME_MODES with their hints. Icons and colours are `theme::access_icon` and
+/// The agent's own settings, then RUNTIME_MODES, with their hints (as the composer's
+/// access menu). Icons and colours are `theme::access_icon` and
 /// `theme::access_color`, as in the composer and Settings → Agents.
-const PERMISSIONS: [(AccessMode, &str); 4] = [
+const PERMISSIONS: [(AccessMode, &str); 5] = [
+    (
+        AccessMode::AgentDefault,
+        "Pass no permission setting. The agent uses its own configuration.",
+    ),
     (
         AccessMode::Supervised,
         "Ask before commands and file changes.",
@@ -323,6 +328,7 @@ impl QuickComposer {
             .effort
             .or_else(|| crate::conversation::preferred_effort(self.kind.id(), cx));
         self.fast = choice.fast;
+        self.access = choice.access;
         if self.cwd != choice.cwd {
             self.cwd = choice.cwd;
             self.workspace = Workspace::default();
@@ -2160,6 +2166,55 @@ mod tests {
         });
         cx.run_until_parked();
         window
+    }
+
+    #[gpui::test]
+    fn reopening_applies_the_choices_access_and_the_picker_can_restore_the_agents_own(
+        cx: &mut TestAppContext,
+    ) {
+        let window = open(cx);
+        window
+            .update(cx, |view, window, cx| {
+                assert_eq!(view.access, AccessMode::Supervised);
+                let projects = view.projects.clone();
+                view.reopen(
+                    projects,
+                    HashMap::new(),
+                    Launch::choice(
+                        "/work/app".into(),
+                        Kind::Codex,
+                        None,
+                        AccessMode::AgentDefault,
+                    ),
+                    cx,
+                );
+                assert_eq!(view.access, AccessMode::AgentDefault);
+                // Picking an explicit level, then the agent's own settings again.
+                view.open(Picker::Permissions, window, cx);
+                let supervised = PERMISSIONS
+                    .iter()
+                    .position(|(mode, _)| *mode == AccessMode::Supervised)
+                    .unwrap();
+                view.choose_permission(supervised, window, cx);
+                assert_eq!(view.access, AccessMode::Supervised);
+                view.open(Picker::Permissions, window, cx);
+                let own = PERMISSIONS
+                    .iter()
+                    .position(|(mode, _)| *mode == AccessMode::AgentDefault)
+                    .expect("the agent's own settings are offered");
+                view.choose_permission(own, window, cx);
+                assert_eq!(view.access, AccessMode::AgentDefault);
+                // The four explicit levels stay.
+                for mode in [
+                    AccessMode::Supervised,
+                    AccessMode::AutoAcceptEdits,
+                    AccessMode::Auto,
+                    AccessMode::FullAccess,
+                ] {
+                    assert!(PERMISSIONS.iter().any(|(m, _)| *m == mode), "{mode:?}");
+                }
+            })
+            .unwrap();
     }
 
     #[gpui::test]

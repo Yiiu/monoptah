@@ -1432,6 +1432,10 @@ impl SettingsView {
                     .role(Role::RadioButton)
                     .aria_label(card.title.clone())
                     .aria_selected(selected)
+                    // Tab reaches each card, and Enter or Space picks it: GPUI turns either
+                    // key into a click on the focused element.
+                    .tab_index(0)
+                    .focus_visible(|s| s.border_color(content(0.6)))
                     .relative()
                     .min_w_0()
                     .rounded_md()
@@ -1573,6 +1577,9 @@ impl SettingsView {
                     .role(Role::RadioButton)
                     .aria_label(name.clone())
                     .aria_selected(selected)
+                    // Focusable like a radio card: Tab, then Enter or Space.
+                    .tab_index(0)
+                    .focus_visible(|s| s.bg(content(0.14)).text_color(content(1.)))
                     .min_w(px(56.))
                     .flex()
                     .flex_col()

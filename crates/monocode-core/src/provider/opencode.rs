@@ -36,6 +36,9 @@ struct Server {
     /// Set when its session is retired: stop it with SIGTERM and a grace
     /// period instead of an immediate group kill (unix).
     graceful: bool,
+    /// Settings → Agents arguments and environment it was started with: its parking key
+    /// describes this launch, not one saved while it ran.
+    launch: crate::launch_args::Launch,
     _registration: process::Registration,
     _account: crate::accounts::Tracked,
 }
@@ -157,6 +160,7 @@ fn park(server: Server, request: &Request, session: String) {
         return;
     }
     process::mark_idle(server.child.id(), true);
+    let key = parked::key_for(request, &server.launch);
     {
         let mut pool = idle().lock().unwrap_or_else(|e| e.into_inner());
         // Checked under the pool lock so `retire_session` cannot miss it.
@@ -168,7 +172,7 @@ fn park(server: Server, request: &Request, session: String) {
             session,
             account_id: request.settings.account.id.clone(),
             cwd: request.cwd.clone(),
-            key: parked::key(request),
+            key,
             at: Instant::now(),
             owner: process::owner(),
         });
@@ -192,9 +196,9 @@ fn park(server: Server, request: &Request, session: String) {
         drop(retired);
     });
 }
-fn command(request: &Request) -> Result<Command, String> {
+fn command(request: &Request, launch: &crate::launch_args::Launch) -> Result<Command, String> {
     // The user's arguments lead the subcommand (`serve`, `service status`).
-    let mut command = super::launch_command(request, &crate::cli::launch(request.kind))?;
+    let mut command = super::launch_command(request, launch)?;
     command
         .current_dir(&request.cwd)
         .stdin(Stdio::null())
@@ -204,7 +208,7 @@ fn command(request: &Request) -> Result<Command, String> {
     Ok(command)
 }
 fn exec(request: &Request, args: &[&str], cancel: &AtomicBool) -> Result<String, String> {
-    let mut child = command(request)?
+    let mut child = command(request, &crate::cli::launch(request.kind))?
         .args(args)
         .spawn()
         .map_err(|e| e.to_string())?;
@@ -309,10 +313,11 @@ fn shared_service(request: &Request, v2: bool) -> bool {
 }
 fn serve_command(
     request: &Request,
+    launch: &crate::launch_args::Launch,
     port: u16,
     v2: bool,
 ) -> Result<(Command, Option<String>), String> {
-    let mut command = command(request)?;
+    let mut command = command(request, launch)?;
     // v2 `serve` requires Basic auth; choose the password instead of parsing it.
     // OpenCode prefers OPENCODE_PASSWORD over OPENCODE_SERVER_PASSWORD, so set
     // the former to override any inherited value the client would not know.
@@ -348,10 +353,12 @@ fn connect(
         }
         return Ok((Client::new(url, directory, true, Some(password)), None));
     }
+    // One read of Settings → Agents for the lookup, the spawn and the parking key.
+    let launch = crate::cli::launch(request.kind);
     if let Some(id) = request.provider_id.as_deref() {
         let found = {
             let mut pool = idle().lock().unwrap_or_else(|e| e.into_inner());
-            let key = parked::key(request);
+            let key = parked::key_for(request, &launch);
             pool.iter()
                 .position(|idle| idle.session == id && idle.key == key)
                 .map(|index| pool.remove(index))
@@ -380,7 +387,7 @@ fn connect(
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).map_err(|e| e.to_string())?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
     drop(listener);
-    let (mut command, password) = serve_command(request, port, v2)?;
+    let (mut command, password) = serve_command(request, &launch, port, v2)?;
     let mut child = command.spawn().map_err(|e| e.to_string())?;
     let registration = process::register(child.id());
     let account = crate::accounts::track(child.id(), request.kind, &request.settings.account);
@@ -412,6 +419,7 @@ fn connect(
         password,
         epoch: process::turn_epoch(),
         graceful: false,
+        launch,
         _registration: registration,
         _account: account,
     };
@@ -861,7 +869,7 @@ mod tests {
             .settings
             .environment
             .insert("OPENCODE_PASSWORD".into(), "inherited".into());
-        let (command, password) = serve_command(&request, 4096, true).unwrap();
+        let (command, password) = serve_command(&request, &Default::default(), 4096, true).unwrap();
         let password = password.expect("v2 serve needs a password");
         assert_ne!(password, "inherited");
         let sent = command
@@ -870,12 +878,43 @@ mod tests {
             .and_then(|(_, value)| value);
         assert_eq!(sent, Some(std::ffi::OsStr::new(&password)));
 
-        let (command, password) = serve_command(&request, 4096, false).unwrap();
+        let (command, password) =
+            serve_command(&request, &Default::default(), 4096, false).unwrap();
         assert_eq!(password, None);
         let sent = command
             .get_envs()
             .find(|(key, _)| *key == "OPENCODE_PASSWORD")
             .and_then(|(_, value)| value);
         assert_eq!(sent, Some(std::ffi::OsStr::new("inherited")));
+    }
+
+    #[test]
+    fn the_server_runs_and_parks_under_the_launch_it_was_given() {
+        let request = Request {
+            kind: Kind::OpenCode,
+            binary: PathBuf::from("opencode"),
+            cwd: PathBuf::from("/project"),
+            prompt: "hello".into(),
+            provider_id: Some("ses_1".into()),
+            model: None,
+            settings: Settings::default(),
+        };
+        let launch = crate::launch_args::Launch {
+            args: vec!["--print-logs".into()],
+            env: vec![("HTTP_PROXY".into(), "http://127.0.0.1:9".into())],
+        };
+        let (command, _) = serve_command(&request, &launch, 4096, false).unwrap();
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(&args[..2], ["--print-logs", "serve"]);
+        assert!(command.get_envs().any(|(key, value)| key == "HTTP_PROXY"
+            && value == Some(std::ffi::OsStr::new("http://127.0.0.1:9"))));
+        // The parking key follows the launch the server was started with.
+        assert_ne!(
+            parked::key_for(&request, &launch),
+            parked::key_for(&request, &Default::default())
+        );
     }
 }

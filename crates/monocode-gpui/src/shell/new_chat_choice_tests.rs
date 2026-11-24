@@ -70,12 +70,13 @@ fn settings_provider_beats_recents_and_takes_its_default_model() {
 }
 
 #[test]
-fn last_choice_is_used_and_defaults_win_over_its_model() {
+fn last_choice_picks_the_provider_but_never_its_model() {
     let mut prefs = Preferences {
         recent_models: vec![recent("claude", Some("opus")), recent("pi", None)],
         ..Default::default()
     };
-    assert_eq!(pick(&prefs, LOCAL), (Kind::Claude, Some("opus".into())));
+    // The composer's model stays in its session: the agent's default applies.
+    assert_eq!(pick(&prefs, LOCAL), (Kind::Claude, None));
     prefs
         .default_models
         .insert("claude".into(), "sonnet".into());
@@ -170,7 +171,7 @@ fn ordinary_shell_new_chat_follows_the_last_choice(cx: &mut TestAppContext) {
     assert_eq!(new_chat(cx, vec![], &[]), ("codex".into(), None));
     assert_eq!(
         new_chat(cx, vec![recent("claude", Some("opus"))], &[]),
-        ("claude".into(), Some("opus".into()))
+        ("claude".into(), None)
     );
     // A hidden last choice is skipped.
     assert_eq!(

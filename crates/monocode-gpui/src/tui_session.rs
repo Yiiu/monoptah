@@ -241,7 +241,26 @@ fn agent_env(
     account: Vec<(String, std::ffi::OsString)>,
     removed: &[&str],
 ) -> Vec<(String, std::ffi::OsString)> {
-    let owned = |key: &str| account.iter().any(|(k, _)| k == key) || removed.contains(&key);
+    agent_env_on(user, account, removed, cfg!(windows))
+}
+
+/// `agent_env` for a host whose variable names are case-insensitive (`windows`) or not.
+fn agent_env_on(
+    user: Vec<(String, String)>,
+    account: Vec<(String, std::ffi::OsString)>,
+    removed: &[&str],
+    windows: bool,
+) -> Vec<(String, std::ffi::OsString)> {
+    let same = |a: &str, b: &str| {
+        if windows {
+            a.eq_ignore_ascii_case(b)
+        } else {
+            a == b
+        }
+    };
+    let owned = |key: &str| {
+        account.iter().any(|(k, _)| same(k, key)) || removed.iter().any(|k| same(k, key))
+    };
     let mut env: Vec<(String, std::ffi::OsString)> = user
         .into_iter()
         .filter(|(key, _)| !owned(key))
@@ -271,6 +290,30 @@ mod agent_env_tests {
                 ("CODEX_HOME".to_string(), "/account".into()),
             ]
         );
+    }
+
+    #[test]
+    fn windows_matches_account_variables_whatever_their_case() {
+        let user = || {
+            vec![
+                ("codex_home".into(), "/user".into()),
+                ("Openai_Api_Key".into(), "not-a-real-key".into()),
+                ("openai_api_key".into(), "not-a-real-key".into()),
+                ("HTTP_PROXY".into(), "http://127.0.0.1:9".into()),
+            ]
+        };
+        let account = || vec![("CODEX_HOME".into(), "/account".into())];
+        let windows = super::agent_env_on(user(), account(), &["OPENAI_API_KEY"], true);
+        assert_eq!(
+            windows,
+            vec![
+                ("HTTP_PROXY".to_string(), "http://127.0.0.1:9".into()),
+                ("CODEX_HOME".to_string(), "/account".into()),
+            ]
+        );
+        // Elsewhere names are case-sensitive: these are different variables.
+        let unix = super::agent_env_on(user(), account(), &["OPENAI_API_KEY"], false);
+        assert_eq!(unix.len(), 5, "{unix:?}");
     }
 }
 
