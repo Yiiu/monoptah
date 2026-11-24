@@ -160,8 +160,10 @@ impl Protocol {
         }
     }
 
-    pub(super) fn codex_access(&self) -> (Value, &'static str, Value, &'static str) {
-        let (policy, sandbox, mut sandbox_policy, reviewer) = self.request.settings.access.codex();
+    /// `None` when the session uses Codex's own settings: no approval or sandbox parameters.
+    pub(super) fn codex_access(&self) -> Option<(Value, &'static str, Value, &'static str)> {
+        let (policy, sandbox, mut sandbox_policy, reviewer) =
+            self.request.settings.access.codex()?;
         if (self.request.settings.operator
             || self.request.settings.operator_enabled
             || self.request.settings.orchestrator)
@@ -169,7 +171,7 @@ impl Protocol {
         {
             sandbox_policy["networkAccess"] = true.into();
         }
-        (policy, sandbox, sandbox_policy, reviewer)
+        Some((policy, sandbox, sandbox_policy, reviewer))
     }
 }
 

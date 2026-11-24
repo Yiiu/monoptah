@@ -49,6 +49,12 @@ pub fn tui_caps(kind: Kind) -> TuiCaps {
             initial_prompt: true,
             launch_flags: true,
         },
+        // Model, effort and permission flags checked against codex-cli 0.172.0; no resume
+        // or initial prompt wiring yet.
+        Kind::Codex => TuiCaps {
+            launch_flags: true,
+            ..TuiCaps::default()
+        },
         _ => TuiCaps::default(),
     }
 }
@@ -111,15 +117,17 @@ mod tests {
     }
 
     #[test]
-    fn only_claude_has_terminal_capabilities() {
+    fn only_claude_and_codex_have_terminal_capabilities() {
         for kind in Kind::ALL {
             let caps = tui_caps(kind);
             let all = caps.resume && caps.initial_prompt && caps.launch_flags;
             let none = !caps.resume && !caps.initial_prompt && !caps.launch_flags;
-            if kind == Kind::Claude {
-                assert!(all, "{kind:?}");
-            } else {
-                assert!(none, "{kind:?}");
+            match kind {
+                Kind::Claude => assert!(all, "{kind:?}"),
+                Kind::Codex => {
+                    assert!(caps.launch_flags && !caps.resume && !caps.initial_prompt)
+                }
+                _ => assert!(none, "{kind:?}"),
             }
         }
     }

@@ -13,7 +13,7 @@ fn recent(provider: &str, model: Option<&str>) -> ModelChoice {
     }
 }
 
-/// The project's own provider, models and hidden list.
+/// A project's own provider, models and hidden list (retired: never applied).
 fn project(
     prefs: &mut Preferences,
     cwd: &str,
@@ -41,10 +41,10 @@ fn nothing_set_starts_codex() {
 }
 
 #[test]
-fn project_provider_beats_settings_and_recents() {
+fn retired_project_defaults_no_longer_apply() {
     let mut prefs = Preferences {
         default_provider: Some("claude".into()),
-        default_models: [("grok".into(), "grok-default".into())].into(),
+        default_models: [("claude".into(), "opus".into())].into(),
         recent_models: vec![recent("pi", Some("pi-1"))],
         ..Default::default()
     };
@@ -52,18 +52,10 @@ fn project_provider_beats_settings_and_recents() {
         &mut prefs,
         LOCAL,
         Some("grok"),
-        &[("grok", "grok-project")],
-        &[],
+        &[("grok", "grok-project"), ("claude", "sonnet")],
+        &["claude"],
     );
-    assert_eq!(
-        pick(&prefs, LOCAL),
-        (Kind::Grok, Some("grok-project".into()))
-    );
-    project(&mut prefs, LOCAL, Some("grok"), &[], &[]);
-    assert_eq!(
-        pick(&prefs, LOCAL),
-        (Kind::Grok, Some("grok-default".into()))
-    );
+    assert_eq!(pick(&prefs, LOCAL), (Kind::Claude, Some("opus".into())));
 }
 
 #[test]
@@ -105,14 +97,6 @@ fn hidden_providers_are_skipped_step_by_step() {
     // Everything hidden falls back to Codex.
     prefs.hidden_providers = Kind::ALL.iter().map(|k| k.id().into()).collect();
     assert_eq!(pick(&prefs, LOCAL).0, Kind::Codex);
-    // A project's own hidden list counts for that project.
-    let mut prefs = Preferences {
-        recent_models: vec![recent("pi", Some("pi-1"))],
-        ..Default::default()
-    };
-    project(&mut prefs, LOCAL, None, &[], &["pi"]);
-    assert_eq!(pick(&prefs, LOCAL).0, Kind::Codex);
-    assert_eq!(pick(&prefs, "/work/other").0, Kind::Pi);
 }
 
 #[test]
@@ -127,7 +111,7 @@ fn remote_projects_ignore_the_hidden_list() {
 }
 
 #[test]
-fn explicit_provider_takes_the_project_then_default_model() {
+fn explicit_provider_takes_the_agents_model() {
     let mut prefs = Preferences {
         default_models: [("claude".into(), "sonnet".into())].into(),
         ..Default::default()
@@ -139,7 +123,12 @@ fn explicit_provider_takes_the_project_then_default_model() {
         NewChatChoice::explicit(&prefs, LOCAL, Kind::Claude)
             .model
             .as_deref(),
-        Some("opus")
+        Some("sonnet")
+    );
+    // No model set is the agent's default.
+    assert_eq!(
+        NewChatChoice::explicit(&prefs, LOCAL, Kind::Codex).model,
+        None
     );
 }
 

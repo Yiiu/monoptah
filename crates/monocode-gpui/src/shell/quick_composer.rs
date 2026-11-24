@@ -36,7 +36,7 @@ impl Shell {
             cwd.clone(),
             new.kind,
             new.model,
-            crate::conversation::default_access(cx),
+            crate::conversation::default_access(new.kind.id(), cx),
         );
         let mut choice = self
             .quick
@@ -44,7 +44,7 @@ impl Shell {
             .clone()
             .filter(|v| self.workspace.projects.contains(&v.cwd))
             .unwrap_or(initial);
-        choice.access = crate::conversation::default_access(cx);
+        choice.access = crate::conversation::default_access(choice.kind.id(), cx);
         choice
     }
     /// The menu bar's Quick Composer: brings the composer forward rather
@@ -135,7 +135,6 @@ impl Shell {
         let store = self.store.clone();
         let mut choice = launch.clone();
         let attachments = std::mem::take(&mut choice.attachments);
-        crate::conversation::remember_access(choice.access, cx);
         crate::pickers::remember_model(choice.kind, choice.model.clone(), cx);
         let account = crate::accounts::get(cx)
             .map(|a| a.read(cx).selected(launch.kind, &launch.cwd))

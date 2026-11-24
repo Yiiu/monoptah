@@ -55,31 +55,6 @@ impl SettingsView {
                 )],
             ),
         ];
-        let mut options = vec![(
-            "global".into(),
-            SharedString::from("Global"),
-            Some(icon("globe", 14.).into_any_element()),
-        )];
-        options.extend(self.ctx.projects.iter().map(|(path, label)| {
-            (
-                path.clone(),
-                SharedString::from(label.clone()),
-                Some(icon("folder", 14.).into_any_element()),
-            )
-        }));
-        let scope = self.provider_scope.clone();
-        let action = self.select(
-            "provider-scope",
-            "Provider defaults scope",
-            &scope,
-            options,
-            None,
-            cx,
-            |this, value, cx| {
-                this.provider_scope = value;
-                cx.notify();
-            },
-        );
         let binaries = self.discovery.binaries.clone();
         let mut clis = Vec::new();
         for (index, kind) in Kind::ALL.into_iter().enumerate() {
@@ -87,28 +62,19 @@ impl SettingsView {
                 .iter()
                 .find(|(k, _)| *k == kind)
                 .and_then(|(_, p)| p.as_ref());
-            let project = if scope == "global" {
-                None
-            } else {
-                p.project_providers.get(&scope)
-            };
-            let selected = project
-                .and_then(|p| p.provider.as_deref())
-                .or(p.default_provider.as_deref())
-                == Some(kind.id());
-            let globally_hidden = p.hidden_providers.iter().any(|id| id == kind.id());
-            let locked = scope != "global" && globally_hidden;
-            let visible = !globally_hidden
-                && !project.is_some_and(|p| p.hidden.iter().any(|id| id == kind.id()));
+            // Per-project provider defaults are retired: everything here is global.
+            let agent = p.agent(kind);
+            let selected = p.default_provider.as_deref() == Some(kind.id());
+            let visible = agent.enabled;
             let models = self
                 .ctx
                 .catalogs
                 .get(kind.id())
                 .cloned()
                 .unwrap_or_default();
-            let selected_model = project
-                .and_then(|p| p.models.get(kind.id()))
-                .or(p.default_models.get(kind.id()))
+            let selected_model = p
+                .default_models
+                .get(kind.id())
                 .cloned()
                 .or_else(|| models.first().map(|m| m.0.clone()));
             let label = div()
@@ -178,15 +144,7 @@ impl SettingsView {
                     !selected && selected_model.is_some() && installed.is_some(),
                     |d| {
                         d.on_click(cx.listener(move |this, _, _, cx| {
-                            let scope = this.provider_scope.clone();
-                            this.update(cx, |p| {
-                                if scope == "global" {
-                                    p.default_provider = Some(kind.id().into());
-                                } else {
-                                    p.project_providers.entry(scope).or_default().provider =
-                                        Some(kind.id().into());
-                                }
-                            })
+                            this.update(cx, |p| p.default_provider = Some(kind.id().into()))
                         }))
                     },
                 )
@@ -206,17 +164,8 @@ impl SettingsView {
                         None,
                         cx,
                         move |this, model, cx| {
-                            let scope = this.provider_scope.clone();
                             this.update(cx, |p| {
-                                if scope == "global" {
-                                    p.default_models.insert(kind.id().into(), model);
-                                } else {
-                                    p.project_providers
-                                        .entry(scope)
-                                        .or_default()
-                                        .models
-                                        .insert(kind.id().into(), model);
-                                }
+                                p.default_models.insert(kind.id().into(), model);
                             });
                         },
                     ),
@@ -225,11 +174,7 @@ impl SettingsView {
             // How a new session opens. The icons of the web app's control have no
             // native widget here, so both options are text.
             if !self.ctx.no_terminal_sessions {
-                let surface = p
-                    .provider_surfaces
-                    .get(kind.id())
-                    .copied()
-                    .unwrap_or_default();
+                let surface = agent.surface;
                 controls.push(self.segmented(
                     format!("session-surface-{}", kind.id()),
                     format!("{} session surface", kind.label()),
@@ -241,9 +186,7 @@ impl SettingsView {
                     cx,
                     move |this, value, cx| {
                         if let Some(surface) = Surface::parse(value) {
-                            this.update(cx, |p| {
-                                p.provider_surfaces.insert(kind.id().into(), surface);
-                            })
+                            this.update(cx, |p| p.set_agent_surface(kind, surface))
                         }
                     },
                 ));
@@ -258,30 +201,18 @@ impl SettingsView {
                             div()
                                 .text_size(px(12.))
                                 .text_color(content(0.5))
-                                .child(if locked {
-                                    "Hidden globally"
-                                } else {
-                                    "Show in picker"
-                                }),
+                                .child("Show in picker"),
                         )
                         .child(self.toggle(
                             kind.id(),
                             "Show provider in the model picker",
                             visible,
-                            locked,
+                            false,
                             cx,
                             move |this, on, cx| {
-                                let scope = this.provider_scope.clone();
+                                // Disabling the default agent also clears the default.
                                 this.update(cx, |p| {
-                                    let hidden = if scope == "global" {
-                                        &mut p.hidden_providers
-                                    } else {
-                                        &mut p.project_providers.entry(scope).or_default().hidden
-                                    };
-                                    hidden.retain(|id| id != kind.id());
-                                    if !on {
-                                        hidden.push(kind.id().into());
-                                    }
+                                    p.set_agent_enabled(kind, on);
                                 })
                             },
                         ))
@@ -400,7 +331,7 @@ impl SettingsView {
                 false,
                 "Agent CLIs",
                 Some("Choose available agents and default models for new conversations.".into()),
-                Some(action),
+                None,
                 clis,
             ),
             self.group(

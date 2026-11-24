@@ -2172,3 +2172,80 @@ fn a_shared_session_records_when_it_was_created() {
     // A remote session (negative id) has none here.
     assert_eq!(store.session_created_at(-1).unwrap(), None);
 }
+
+#[test]
+fn the_agents_own_settings_never_reach_the_shared_runtime_mode_column() {
+    use crate::agent::AccessMode;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("monocode.db");
+    let store = Store::open_monocode(&path).unwrap();
+    let summary = store.create("codex", "/work").unwrap();
+    let id = summary.id;
+    let column = |store: &Store| -> String {
+        store
+            .conn
+            .query_row(
+                "SELECT runtime_mode FROM sessions WHERE id=?1",
+                [store.persisted_session_id(id).unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    let access = |store: &Store| store.agent_settings(id).unwrap().unwrap().access;
+    let mut settings = store.agent_settings(id).unwrap().unwrap_or_default();
+    settings.access = AccessMode::AgentDefault;
+    store.save_agent_settings(id, &settings).unwrap();
+    // The desktop app reads the peer id; native reads its own value back.
+    assert_eq!(column(&store), "supervised");
+    assert_eq!(access(&store), AccessMode::AgentDefault);
+    drop(store);
+    // The native value lives in the sidecar and survives a reopen.
+    let store = Store::open_monocode(&path).unwrap();
+    assert_eq!(column(&store), "supervised");
+    assert_eq!(access(&store), AccessMode::AgentDefault);
+    // Every other level is written to the shared column as before.
+    let mut settings = store.agent_settings(id).unwrap().unwrap();
+    settings.access = AccessMode::Auto;
+    store.save_agent_settings(id, &settings).unwrap();
+    assert_eq!(column(&store), "auto");
+    assert_eq!(access(&store), AccessMode::Auto);
+}
+
+#[test]
+fn a_desktop_edit_after_own_wins_and_drops_it() {
+    use crate::agent::AccessMode;
+    let store = Store::open_monocode(Path::new(":memory:")).unwrap();
+    let id = store.create("claude", "/work").unwrap().id;
+    let mut settings = store.agent_settings(id).unwrap().unwrap_or_default();
+    settings.access = AccessMode::AgentDefault;
+    store.save_agent_settings(id, &settings).unwrap();
+    let set_column = |mode: &str| {
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET runtime_mode=?1 WHERE id=?2",
+                params![mode, store.persisted_session_id(id).unwrap()],
+            )
+            .unwrap();
+    };
+    // The desktop app picks full access for this session.
+    set_column("full-access");
+    let access = || store.agent_settings(id).unwrap().unwrap().access;
+    assert_eq!(access(), AccessMode::FullAccess);
+    // Returning to the peer id later does not revive "own": it was dropped.
+    set_column("supervised");
+    assert_eq!(access(), AccessMode::Supervised);
+}
+
+#[test]
+fn deleting_a_session_removes_its_native_settings() {
+    use crate::agent::AccessMode;
+    let store = Store::open_monocode(Path::new(":memory:")).unwrap();
+    let id = store.create("codex", "/work").unwrap().id;
+    let mut settings = store.agent_settings(id).unwrap().unwrap_or_default();
+    settings.access = AccessMode::AgentDefault;
+    store.save_agent_settings(id, &settings).unwrap();
+    assert!(store.setting(&format!("agent:{id}")).unwrap().is_some());
+    store.shared_delete(id).unwrap();
+    assert_eq!(store.setting(&format!("agent:{id}")).unwrap(), None);
+}

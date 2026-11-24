@@ -150,7 +150,7 @@ impl NewSessionDefaults {
             account: crate::accounts::get(cx)
                 .map(|center| center.read(cx).selected(kind, cwd))
                 .unwrap_or_default(),
-            access: crate::conversation::default_access(cx),
+            access: crate::conversation::default_access(kind.id(), cx),
             effort: crate::conversation::preferred_effort(kind.id(), cx),
             surface,
         }

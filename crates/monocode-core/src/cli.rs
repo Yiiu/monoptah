@@ -1,4 +1,7 @@
 //! Bounded CLI invocations for Settings management. Call only from workers.
+//! Also holds the per-agent CLI path overrides and extra launch configuration that every
+//! launch reads; both are replaced whenever the settings change.
+pub use crate::launch_args::Launch;
 use crate::provider::Kind;
 use std::{
     collections::HashMap,
@@ -12,16 +15,39 @@ fn paths() -> &'static RwLock<HashMap<String, String>> {
     static PATHS: OnceLock<RwLock<HashMap<String, String>>> = OnceLock::new();
     PATHS.get_or_init(Default::default)
 }
+/// Replace the configured CLI paths. Called at startup and after every settings change,
+/// so a new path applies to the next launch without a restart.
 pub fn initialize(overrides: &HashMap<String, String>) {
-    static INIT: OnceLock<()> = OnceLock::new();
-    INIT.get_or_init(|| {
-        *paths().write().unwrap() = overrides.clone();
-    });
+    let mut paths = paths().write().unwrap_or_else(|e| e.into_inner());
+    if *paths != *overrides {
+        *paths = overrides.clone();
+    }
+}
+fn launches() -> &'static RwLock<HashMap<String, Launch>> {
+    static LAUNCHES: OnceLock<RwLock<HashMap<String, Launch>>> = OnceLock::new();
+    LAUNCHES.get_or_init(Default::default)
+}
+/// Replace every agent's extra launch arguments and environment, keyed by `Kind::id()`.
+/// Called with the settings at startup and after every settings change.
+pub fn set_launches(next: HashMap<String, Launch>) {
+    let mut launches = launches().write().unwrap_or_else(|e| e.into_inner());
+    if *launches != next {
+        *launches = next;
+    }
+}
+/// The extra arguments and environment the user set for this agent; empty when none.
+pub fn launch(kind: Kind) -> Launch {
+    launches()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(kind.id())
+        .cloned()
+        .unwrap_or_default()
 }
 pub fn configured(kind: Kind) -> Option<PathBuf> {
     paths()
         .read()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .get(kind.id())
         .filter(|p| !p.trim().is_empty())
         .map(PathBuf::from)
@@ -150,5 +176,32 @@ mod tests {
         assert!(inspect(Kind::Codex, path.to_str())
             .unwrap_err()
             .contains("invalid version"));
+    }
+}
+
+#[cfg(test)]
+mod reload_tests {
+    use super::*;
+
+    #[test]
+    fn paths_and_launches_are_replaced_on_every_call() {
+        // Fx is never launched by the core tests, so this does not leak into others.
+        let first = HashMap::from([("fx".to_string(), "/first/fx".to_string())]);
+        initialize(&first);
+        assert_eq!(configured(Kind::Fx), Some(PathBuf::from("/first/fx")));
+        let second = HashMap::from([("fx".to_string(), "/second/fx".to_string())]);
+        initialize(&second);
+        assert_eq!(configured(Kind::Fx), Some(PathBuf::from("/second/fx")));
+        initialize(&HashMap::new());
+        assert_eq!(configured(Kind::Fx), None);
+
+        let launch = Launch {
+            args: vec!["--verbose".into()],
+            env: vec![("HTTP_PROXY".into(), "http://127.0.0.1:9".into())],
+        };
+        set_launches(HashMap::from([("fx".to_string(), launch.clone())]));
+        assert_eq!(super::launch(Kind::Fx), launch);
+        set_launches(HashMap::new());
+        assert!(super::launch(Kind::Fx).is_empty());
     }
 }

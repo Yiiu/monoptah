@@ -186,12 +186,17 @@ pub(crate) fn prepare(request: Request) -> Result<Prepared, String> {
             Some((cli, tui_hook::spool_dir(data_dir.as_deref()?)))
         })
         .flatten();
-    let (env_set, env_remove) = profile.env(kind)?;
+    let (account_set, env_remove) = profile.env(kind)?;
+    // Settings → Agents arguments and environment (`Preferences::agent`, pushed to core).
+    let extra = monocode_core::cli::launch(kind);
+    let env_set = agent_env(extra.env, account_set, &env_remove);
     let launch = tui_launch::build(LaunchInput {
         kind,
         binary,
         model: settings.model.clone(),
+        effort: settings.effort.clone(),
         access: settings.access,
+        args: extra.args,
         provider_id: if claim.is_some() { None } else { saved.clone() },
         new_id: claim.clone(),
         initial_prompt,
@@ -227,6 +232,46 @@ pub(crate) fn prepare(request: Request) -> Result<Prepared, String> {
         claimed: claim.is_some(),
         launch,
     })
+}
+
+/// The user's variables, then the account's on top. A user variable the account sets or
+/// removes is dropped, so the account wins on every platform (Windows ignores removals).
+fn agent_env(
+    user: Vec<(String, String)>,
+    account: Vec<(String, std::ffi::OsString)>,
+    removed: &[&str],
+) -> Vec<(String, std::ffi::OsString)> {
+    let owned = |key: &str| account.iter().any(|(k, _)| k == key) || removed.contains(&key);
+    let mut env: Vec<(String, std::ffi::OsString)> = user
+        .into_iter()
+        .filter(|(key, _)| !owned(key))
+        .map(|(key, value)| (key, value.into()))
+        .collect();
+    env.extend(account);
+    env
+}
+
+#[cfg(test)]
+mod agent_env_tests {
+    #[test]
+    fn the_account_wins_over_the_users_variables() {
+        let env = super::agent_env(
+            vec![
+                ("HTTP_PROXY".into(), "http://127.0.0.1:9".into()),
+                ("CODEX_HOME".into(), "/user".into()),
+                ("OPENAI_API_KEY".into(), "not-a-real-key".into()),
+            ],
+            vec![("CODEX_HOME".into(), "/account".into())],
+            &["OPENAI_API_KEY"],
+        );
+        assert_eq!(
+            env,
+            vec![
+                ("HTTP_PROXY".to_string(), "http://127.0.0.1:9".into()),
+                ("CODEX_HOME".to_string(), "/account".into()),
+            ]
+        );
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

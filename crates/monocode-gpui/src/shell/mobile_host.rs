@@ -706,7 +706,7 @@ impl Shell {
         (
             choice.kind,
             model,
-            remote_default_access(crate::conversation::default_access(cx)),
+            remote_default_access(crate::conversation::default_access(choice.kind.id(), cx)),
         )
     }
 
@@ -3063,7 +3063,7 @@ impl Shell {
                 "harness": kind.id(),
                 "model": current_model,
                 "modelSettings": settings,
-                "runtimeMode": access.id(),
+                "runtimeMode": access.peer_id(),
             });
             if let Some(account) = account {
                 current["providerAccountId"] = json!(account);
@@ -4978,7 +4978,7 @@ mod tests {
     }
 
     #[test]
-    fn a_project_hidden_provider_is_left_out_of_the_model_sheet_for_local_projects() {
+    fn retired_project_hidden_lists_do_not_change_the_model_sheet() {
         let mut prefs = crate::settings::Preferences {
             hidden_providers: vec!["claude".into()],
             ..Default::default()
@@ -4988,10 +4988,7 @@ mod tests {
             .entry("/work/project".into())
             .or_default()
             .hidden = vec!["codex".into()];
-        assert_eq!(
-            hidden_providers(&prefs, "/work/project"),
-            ["claude", "codex"]
-        );
+        assert_eq!(hidden_providers(&prefs, "/work/project"), ["claude"]);
         assert_eq!(hidden_providers(&prefs, "/work/other"), ["claude"]);
         assert!(hidden_providers(&prefs, "remote://env/work/project").is_empty());
     }
@@ -5010,10 +5007,11 @@ mod tests {
             .project_providers
             .entry("/work/project".into())
             .or_default();
+        // Retired per-project models no longer apply.
         project.models = [("claude".into(), "claude-sonnet-5-5".into())].into();
         assert_eq!(
             explicit_model(&prefs, "/work/project", Kind::Claude).as_deref(),
-            Some("claude-sonnet-5-5")
+            Some("claude-opus-5-5")
         );
         assert_eq!(explicit_model(&prefs, "/work/project", Kind::Codex), None);
     }

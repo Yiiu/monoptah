@@ -4,6 +4,10 @@ use monocode_core::{cloud_sessions::kit_prefs::CloudKitPrefs, provider::Kind, su
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 
+mod agents;
+#[allow(unused_imports)]
+pub(crate) use agents::{AgentConfig, AgentPreferences, OPEN_CHAT, OPEN_PER_AGENT, OPEN_TUI};
+
 /// A saved entry naming a provider or surface this build does not know is
 /// dropped; it must not cost the user every other preference.
 fn known_surfaces<'de, D: Deserializer<'de>>(
@@ -108,14 +112,18 @@ pub(crate) struct Preferences {
     pub default_provider: Option<String>,
     pub default_models: HashMap<String, String>,
     pub hidden_providers: Vec<String>,
+    /// Retired: per-project provider defaults no longer apply. Kept for older builds.
     pub project_providers: HashMap<String, ProviderDefaults>,
     pub favorite_models: Vec<ModelChoice>,
     pub recent_models: Vec<ModelChoice>,
     pub model_picker_tab: Option<String>,
-    /// The last access mode picked in a composer; new chats start with it.
+    /// Retired: the last composer access mode. Read once by `migrate_agents`; kept for
+    /// older builds.
     pub default_access: Option<String>,
-    /// Last explicit effort choice for each provider, shared across projects.
+    /// Retired: the last composer effort per provider. Read once by `migrate_agents`.
     pub provider_efforts: HashMap<String, String>,
+    /// Settings → Agents: open mode, permissions, efforts, arguments and environment.
+    pub agents: AgentPreferences,
     /// The model for session titles, branch names, commit messages and pull
     /// requests; `None` lets each use its own harness's quick model.
     pub background_model: Option<ModelChoice>,
@@ -213,6 +221,7 @@ impl Default for Preferences {
             model_picker_tab: None,
             default_access: None,
             provider_efforts: HashMap::new(),
+            agents: AgentPreferences::default(),
             background_model: None,
             monos: true,
             rail_monos_pinned: false,
@@ -314,11 +323,10 @@ impl Preferences {
         let choice = self.background_model.as_ref()?;
         Some((Kind::parse(&choice.provider)?, choice.model.clone()))
     }
-    pub(crate) fn hidden_for(&self, project: &str) -> Vec<String> {
+    /// Disabled agents. Per-project hidden lists are retired, so every project gets the
+    /// same list; the parameter stays for the callers' sake.
+    pub(crate) fn hidden_for(&self, _project: &str) -> Vec<String> {
         let mut hidden = self.hidden_providers.clone();
-        if let Some(settings) = self.project_providers.get(project) {
-            hidden.extend(settings.hidden.clone());
-        }
         hidden.sort();
         hidden.dedup();
         hidden

@@ -163,7 +163,7 @@ impl Automations {
         let kind = Kind::from_id(&editor.draft.harness);
         let preferred = cx
             .try_global::<crate::settings::Preferences>()
-            .and_then(|p| p.provider_surfaces.get(kind.id()).copied())
+            .map(|p| p.agent(kind).surface)
             .unwrap_or_default();
         self.terminal_sessions
             && monocode_core::surface::automation_surface(kind, &editor.draft.cwd, preferred)

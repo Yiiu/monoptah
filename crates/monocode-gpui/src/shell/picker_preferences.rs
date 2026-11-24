@@ -1,4 +1,5 @@
-//! Keep remembered picker/file choices in the native workspace sidecar.
+//! Keep remembered picker/file choices in the native workspace sidecar. Composer access and
+//! effort are no longer remembered: new sessions start from Settings → Agents.
 use super::*;
 
 impl Shell {
@@ -10,8 +11,6 @@ impl Shell {
                 && saved.favorite_models == prefs.favorite_models
                 && saved.recent_models == prefs.recent_models
                 && saved.file_view_mode == prefs.file_view_mode
-                && saved.default_access == prefs.default_access
-                && saved.provider_efforts == prefs.provider_efforts
             {
                 return;
             }
@@ -19,8 +18,6 @@ impl Shell {
             saved.favorite_models = prefs.favorite_models.clone();
             saved.recent_models = prefs.recent_models.clone();
             saved.file_view_mode = prefs.file_view_mode.clone();
-            saved.default_access = prefs.default_access.clone();
-            saved.provider_efforts = prefs.provider_efforts.clone();
             this.sync_settings(cx);
             this.persist(cx);
         });

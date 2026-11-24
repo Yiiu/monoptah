@@ -330,7 +330,10 @@ impl Protocol {
         let kind = self.request.kind;
         let settings = &self.request.settings;
         let planning = settings.plan || settings.access == AccessMode::ReadOnly;
+        // The agent's own settings: leave the session in the mode the agent starts in.
+        let own = !planning && settings.access == AccessMode::AgentDefault;
         let mode = match kind {
+            _ if own => "",
             Kind::Antigravity => {
                 if planning {
                     "default"
@@ -693,7 +696,9 @@ impl Protocol {
                         || self.request.settings.plan
                         || self.request.settings.access == AccessMode::ReadOnly;
                     let access = self.request.settings.access;
-                    let auto = self.request.kind == Kind::Fx
+                    // The agent's own settings: every request the agent sends reaches the user.
+                    let auto = (self.request.kind == Kind::Fx
+                        && access != AccessMode::AgentDefault)
                         || access == AccessMode::FullAccess
                         || (access == AccessMode::Auto
                             && self.request.kind != Kind::Antigravity

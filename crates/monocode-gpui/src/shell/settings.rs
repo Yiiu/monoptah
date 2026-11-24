@@ -549,7 +549,9 @@ impl Shell {
             self.update_chat_visibility(cx);
             self.invalidate_chrome(cx);
         }
+        // Both are replaced on every change, so the next launch uses them without a restart.
         monocode_core::cli::initialize(&self.workspace.preferences.binary_paths);
+        monocode_core::cli::set_launches(self.workspace.preferences.launches());
         self.keep_visible_idle_agents(cx);
         monocode_core::provider::configure_idle_agents(
             self.workspace.preferences.idle_agents as usize,

@@ -153,8 +153,9 @@ impl Shell {
             string(&params, "model"),
             None,
         );
-        let access = access
-            .unwrap_or_else(|| remote_default_access(crate::conversation::default_access(cx)));
+        let access = access.unwrap_or_else(|| {
+            remote_default_access(crate::conversation::default_access(Kind::Claude.id(), cx))
+        });
         let effort = crate::conversation::preferred_effort(Kind::Claude.id(), cx);
         let chosen = model_settings(&params);
         let probe = OptionsProbe::new(cwd.clone(), self.mobile_cloud_service(), cx);

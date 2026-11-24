@@ -547,7 +547,6 @@ impl Conversation {
         cx: &mut Context<Self>,
     ) {
         self.settings.access = mode;
-        super::remember_access(mode, cx);
         self.save_settings(cx);
         cx.notify();
     }

@@ -167,6 +167,33 @@ impl Profile {
         }
         Ok(environment)
     }
+    /// The variables this account sets or removes for a provider process. A user variable
+    /// with one of these names is overridden by the account (Settings marks it so).
+    pub fn owned_keys(&self, kind: Kind) -> Vec<&'static str> {
+        let mut keys = Vec::new();
+        if kind == Kind::Claude && claude_entrypoint() {
+            keys.push("CLAUDE_CODE_ENTRYPOINT");
+        }
+        if self.id != DEFAULT && supports_profiles(kind) {
+            keys.extend_from_slice(match kind {
+                Kind::Claude => &[
+                    "CLAUDE_CONFIG_DIR",
+                    "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+                    "ANTHROPIC_API_KEY",
+                    "ANTHROPIC_AUTH_TOKEN",
+                    "CLAUDE_CODE_OAUTH_TOKEN",
+                ][..],
+                Kind::Codex => &[
+                    "CODEX_HOME",
+                    "OPENAI_API_KEY",
+                    "CODEX_API_KEY",
+                    "CODEX_ACCESS_TOKEN",
+                ][..],
+                _ => &[][..],
+            });
+        }
+        keys
+    }
     pub fn apply(&self, kind: Kind, command: &mut Command) -> Result<(), String> {
         if kind == Kind::Claude && claude_entrypoint() {
             command.env("CLAUDE_CODE_ENTRYPOINT", "monocode");

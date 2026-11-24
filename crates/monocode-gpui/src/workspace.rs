@@ -590,6 +590,14 @@ impl Workspace {
                 state.preferences.empty_session = if games { "games" } else { "none" }.into();
             }
         }
+        // Settings → Agents replaces "remember the last composer choice": seed it once from
+        // the older fields. Once saved, `agents.open_mode` exists and this never reruns.
+        let agents_migrated = saved
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            .is_some_and(|value| value.pointer("/preferences/agents/open_mode").is_some());
+        if !agents_migrated {
+            state.preferences.migrate_agents();
+        }
         let has_rail_state = saved
             .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
             .is_some_and(|value| value.get("project_rail_pinned").is_some());
@@ -1516,6 +1524,34 @@ mod tests {
         assert_eq!(state.visible_project_order(), state.projects);
         assert!(state.move_project_to_end("/e", -1));
         assert_eq!(state.projects[0], "/e");
+    }
+
+    #[test]
+    fn agent_settings_migrate_once_and_a_later_load_keeps_edits() {
+        let old = r#"{"preferences":{"default_access":"full-access",
+            "provider_efforts":{"codex":"high"},"provider_surfaces":{"claude":"tui"}}}"#;
+        let mut state = super::Workspace::restore(Some(old), &[], "/work");
+        let agents = &state.preferences.agents;
+        assert_eq!(agents.permission.as_deref(), Some("full"));
+        assert_eq!(agents.efforts["codex"], "high");
+        assert_eq!(agents.open_mode, "per-agent");
+        // An edit after the migration survives the next load: it does not run again.
+        state.preferences.agents.permission = Some("ask".into());
+        state.preferences.agents.efforts.clear();
+        state.preferences.agents.open_mode = "chat".into();
+        let saved = serde_json::to_string(&state).unwrap();
+        let again = super::Workspace::restore(Some(&saved), &[], "/work");
+        assert_eq!(again.preferences.agents, state.preferences.agents);
+        // A bad value in a new field does not reset the rest of the workspace.
+        let bad = r#"{"project":"/kept","preferences":{"sounds":false,"agents":{"open_mode":"chat","efforts":5}}}"#;
+        let state = super::Workspace::restore(Some(bad), &[], "/work");
+        assert_eq!(state.project, "/kept");
+        assert!(!state.preferences.sounds);
+        assert_eq!(state.preferences.agents.open_mode, "chat");
+        // A fresh install starts on the agent's own settings, opening in chat.
+        let fresh = super::Workspace::restore(None, &[], "/work");
+        assert_eq!(fresh.preferences.agents.permission.as_deref(), Some("own"));
+        assert_eq!(fresh.preferences.agents.open_mode, "chat");
     }
 
     #[test]

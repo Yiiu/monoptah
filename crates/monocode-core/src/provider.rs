@@ -316,6 +316,9 @@ struct Protocol {
     visible_question: Option<String>,
     async_question_items: std::collections::HashSet<String>,
     async_answers: HashMap<String, (Value, String, Value, crate::agent::Question)>,
+    /// The Settings → Agents arguments and environment this process was started with, so
+    /// a settings edit during a turn cannot park it under the new configuration's key.
+    launch: crate::launch_args::Launch,
 }
 impl Protocol {
     fn new(request: Request) -> Self {
@@ -359,6 +362,7 @@ impl Protocol {
             visible_question: None,
             async_question_items: Default::default(),
             async_answers: HashMap::new(),
+            launch: Default::default(),
         }
     }
     fn text(&mut self, key: &str, text: &str, snapshot: bool, events: &mut Vec<Event>) {
@@ -586,9 +590,16 @@ impl Protocol {
                             write_json(stdin, json!({"method":"initialized"}))?;
                             self.initialized = true;
                         }
-                        let (policy, sandbox, sandbox_policy, reviewer) = self.codex_access();
-                        let mut params = json!({"cwd":self.request.cwd,"approvalPolicy":policy,"sandbox":sandbox,"sandboxPolicy":sandbox_policy,"approvalsReviewer":reviewer,
+                        let mut params = json!({"cwd":self.request.cwd,
                             "developerInstructions":format!("You are the coding agent in Monoptah. Use the available tools to inspect and work in the supplied cwd. Do not ask the user to paste files or git output you can inspect yourself. Respect the selected access policy and request approval when required. {}", if self.request.settings.plan { "This is a planning turn: inspect and propose a plan without changing files." } else { "" })});
+                        if let Some((policy, sandbox, sandbox_policy, reviewer)) =
+                            self.codex_access()
+                        {
+                            params["approvalPolicy"] = policy;
+                            params["sandbox"] = sandbox.into();
+                            params["sandboxPolicy"] = sandbox_policy;
+                            params["approvalsReviewer"] = reviewer.into();
+                        }
                         if let Some(instructions) = crate::visual_bridge::instructions(
                             &self.request.settings.environment,
                             false,
@@ -655,9 +666,12 @@ impl Protocol {
                             )?;
                             return Ok(events);
                         }
-                        let (policy, _, sandbox, reviewer) = self.codex_access();
-                        let mut params = json!({"threadId":id,"input":self.request.codex_input(),
-                            "approvalPolicy":policy,"sandboxPolicy":sandbox,"approvalsReviewer":reviewer});
+                        let mut params = json!({"threadId":id,"input":self.request.codex_input()});
+                        if let Some((policy, _, sandbox, reviewer)) = self.codex_access() {
+                            params["approvalPolicy"] = policy;
+                            params["sandboxPolicy"] = sandbox;
+                            params["approvalsReviewer"] = reviewer.into();
+                        }
                         if let Some(effort) = &self.request.settings.effort {
                             params["effort"] = effort.clone().into();
                         }
@@ -1534,6 +1548,25 @@ fn run_process(
     run_operation(request, cancel, controls, probe, false, false, emit)
 }
 
+/// The start of every chat launch of a local CLI. Env order, later wins: the GUI env, the
+/// app's session env, the user's Settings → Agents env, then the account, so the account
+/// wins a collision. The user's arguments go in front of a transport subcommand
+/// (`launch_args::args_lead`); the caller appends them last for the other agents.
+pub(crate) fn launch_command(
+    request: &Request,
+    launch: &crate::launch_args::Launch,
+) -> Result<Command, String> {
+    let mut command = Command::new(&request.binary);
+    crate::scm::shell::apply_gui_env(&mut command);
+    command.envs(&request.settings.environment);
+    crate::launch_args::apply_env(&mut command, &launch.env);
+    request.settings.account.apply(request.kind, &mut command)?;
+    if crate::launch_args::args_lead(request.kind) {
+        command.args(&launch.args);
+    }
+    Ok(command)
+}
+
 fn run_operation(
     request: Request,
     cancel: Arc<AtomicBool>,
@@ -1566,10 +1599,8 @@ fn run_operation(
             );
         }
     }
-    let mut command = Command::new(&request.binary);
-    crate::scm::shell::apply_gui_env(&mut command);
-    command.envs(&request.settings.environment);
-    request.settings.account.apply(request.kind, &mut command)?;
+    let launch = crate::cli::launch(request.kind);
+    let mut command = launch_command(&request, &launch)?;
     match request.kind {
         Kind::Codex => {
             command.arg("app-server");
@@ -1605,11 +1636,13 @@ fn run_operation(
             ]);
             let settings = &request.settings;
             let mode = if settings.plan {
-                "plan"
+                Some("plan")
             } else {
                 settings.access.claude()
             };
-            command.args(["--permission-mode", mode]);
+            if let Some(mode) = mode {
+                command.args(["--permission-mode", mode]);
+            }
             if settings.text_only {
                 command.args([
                     "--tools",
@@ -1662,7 +1695,7 @@ fn run_operation(
             if !allowed.is_empty() {
                 command.args(["--allowedTools", &allowed.join(",")]);
             }
-            if mode == "bypassPermissions" {
+            if mode == Some("bypassPermissions") {
                 command.arg("--allow-dangerously-skip-permissions");
             }
             let mut config = json!({});
@@ -1728,6 +1761,9 @@ fn run_operation(
         kind if kind.is_pi() => pi::configure(&mut command, &request, probe || command_probe),
         _ => acp::configure(&mut command, &request)?,
     }
+    if !crate::launch_args::args_lead(request.kind) {
+        command.args(&launch.args);
+    }
     command
         .current_dir(if request.kind == Kind::Antigravity {
             request.binary.parent().unwrap_or(&request.cwd)
@@ -1766,6 +1802,7 @@ fn run_operation(
     let rx = &wire.rx;
     let tail = &wire.tail;
     let mut stdin = &mut wire.stdin;
+    protocol.launch = launch;
     let mut pending = Vec::new();
     if let Some(id) = claude_new_session {
         protocol.request.provider_id = Some(id.clone());
@@ -2042,6 +2079,109 @@ fn run_operation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn env_of(command: &Command, key: &str) -> Option<Option<String>> {
+        command
+            .get_envs()
+            .find(|(name, _)| *name == std::ffi::OsStr::new(key))
+            .map(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()))
+    }
+    #[test]
+    fn agent_env_sits_between_the_session_env_and_the_account() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut request = protocol(Kind::Codex).request;
+        request.settings.environment =
+            HashMap::from([("SHARED".to_string(), "session".to_string())]);
+        request.settings.account = crate::accounts::Profile::new("work", tmp.path());
+        let launch = crate::launch_args::Launch {
+            args: vec!["--enable".into(), "x".into()],
+            env: vec![
+                ("SHARED".into(), "user".into()),
+                ("CODEX_HOME".into(), "/user/home".into()),
+                ("OPENAI_API_KEY".into(), "not-a-real-key".into()),
+                ("HTTP_PROXY".into(), "http://127.0.0.1:9".into()),
+            ],
+        };
+        let command = launch_command(&request, &launch).unwrap();
+        assert_eq!(env_of(&command, "SHARED"), Some(Some("user".into())));
+        assert_eq!(
+            env_of(&command, "HTTP_PROXY"),
+            Some(Some("http://127.0.0.1:9".into()))
+        );
+        // The account sets and removes these after the user's values: it wins.
+        let home = env_of(&command, "CODEX_HOME").flatten().unwrap();
+        assert_ne!(home, "/user/home");
+        assert_eq!(env_of(&command, "OPENAI_API_KEY"), Some(None));
+        // Codex starts a transport subcommand, so the arguments lead it.
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(args, ["--enable", "x"]);
+        // Claude takes them after its own flags instead.
+        request.kind = Kind::Claude;
+        request.settings.account = Default::default();
+        assert_eq!(
+            launch_command(&request, &launch)
+                .unwrap()
+                .get_args()
+                .count(),
+            0
+        );
+    }
+    #[test]
+    fn codex_with_its_own_settings_gets_no_approval_or_sandbox_parameters() {
+        let mut p = protocol(Kind::Codex);
+        p.request.settings.access = AccessMode::AgentDefault;
+        let mut out = Vec::new();
+        p.frame(json!({"id":1,"result":{}}), &mut out).unwrap();
+        p.frame(
+            json!({"id":2,"result":{"thread":{"id":"t1"},"model":"gpt-5"}}),
+            &mut out,
+        )
+        .unwrap();
+        let sent: Vec<Value> = String::from_utf8_lossy(&out)
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect();
+        for method in ["thread/start", "turn/start"] {
+            let params = &sent.iter().find(|m| m["method"] == method).unwrap()["params"];
+            for key in [
+                "approvalPolicy",
+                "sandbox",
+                "sandboxPolicy",
+                "approvalsReviewer",
+            ] {
+                assert!(params.get(key).is_none(), "{method} sent {key}");
+            }
+        }
+        // Every other level still sends them.
+        let mut p = protocol(Kind::Codex);
+        p.request.settings.access = AccessMode::Supervised;
+        let mut out = Vec::new();
+        p.frame(json!({"id":1,"result":{}}), &mut out).unwrap();
+        let started: Value = String::from_utf8_lossy(&out)
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|m| m["method"] == "thread/start")
+            .unwrap();
+        assert_eq!(started["params"]["approvalPolicy"], "untrusted");
+        assert_eq!(started["params"]["sandbox"], "read-only");
+    }
+    #[test]
+    fn access_levels_map_to_claude_and_codex_values() {
+        assert_eq!(AccessMode::AgentDefault.claude(), None);
+        assert_eq!(AccessMode::AgentDefault.codex(), None);
+        assert_eq!(AccessMode::Supervised.claude(), Some("default"));
+        assert_eq!(AccessMode::FullAccess.claude(), Some("bypassPermissions"));
+        assert_eq!(AccessMode::from_id("own"), AccessMode::AgentDefault);
+        assert_eq!(AccessMode::AgentDefault.id(), "own");
+        assert_eq!(AccessMode::AgentDefault.peer_id(), "supervised");
+        assert_eq!(
+            serde_json::to_string(&AccessMode::AgentDefault).unwrap(),
+            "\"own\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AccessMode>("\"own\"").unwrap(),
+            AccessMode::AgentDefault
+        );
+    }
     fn protocol(kind: Kind) -> Protocol {
         Protocol::new(Request {
             kind,
@@ -2129,7 +2269,7 @@ mod tests {
             p.request.settings.operator_enabled = true;
             p.request.settings.plan = plan;
             assert!(!p.request.settings.operator);
-            assert_eq!(p.codex_access().2["networkAccess"], true);
+            assert_eq!(p.codex_access().unwrap().2["networkAccess"], true);
             let mut out = Vec::new();
             p.frame(json!({"id":1,"result":{}}), &mut out).unwrap();
             p.frame(json!({"id":2,"result":{"thread":{"id":"saved"}}}), &mut out)

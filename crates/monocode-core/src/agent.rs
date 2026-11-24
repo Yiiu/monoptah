@@ -5,6 +5,9 @@ use serde_json::{json, Value};
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AccessMode {
+    /// Pass no permission flag or parameters: the CLI applies its own configuration.
+    #[serde(rename = "own")]
+    AgentDefault,
     ReadOnly,
     #[default]
     Supervised,
@@ -15,6 +18,7 @@ pub enum AccessMode {
 impl AccessMode {
     pub fn id(self) -> &'static str {
         match self {
+            Self::AgentDefault => "own",
             Self::ReadOnly => "read-only",
             Self::Supervised => "supervised",
             Self::AutoAcceptEdits => "auto-accept-edits",
@@ -24,6 +28,7 @@ impl AccessMode {
     }
     pub fn label(self) -> &'static str {
         match self {
+            Self::AgentDefault => "Agent's own settings",
             Self::ReadOnly => "Read-only",
             Self::Supervised => "Supervised",
             Self::AutoAcceptEdits => "Auto-accept edits",
@@ -33,6 +38,7 @@ impl AccessMode {
     }
     pub fn from_id(id: &str) -> Self {
         match id {
+            "own" => Self::AgentDefault,
             "read-only" => Self::ReadOnly,
             "auto-accept-edits" => Self::AutoAcceptEdits,
             "auto" => Self::Auto,
@@ -40,9 +46,23 @@ impl AccessMode {
             _ => Self::Supervised,
         }
     }
-    /// codexProtocol.ts::runtimeModeToCodexConfig.
-    pub fn codex(self) -> (Value, &'static str, Value, &'static str) {
+    /// The id a peer that predates `AgentDefault` understands (the remote Host and phone
+    /// clients): the agent's own settings read as supervised there.
+    pub fn peer_id(self) -> &'static str {
         match self {
+            Self::AgentDefault => Self::Supervised.id(),
+            other => other.id(),
+        }
+    }
+    /// codexProtocol.ts::runtimeModeToCodexConfig. `None` sends no approval or sandbox
+    /// parameters, so Codex applies its own configuration.
+    ///
+    /// Checked against codex-cli 0.172.0: the app-server schema still accepts `untrusted`
+    /// (`AskForApproval` is untrusted | on-request | never) although the TUI's `-a` now
+    /// lists only on-request and never.
+    pub fn codex(self) -> Option<(Value, &'static str, Value, &'static str)> {
+        Some(match self {
+            Self::AgentDefault => return None,
             Self::ReadOnly => (
                 json!("never"),
                 "read-only",
@@ -73,18 +93,85 @@ impl AccessMode {
                 json!({"type":"dangerFullAccess"}),
                 "user",
             ),
-        }
+        })
     }
-    pub fn claude(self) -> &'static str {
-        match self {
+    /// Claude's `--permission-mode`; `None` passes no flag. claude 2.1.331 lists `manual`
+    /// in its help but still accepts `default`, which older releases need, so it stays.
+    pub fn claude(self) -> Option<&'static str> {
+        Some(match self {
+            Self::AgentDefault => return None,
             Self::ReadOnly => "plan",
             Self::Supervised => "default",
             Self::AutoAcceptEdits => "acceptEdits",
             Self::Auto => "auto",
             Self::FullAccess => "bypassPermissions",
+        })
+    }
+}
+/// A permission level from Settings → Agents. Sessions carry it as an `AccessMode`;
+/// `ReadOnly` stays a composer/plan-only mode and is not a settings level.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Permission {
+    /// The agent's own settings: no permission flag or parameters.
+    Own,
+    Ask,
+    AcceptEdits,
+    /// "Approve for me".
+    Auto,
+    Full,
+}
+impl Permission {
+    pub const ALL: [Self; 5] = [
+        Self::Own,
+        Self::Ask,
+        Self::AcceptEdits,
+        Self::Auto,
+        Self::Full,
+    ];
+    /// The stored id.
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Own => "own",
+            Self::Ask => "ask",
+            Self::AcceptEdits => "edits",
+            Self::Auto => "auto",
+            Self::Full => "full",
+        }
+    }
+    pub fn parse(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|level| level.id() == id)
+    }
+    pub fn access(self) -> AccessMode {
+        match self {
+            Self::Own => AccessMode::AgentDefault,
+            Self::Ask => AccessMode::Supervised,
+            Self::AcceptEdits => AccessMode::AutoAcceptEdits,
+            Self::Auto => AccessMode::Auto,
+            Self::Full => AccessMode::FullAccess,
+        }
+    }
+    /// The level a session's access mode reads as; read-only reads as ask.
+    pub fn from_access(access: AccessMode) -> Self {
+        match access {
+            AccessMode::AgentDefault => Self::Own,
+            AccessMode::ReadOnly | AccessMode::Supervised => Self::Ask,
+            AccessMode::AutoAcceptEdits => Self::AcceptEdits,
+            AccessMode::Auto => Self::Auto,
+            AccessMode::FullAccess => Self::Full,
+        }
+    }
+    /// The levels an agent can apply. Pi and Omp have no permission mechanism (empty: the
+    /// field is hidden); Cursor and Fx only approve on the client side.
+    pub fn supported(kind: crate::provider::Kind) -> &'static [Self] {
+        use crate::provider::Kind;
+        match kind {
+            Kind::Pi | Kind::Omp => &[],
+            Kind::Cursor | Kind::Fx => &[Self::Own, Self::Auto, Self::Full],
+            _ => &Self::ALL,
         }
     }
 }
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {

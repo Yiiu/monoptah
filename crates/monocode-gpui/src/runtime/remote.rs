@@ -110,7 +110,7 @@ fn configure_command(
     let mut value = command("configure", Some(session_id));
     value["model"] = json!(host_model(provider, settings.model.as_deref())?);
     value["modelSettings"] = json!(model_settings(provider, settings));
-    value["runtimeMode"] = json!(settings.access.id());
+    value["runtimeMode"] = json!(settings.access.peer_id());
     Ok(value)
 }
 /// Called off-thread after saving an idle remote conversation's settings.
@@ -764,7 +764,7 @@ pub(crate) fn run_with_client_mirrored(
                 create["harness"] = json!(summary.provider);
                 create["model"] = json!(host_model(&summary.provider, settings.model.as_deref())?);
                 create["modelSettings"] = json!(model_settings(&summary.provider, &settings));
-                create["runtimeMode"] = json!(settings.access.id());
+                create["runtimeMode"] = json!(settings.access.peer_id());
                 if let Some(path) = &settings.worktree_cwd {
                     let remote = monocode_core::remote::parse_remote_path(path)
                         .ok_or("Invalid remote worktree")?;
@@ -779,7 +779,7 @@ pub(crate) fn run_with_client_mirrored(
                 configure["model"] =
                     json!(host_model(&summary.provider, settings.model.as_deref())?);
                 configure["modelSettings"] = json!(model_settings(&summary.provider, &settings));
-                configure["runtimeMode"] = json!(settings.access.id());
+                configure["runtimeMode"] = json!(settings.access.peer_id());
                 binding.outbox.push(configure);
             }
             let operation = action["type"].as_str().unwrap_or("send");

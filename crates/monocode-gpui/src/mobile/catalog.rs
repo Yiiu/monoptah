@@ -129,7 +129,7 @@ pub(crate) fn session(
         "model": model_id(kind, metadata.model.as_deref()),
         "modelName": pickers::cached_model_name(kind, metadata.model.as_deref()).to_string(),
         "branch": if metadata.worktree_removed { "" } else { metadata.branch.as_deref().filter(|branch| !branch.is_empty()).unwrap_or(fallback_branch) },
-        "runtimeMode": metadata.access.id(),
+        "runtimeMode": metadata.access.peer_id(),
         "updatedAt": summary.updated_at,
         "busy": live.is_some_and(|live| live.busy),
         "live": live.is_some(),

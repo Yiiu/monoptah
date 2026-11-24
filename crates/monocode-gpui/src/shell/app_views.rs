@@ -584,13 +584,7 @@ impl Shell {
         let settings = monocode_core::agent::Settings {
             model: choice.model,
             effort: crate::conversation::preferred_effort(kind.id(), cx),
-            access: self
-                .workspace
-                .preferences
-                .default_access
-                .as_deref()
-                .map(monocode_core::agent::AccessMode::from_id)
-                .unwrap_or_default(),
+            access: self.workspace.preferences.agent(kind).access(),
             account: crate::accounts::get(cx)
                 .map(|accounts| accounts.read(cx).selected(kind, &cwd))
                 .unwrap_or_default(),
@@ -654,13 +648,7 @@ impl Shell {
             )
             .model,
             effort: crate::conversation::preferred_effort(kind.id(), cx),
-            access: self
-                .workspace
-                .preferences
-                .default_access
-                .as_deref()
-                .map(monocode_core::agent::AccessMode::from_id)
-                .unwrap_or_default(),
+            access: self.workspace.preferences.agent(kind).access(),
             account: crate::accounts::get(cx)
                 .map(|accounts| accounts.read(cx).selected(kind, cwd))
                 .unwrap_or_default(),
@@ -869,8 +857,7 @@ mod tests {
                 shell
                     .workspace
                     .preferences
-                    .provider_surfaces
-                    .insert(provider.into(), surface);
+                    .set_agent_surface(Kind::from_id(provider), surface);
                 let before = known(shell);
                 shell.start_inbox_session(item(&project), prompt.into(), cx);
                 before

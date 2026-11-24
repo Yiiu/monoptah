@@ -28,7 +28,12 @@ pub struct LaunchInput {
     pub binary: PathBuf,
     /// Session model in any stored form; none or `default` omits `--model`.
     pub model: Option<String>,
+    /// Reasoning effort; passed only where the CLI's flag is verified.
+    pub effort: Option<String>,
     pub access: AccessMode,
+    /// Extra arguments from Settings → Agents, already split. Every agent gets them, before
+    /// the initial prompt.
+    pub args: Vec<String>,
     /// Saved conversation id: resumed instead of starting a new conversation.
     pub provider_id: Option<String>,
     /// Id for a new conversation instead of minting one (claims a saved id the CLI never saw).
@@ -61,21 +66,33 @@ fn non_blank(value: &Option<String>) -> Option<&str> {
     value.as_deref().filter(|v| !v.trim().is_empty())
 }
 
+/// Efforts Claude's `--effort` accepts (claude 2.1.331: low, medium, high, xhigh, max).
+const CLAUDE_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+
 /// Program and arguments that start the session's interactive CLI in a PTY.
-/// Order: `--model`, `--permission-mode`, `--settings`, `--resume`/`--session-id`, prompt.
+/// Order: `--model`, `--permission-mode`, `--effort`, `--settings`, `--resume`/`--session-id`,
+/// the user's arguments, prompt.
 pub fn build(input: LaunchInput) -> TuiLaunch {
     let caps = tui_caps(input.kind);
     let mut args: Vec<OsString> = Vec::new();
     let mut minted_id = None;
-    if caps.launch_flags {
-        if let Some(model) = input
-            .model
-            .as_deref()
-            .and_then(|m| crate::store::native_model(m, input.kind.id()))
-        {
+    let model = input
+        .model
+        .as_deref()
+        .and_then(|m| crate::store::native_model(m, input.kind.id()));
+    let effort = non_blank(&input.effort);
+    if caps.launch_flags && input.kind == Kind::Codex {
+        codex_flags(model, effort, input.access, &mut args);
+    } else if caps.launch_flags {
+        if let Some(model) = model {
             args.extend(["--model".into(), model.into()]);
         }
-        args.extend(["--permission-mode".into(), input.access.claude().into()]);
+        if let Some(mode) = input.access.claude() {
+            args.extend(["--permission-mode".into(), mode.into()]);
+        }
+        if let Some(effort) = effort.filter(|e| CLAUDE_EFFORTS.contains(e)) {
+            args.extend(["--effort".into(), effort.into()]);
+        }
     }
     if input.kind == Kind::Claude && !input.windows {
         if let Some((cli, spool)) = &input.hook {
@@ -102,6 +119,7 @@ pub fn build(input: LaunchInput) -> TuiLaunch {
             minted_id = Some(id);
         }
     }
+    args.extend(input.args.iter().map(OsString::from));
     // A resumed conversation already has its first prompt.
     if let Some(prompt) = non_blank(&input.initial_prompt) {
         if caps.initial_prompt && !resuming {
@@ -117,6 +135,46 @@ pub fn build(input: LaunchInput) -> TuiLaunch {
         args,
         minted_id,
     }
+}
+
+/// Codex's interactive flags, checked against codex-cli 0.172.0 (`codex --help`):
+/// `--model`, `-c model_reasoning_effort=..`, `-a on-request|never`, `-s <sandbox>` and
+/// `--dangerously-bypass-approvals-and-sandbox`. "Approve for me" uses the
+/// `approvals_reviewer` config key (what the app-server path sends) rather than the newer
+/// `--approve-for-me`, so an older CLI still starts.
+fn codex_flags(
+    model: Option<String>,
+    effort: Option<&str>,
+    access: AccessMode,
+    args: &mut Vec<OsString>,
+) {
+    if let Some(model) = model {
+        args.extend(["--model".into(), model.into()]);
+    }
+    if let Some(effort) =
+        effort.filter(|e| e.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
+    {
+        args.extend([
+            "-c".into(),
+            format!("model_reasoning_effort=\"{effort}\"").into(),
+        ]);
+    }
+    let flags: &[&str] = match access {
+        AccessMode::AgentDefault => &[],
+        AccessMode::ReadOnly => &["-a", "never", "-s", "read-only"],
+        AccessMode::Supervised => &["-a", "on-request", "-s", "read-only"],
+        AccessMode::AutoAcceptEdits => &["-a", "on-request", "-s", "workspace-write"],
+        AccessMode::Auto => &[
+            "-a",
+            "on-request",
+            "-s",
+            "workspace-write",
+            "-c",
+            "approvals_reviewer=\"auto_review\"",
+        ],
+        AccessMode::FullAccess => &["--dangerously-bypass-approvals-and-sandbox"],
+    };
+    args.extend(flags.iter().map(OsString::from));
 }
 
 /// The `--settings` JSON that makes Claude call back into this app. Claude merges
@@ -314,7 +372,9 @@ mod tests {
             kind,
             binary: PathBuf::from(BIN),
             model: Some("claude:opus-5-5".into()),
+            effort: None,
             access: AccessMode::Supervised,
+            args: Vec::new(),
             provider_id: None,
             new_id: None,
             initial_prompt: None,
@@ -517,10 +577,109 @@ mod tests {
         assert_eq!(args.len(), 10);
     }
 
+    #[test]
+    fn the_agents_own_settings_pass_no_permission_mode() {
+        let args = args(&build(LaunchInput {
+            access: AccessMode::AgentDefault,
+            ..claude()
+        }));
+        assert!(!args.contains(&"--permission-mode".to_string()));
+        let codex = args_of(build(LaunchInput {
+            access: AccessMode::AgentDefault,
+            model: None,
+            ..input(Kind::Codex)
+        }));
+        assert!(codex.is_empty(), "{codex:?}");
+    }
+
+    #[test]
+    fn claude_gets_a_verified_effort_and_user_arguments_before_the_prompt() {
+        let launch = build(LaunchInput {
+            effort: Some("high".into()),
+            args: vec!["--add-dir".into(), "/work".into()],
+            initial_prompt: Some("-starts with a dash".into()),
+            ..claude()
+        });
+        let args = args(&launch);
+        assert_eq!(after(&args, "--effort"), "high");
+        let n = args.len();
+        assert_eq!(
+            &args[n - 4..],
+            ["--add-dir", "/work", "--", "-starts with a dash"]
+        );
+        // An effort Claude's flag does not take is not passed.
+        let ultra = args_of(build(LaunchInput {
+            effort: Some("ultrathink".into()),
+            ..claude()
+        }));
+        assert!(!ultra.contains(&"--effort".to_string()));
+    }
+
+    fn args_of(launch: TuiLaunch) -> Vec<String> {
+        args(&launch)
+    }
+
+    #[test]
+    fn codex_gets_its_verified_model_effort_and_permission_flags() {
+        let base = || LaunchInput {
+            model: Some("codex:gpt-5".into()),
+            effort: Some("high".into()),
+            ..input(Kind::Codex)
+        };
+        let cases: [(AccessMode, &[&str]); 5] = [
+            (AccessMode::ReadOnly, &["-a", "never", "-s", "read-only"]),
+            (
+                AccessMode::Supervised,
+                &["-a", "on-request", "-s", "read-only"],
+            ),
+            (
+                AccessMode::AutoAcceptEdits,
+                &["-a", "on-request", "-s", "workspace-write"],
+            ),
+            (
+                AccessMode::Auto,
+                &[
+                    "-a",
+                    "on-request",
+                    "-s",
+                    "workspace-write",
+                    "-c",
+                    "approvals_reviewer=\"auto_review\"",
+                ],
+            ),
+            (
+                AccessMode::FullAccess,
+                &["--dangerously-bypass-approvals-and-sandbox"],
+            ),
+        ];
+        for (access, permission) in cases {
+            let launch = build(LaunchInput {
+                access,
+                args: vec!["--search".into()],
+                ..base()
+            });
+            let mut expected = vec!["--model", "gpt-5", "-c", "model_reasoning_effort=\"high\""];
+            expected.extend(permission);
+            expected.push("--search");
+            assert_eq!(args(&launch), expected, "{access:?}");
+            assert_eq!(launch.minted_id, None);
+        }
+    }
+
     // providers without TUI flags
     #[test]
-    fn other_providers_launch_the_bare_binary() {
-        for kind in Kind::ALL.into_iter().filter(|k| *k != Kind::Claude) {
+    fn other_providers_launch_the_bare_binary_plus_user_arguments() {
+        for kind in Kind::ALL
+            .into_iter()
+            .filter(|k| !matches!(k, Kind::Claude | Kind::Codex))
+        {
+            let with_args = build(LaunchInput {
+                args: vec!["--verbose".into()],
+                access: AccessMode::FullAccess,
+                ..input(kind)
+            });
+            assert_eq!(args(&with_args), ["--verbose"], "{kind:?}");
+
             let launch = build(LaunchInput {
                 model: Some(format!("{}:some-model", kind.id())),
                 access: AccessMode::FullAccess,

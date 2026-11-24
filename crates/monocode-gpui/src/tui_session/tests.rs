@@ -193,14 +193,40 @@ fn a_resumed_conversation_never_gets_the_initial_prompt() {
 
 #[test]
 fn a_cli_without_a_first_prompt_slot_ignores_the_initial_prompt() {
-    let store = store_in(&temp("prompt-codex"));
+    for provider in ["codex", "grok"] {
+        let store = store_in(&temp(&format!("prompt-{provider}")));
+        let summary = terminal_session(&store, provider, None);
+        let prepared = prepare(Request {
+            initial_prompt: Some("Fix the build".into()),
+            ..request(&store, &summary)
+        })
+        .unwrap();
+        assert!(
+            !args(&prepared).iter().any(|arg| arg == "Fix the build"),
+            "{provider}"
+        );
+    }
+}
+
+#[test]
+fn codex_gets_its_verified_permission_flags_and_the_agents_own_settings_pass_none() {
+    let store = store_in(&temp("codex-flags"));
     let summary = terminal_session(&store, "codex", None);
-    let prepared = prepare(Request {
-        initial_prompt: Some("Fix the build".into()),
-        ..request(&store, &summary)
-    })
-    .unwrap();
-    assert!(prepared.launch.args.is_empty());
+    // A session saved before Settings → Agents existed is supervised.
+    assert_eq!(
+        args(&prepare(request(&store, &summary)).unwrap()),
+        ["-a", "on-request", "-s", "read-only"]
+    );
+    save_settings(&store, summary.id, |settings| {
+        settings.access = monocode_core::agent::AccessMode::AgentDefault
+    });
+    assert!(
+        prepare(request(&store, &summary))
+            .unwrap()
+            .launch
+            .args
+            .is_empty()
+    );
 }
 
 #[test]
@@ -224,10 +250,10 @@ fn starting_fresh_mints_a_new_id_and_saves_it() {
 
 #[test]
 fn other_providers_launch_their_bare_cli_and_save_nothing() {
-    let store = store_in(&temp("codex"));
-    let summary = terminal_session(&store, "codex", None);
+    let store = store_in(&temp("grok"));
+    let summary = terminal_session(&store, "grok", None);
     let prepared = prepare(request(&store, &summary)).unwrap();
-    assert_eq!(prepared.launch.program, OsString::from("/opt/test/codex"));
+    assert_eq!(prepared.launch.program, OsString::from("/opt/test/grok"));
     assert!(prepared.launch.args.is_empty());
     assert_eq!(prepared.launch.minted_id, None);
     assert_eq!(prepared.provider_id, None);
@@ -586,7 +612,7 @@ fn it_resumes_a_saved_conversation_without_saving_a_new_id(cx: &mut TestAppConte
 
 #[gpui::test]
 fn it_launches_other_providers_fresh_with_their_bare_cli(cx: &mut TestAppContext) {
-    let f = Fixture::new(cx, "codex", None);
+    let f = Fixture::new(cx, "grok", None);
     f.start(cx);
     assert!(f.args(cx).is_empty());
     assert_eq!(saved_id(&f.store, f.summary.id), None);

@@ -721,6 +721,8 @@ fn query_provider(
         provider::resolve(kind).ok_or_else(|| format!("{} CLI not installed", kind.label()))?;
     let mut command = Command::new(binary);
     crate::scm::shell::apply_gui_env(&mut command);
+    // The user's Settings → Agents env (not its arguments), before the account.
+    crate::launch_args::apply_env(&mut command, &crate::cli::launch(kind).env);
     account.apply(kind, &mut command)?;
     if kind == Kind::Codex {
         command.arg("app-server");

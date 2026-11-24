@@ -193,10 +193,8 @@ fn park(server: Server, request: &Request, session: String) {
     });
 }
 fn command(request: &Request) -> Result<Command, String> {
-    let mut command = Command::new(&request.binary);
-    crate::scm::shell::apply_gui_env(&mut command);
-    command.envs(&request.settings.environment);
-    request.settings.account.apply(request.kind, &mut command)?;
+    // The user's arguments lead the subcommand (`serve`, `service status`).
+    let mut command = super::launch_command(request, &crate::cli::launch(request.kind))?;
     command
         .current_dir(&request.cwd)
         .stdin(Stdio::null())
