@@ -2919,3 +2919,76 @@ fn a_launch_card_marks_a_session_that_runs_in_the_cloud(cx: &mut TestAppContext)
     assert!(visual.debug_bounds("mono-launch-card-cloud-776").is_some());
     assert!(visual.debug_bounds("mono-launch-card-cloud-777").is_none());
 }
+
+// A subagent's report is Markdown inside its panel, not a transcript row. Its
+// code blocks must draw there: looking one up as a row by the block's own hash
+// aborted the app.
+#[gpui::test]
+fn code_blocks_in_a_subagent_report_draw_inside_its_open_panel(cx: &mut TestAppContext) {
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let window = chat_mode(cx, false);
+    let mut call = ToolCall::new("scout", "Agent");
+    call.state = ToolState::Completed;
+    call.panel = Some(Panel::Agent(monocode_core::tool::tasks::AgentRun {
+        name: Some("Scout".into()),
+        ..Default::default()
+    }));
+    call.output = "Ran the checks:\n\n```sh\nnpm test\n```".into();
+    window
+        .update(cx, |view, _, cx| {
+            view.patch(
+                0,
+                vec![
+                    row("user", "Check the build"),
+                    row("tool", &serde_json::to_string(&call).unwrap()),
+                ],
+                cx,
+            );
+            view.work_folds.insert(1, true);
+            view.rebuild(1, cx);
+            view.motions.clear();
+            let group = view
+                .rows
+                .iter()
+                .find_map(|row| match row.body {
+                    Body::Phase { group, .. } => Some(group),
+                    _ => None,
+                })
+                .expect("the subagent sits in a tool group");
+            view.toggle_phase(group, true, cx);
+            let start = view
+                .rows
+                .iter()
+                .find_map(|row| match &row.body {
+                    Body::Tool { call, .. } if matches!(call.panel(), Some(Panel::Agent(_))) => {
+                        Some(view.messages[row.message].start)
+                    }
+                    _ => None,
+                })
+                .expect("the open group shows the subagent");
+            let panel = format!("agent:{start}:scout");
+            view.toggle_agent_part(panel.clone(), true, start, cx);
+            assert!(
+                view.agent_panels.part_open(&panel, false),
+                "the subagent's panel is open"
+            );
+        })
+        .unwrap();
+    render(window, cx);
+    let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+    assert!(visual.debug_bounds("subagent-1").is_some());
+    let fence = crate::markdown_model::parse_full(&call.output)
+        .blocks
+        .iter()
+        .flat_map(|block| crate::markdown::rows(&block.block))
+        .find_map(|row| match row.part {
+            crate::markdown::Part::Code { fence, .. } => Some(fence),
+            _ => None,
+        })
+        .expect("the report holds a code block");
+    let selector: &'static str = Box::leak(format!("code-{}", fence.key as usize).into_boxed_str());
+    assert!(
+        visual.debug_bounds(selector).is_some(),
+        "the report's code block draws"
+    );
+}

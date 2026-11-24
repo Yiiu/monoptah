@@ -4837,11 +4837,47 @@ impl TranscriptView {
         })
         .detach();
     }
+    /// A code block of a transcript row. Search and text selection tie it to that row.
     fn code(
         &mut self,
         fence: Arc<Fence>,
         lines: std::ops::Range<usize>,
         ix: usize,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let row = &self.rows[ix];
+        let message = &self.messages[row.message];
+        self.code_block(
+            fence,
+            lines,
+            ix,
+            self.search_match
+                .as_ref()
+                .is_some_and(|(start, _)| *start == row.key.0),
+            self.text_selection(row.key, message.start, message.role == "assistant", cx),
+            cx,
+        )
+    }
+    /// A code block inside a tool panel, such as a subagent's report or a note.
+    /// That Markdown is no transcript row, so the block is never the search's
+    /// current match and, like the prose around it, it takes no text selection.
+    /// `scope` only scopes the block's element ids. It is no row index.
+    fn panel_code(
+        &mut self,
+        fence: Arc<Fence>,
+        lines: std::ops::Range<usize>,
+        scope: usize,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        self.code_block(fence, lines, scope, false, None, cx)
+    }
+    fn code_block(
+        &mut self,
+        fence: Arc<Fence>,
+        lines: std::ops::Range<usize>,
+        scope: usize,
+        current: bool,
+        selection: Option<selection::TextSelection>,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         self.highlight(&fence, cx);
@@ -4860,6 +4896,7 @@ impl TranscriptView {
         });
         div()
             .relative()
+            .debug_selector(move || format!("code-{scope}"))
             .w_full()
             .min_w_0()
             .overflow_hidden()
@@ -4902,7 +4939,7 @@ impl TranscriptView {
                         })
                         .child(
                             div()
-                                .id(("code-file-link", ix))
+                                .id(("code-file-link", scope))
                                 .flex_1()
                                 .min_w_0()
                                 .truncate()
@@ -4971,7 +5008,7 @@ impl TranscriptView {
             })
             .child(
                 div()
-                    .id(("code-scroll", ix))
+                    .id(("code-scroll", scope))
                     .overflow_x_scroll()
                     .w_full()
                     .py(px(10.))
@@ -4984,15 +5021,8 @@ impl TranscriptView {
                         lines,
                         self.highlights.get(&key).and_then(|v| v.as_deref()),
                         self.search_match.as_ref().map_or("", |(_, q)| q.as_str()),
-                        self.search_match
-                            .as_ref()
-                            .is_some_and(|(start, _)| *start == self.rows[ix].key.0),
-                        self.text_selection(
-                            self.rows[ix].key,
-                            self.messages[self.rows[ix].message].start,
-                            self.messages[self.rows[ix].message].role == "assistant",
-                            cx,
-                        ),
+                        current,
+                        selection,
                     )),
             )
             .into_any_element()
