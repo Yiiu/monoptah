@@ -58,6 +58,15 @@
   lives in a separate file next to the database, "never in the database itself"
   (`src/accounts/token.rs`). OS keychains are used via `keyring` per platform (see
   `Cargo.toml` target sections). Never store a token in plain JSON settings.
+- Documented exception: per-agent environment variables (`preferences.agents.env`, the Agent
+  CLIs settings page) are stored as plain text in the native workspace JSON, by product
+  decision (2026-11-24). Mitigations: values whose name contains KEY/TOKEN/SECRET/PASSWORD/AUTH
+  are masked on screen, and env values never go into logs, aria labels, debug selectors,
+  toasts or error text. Moving them to the OS credential store is a follow-up; do not add other
+  plain-text secrets on the strength of this exception.
+- The desktop app shares `sessions.runtime_mode`: never write a value it does not know. Native's
+  "agent's own settings" access is written there as its peer id (`AccessMode::peer_id`) and
+  kept exactly in the native sidecar record `agent:{id}` (`store/shared.rs`).
 
 ## Serde conventions
 
