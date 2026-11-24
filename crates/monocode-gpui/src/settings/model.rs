@@ -143,7 +143,7 @@ impl Section {
                 "transcript composer prompt message diff review layout format save editor"
             }
             Section::Providers => {
-                "account sign in login model harness claude codex gemini cli default hooks"
+                "account sign in login model harness claude codex gemini cli default hooks agent permission arguments env"
             }
             Section::Mcp => {
                 "tools servers connections oauth authenticate login claude codex cursor opencode"
@@ -475,13 +475,85 @@ pub(crate) const INDEX: &[(&str, Section, &str, &str)] = &[
         "agent-clis",
         Section::Providers,
         "Agent CLIs",
-        "codex opencode cursor grok pi omp fx hermes antigravity devin binary path",
+        "codex opencode cursor grok pi omp fx hermes antigravity devin binary path command install update detect",
     ),
     (
-        "session-surface",
+        "agent-open-mode",
         Section::Providers,
-        "Session surface",
-        "chat tui terminal interactive cli surface",
+        "Open new sessions in",
+        "session surface chat tui terminal interactive cli open in mode per agent",
+    ),
+    (
+        "agent-permission",
+        Section::Providers,
+        "Agent permissions",
+        "permission approval ask accept edits approve for me full access yolo bypass sandbox",
+    ),
+    (
+        "settings-agent-codex",
+        Section::Providers,
+        "Codex",
+        "agent cli command path model effort permission arguments args env environment install update",
+    ),
+    (
+        "settings-agent-claude",
+        Section::Providers,
+        "Claude Code",
+        "agent cli command path model effort permission arguments args env environment install update",
+    ),
+    (
+        "settings-agent-cursor",
+        Section::Providers,
+        "Cursor",
+        "agent cli command path model permission arguments args env environment install update",
+    ),
+    (
+        "settings-agent-grok",
+        Section::Providers,
+        "Grok",
+        "agent cli command path model effort permission arguments args env environment install update",
+    ),
+    (
+        "settings-agent-opencode",
+        Section::Providers,
+        "OpenCode",
+        "agent cli command path model permission arguments args env environment install update",
+    ),
+    (
+        "settings-agent-antigravity",
+        Section::Providers,
+        "Antigravity",
+        "agent cli command path model permission arguments args env environment install update agy",
+    ),
+    (
+        "settings-agent-pi",
+        Section::Providers,
+        "Pi",
+        "agent cli command path model effort arguments args env environment install update",
+    ),
+    (
+        "settings-agent-omp",
+        Section::Providers,
+        "omp",
+        "agent cli command path model effort arguments args env environment install update",
+    ),
+    (
+        "settings-agent-fx",
+        Section::Providers,
+        "fx",
+        "agent cli command path model permission arguments args env environment install update",
+    ),
+    (
+        "settings-agent-hermes",
+        Section::Providers,
+        "Hermes",
+        "agent cli command path model effort permission arguments args env environment install update",
+    ),
+    (
+        "settings-agent-devin",
+        Section::Providers,
+        "Devin",
+        "agent cli command path model permission arguments args env environment install update",
     ),
     (
         "background-model",
@@ -709,14 +781,38 @@ mod tests {
             Section::Inbox.keywords().contains("clickup"),
             "section keywords"
         );
-        for query in ["session surface", "terminal", "tui"] {
+        for query in ["session surface", "terminal", "tui", "open new sessions"] {
             assert!(
                 search(query, "Wayland").iter().any(
-                    |r| r.section == Section::Providers && r.setting == Some("session-surface")
+                    |r| r.section == Section::Providers && r.setting == Some("agent-open-mode")
                 ),
                 "{query}"
             );
         }
+        for query in ["permission", "full access", "yolo", "approval"] {
+            assert!(
+                search(query, "Wayland")
+                    .iter()
+                    .any(|r| r.section == Section::Providers
+                        && r.setting == Some("agent-permission")),
+                "{query}"
+            );
+        }
+        // Each agent's row is a result of its own; the page opens it.
+        for kind in monocode_core::provider::Kind::ALL {
+            let id = format!("settings-agent-{}", kind.id());
+            assert!(
+                INDEX
+                    .iter()
+                    .any(|(setting, section, ..)| *setting == id && *section == Section::Providers),
+                "{id}"
+            );
+        }
+        assert!(
+            search("claude", "Wayland")
+                .iter()
+                .any(|r| r.setting == Some("settings-agent-claude"))
+        );
         let pages = search("archive", "Wayland");
         assert!(
             pages

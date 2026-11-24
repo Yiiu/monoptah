@@ -178,8 +178,9 @@ impl Shell {
                             });
                         }
                     }
-                    this.sync_settings(cx);
                 }
+                // The Agent CLIs settings show each agent's update state.
+                this.sync_settings(cx);
                 cx.notify();
             },
         ));

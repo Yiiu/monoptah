@@ -50,26 +50,23 @@ const COMMANDS: [(Command, &str); 4] = [
         "Save this message without starting the agent.",
     ),
 ];
-/// RUNTIME_MODES, with their icons and hints.
-const PERMISSIONS: [(AccessMode, &str, &str); 4] = [
+/// RUNTIME_MODES with their hints. Icons and colours are `theme::access_icon` and
+/// `theme::access_color`, as in the composer and Settings → Agents.
+const PERMISSIONS: [(AccessMode, &str); 4] = [
     (
         AccessMode::Supervised,
-        "lock",
         "Ask before commands and file changes.",
     ),
     (
         AccessMode::AutoAcceptEdits,
-        "pencil",
         "Auto-approve edits, ask before other actions.",
     ),
     (
         AccessMode::Auto,
-        "sparkles",
         "An AI reviewer can approve or deny actions.",
     ),
     (
         AccessMode::FullAccess,
-        "shield",
         "Allow commands, edits, and supported MCP confirmations in non-plan turns without prompts.",
     ),
 ];
@@ -1244,10 +1241,6 @@ impl QuickComposer {
                 .on_click(cx.listener(|this, _, window, cx| this.open(Picker::Model, window, cx))),
             )
             .when(self.kind != Kind::Fx, |d| {
-                let permission = PERMISSIONS
-                    .iter()
-                    .find(|(mode, ..)| *mode == self.access)
-                    .map_or("lock", |(_, icon, _)| *icon);
                 d.child(
                     pill(
                         "quick-permissions",
@@ -1257,13 +1250,9 @@ impl QuickComposer {
                     )
                     .px_2()
                     .py_1()
-                    .child(icon(permission, 14.).text_color(
-                        if self.access == AccessMode::FullAccess {
-                            amber(0.9)
-                        } else {
-                            content(0.7)
-                        },
-                    ))
+                    .child(
+                        icon(access_icon(self.access), 14.).text_color(access_color(self.access)),
+                    )
                     .child(div().truncate().child(self.access.label()))
                     .child(icon("chevron-down", 12.).text_color(content(0.4)))
                     .on_click(
@@ -1445,7 +1434,7 @@ impl QuickComposer {
                 PERMISSIONS
                     .into_iter()
                     .enumerate()
-                    .map(|(ix, (mode, glyph, hint))| {
+                    .map(|(ix, (mode, hint))| {
                         let selected = mode == self.access;
                         self.option_row(("quick-permission", ix), ix == self.highlight, cx)
                             .aria_label(mode.label())
@@ -1455,13 +1444,7 @@ impl QuickComposer {
                             .flex()
                             .items_center()
                             .gap_3()
-                            .child(
-                                icon(glyph, 16.).text_color(if mode == AccessMode::FullAccess {
-                                    amber(0.9)
-                                } else {
-                                    content(0.75)
-                                }),
-                            )
+                            .child(icon(access_icon(mode), 16.).text_color(access_color(mode)))
                             .child(
                                 div()
                                     .flex_1()

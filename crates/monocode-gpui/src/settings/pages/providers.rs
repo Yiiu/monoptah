@@ -1,17 +1,18 @@
 use crate::{
-    settings::{
-        ModelChoice, SettingsView,
-        widgets::{note, secondary_button},
-    },
+    settings::{ModelChoice, SettingsView, widgets::note},
     theme::*,
 };
-use gpui::{AnyElement, Context, SharedString, div, prelude::*, px};
-use monocode_core::{provider::Kind, surface::Surface};
+use gpui::{AnyElement, Context, SharedString, Window, prelude::*};
+use monocode_core::provider::Kind;
 
-/// Shown instead of the session surface control when the database cannot store a terminal session.
-const NO_TERMINAL_HINT: &str = "Terminal sessions need a newer database.";
 impl SettingsView {
-    pub(super) fn providers_page(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    /// Accounts, usage and privacy, the Agent CLIs groups (`pages/agents.rs`), background
+    /// tasks and advanced switches.
+    pub(super) fn providers_page(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
         let p = self.prefs.clone();
         let accounts = if let Some(center) = crate::accounts::get(cx) {
             center.update(cx, |center, cx| {
@@ -56,190 +57,7 @@ impl SettingsView {
             ),
         ];
         let binaries = self.discovery.binaries.clone();
-        let mut clis = Vec::new();
-        for (index, kind) in Kind::ALL.into_iter().enumerate() {
-            let installed = binaries
-                .iter()
-                .find(|(k, _)| *k == kind)
-                .and_then(|(_, p)| p.as_ref());
-            // Per-project provider defaults are retired: everything here is global.
-            let agent = p.agent(kind);
-            let selected = p.default_provider.as_deref() == Some(kind.id());
-            let visible = agent.enabled;
-            let models = self
-                .ctx
-                .catalogs
-                .get(kind.id())
-                .cloned()
-                .unwrap_or_default();
-            let selected_model = p
-                .default_models
-                .get(kind.id())
-                .cloned()
-                .or_else(|| models.first().map(|m| m.0.clone()));
-            let label = div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(provider_icon(kind.id(), 16.))
-                .child(kind.label())
-                .child({
-                    let slot = self
-                        .binary_anchors
-                        .borrow_mut()
-                        .entry(kind)
-                        .or_default()
-                        .clone();
-                    secondary_button(
-                        SharedString::from(format!("binary-{}", kind.id())),
-                        format!("Show {} CLI details", kind.label()),
-                        false,
-                        false,
-                    )
-                    .relative()
-                    .size_6()
-                    .p_0()
-                    .justify_center()
-                    .child(slot.probe())
-                    .child(icon("folder-open", 14.))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.open_management(
-                            super::super::management::Target::Cli(kind),
-                            window,
-                            cx,
-                        )
-                    }))
-                })
-                .child(
-                    div()
-                        .rounded_full()
-                        .bg(content(0.1))
-                        .px(px(6.))
-                        .py(px(2.))
-                        .text_size(px(10.))
-                        .text_color(content(0.6))
-                        .child(if installed.is_some() {
-                            "INSTALLED"
-                        } else {
-                            "NOT INSTALLED"
-                        }),
-                );
-            let mut controls = vec![
-                secondary_button(
-                    SharedString::from(format!("default-provider-{}", kind.id())),
-                    if selected {
-                        "Default"
-                    } else {
-                        "Use by default"
-                    },
-                    false,
-                    selected || selected_model.is_none() || installed.is_none(),
-                )
-                .child(if selected {
-                    "Default"
-                } else {
-                    "Use by default"
-                })
-                .when(
-                    !selected && selected_model.is_some() && installed.is_some(),
-                    |d| {
-                        d.on_click(cx.listener(move |this, _, _, cx| {
-                            this.update(cx, |p| p.default_provider = Some(kind.id().into()))
-                        }))
-                    },
-                )
-                .into_any_element(),
-            ];
-            if let Some(model) = &selected_model {
-                controls.insert(
-                    0,
-                    self.select(
-                        kind.id(),
-                        kind.label(),
-                        model,
-                        models
-                            .iter()
-                            .map(|(id, name)| (id.clone(), SharedString::from(name.clone()), None))
-                            .collect(),
-                        None,
-                        cx,
-                        move |this, model, cx| {
-                            this.update(cx, |p| {
-                                p.default_models.insert(kind.id().into(), model);
-                            });
-                        },
-                    ),
-                );
-            }
-            // How a new session opens. The icons of the web app's control have no
-            // native widget here, so both options are text.
-            if !self.ctx.no_terminal_sessions {
-                let surface = agent.surface;
-                controls.push(self.segmented(
-                    format!("session-surface-{}", kind.id()),
-                    format!("{} session surface", kind.label()),
-                    surface.id(),
-                    &[
-                        (Surface::Chat.id(), "Chat"),
-                        (Surface::Tui.id(), "Terminal (TUI)"),
-                    ],
-                    cx,
-                    move |this, value, cx| {
-                        if let Some(surface) = Surface::parse(value) {
-                            this.update(cx, |p| p.set_agent_surface(kind, surface))
-                        }
-                    },
-                ));
-            }
-            if installed.is_some() {
-                controls.push(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            div()
-                                .text_size(px(12.))
-                                .text_color(content(0.5))
-                                .child("Show in picker"),
-                        )
-                        .child(self.toggle(
-                            kind.id(),
-                            "Show provider in the model picker",
-                            visible,
-                            false,
-                            cx,
-                            move |this, on, cx| {
-                                // Disabling the default agent also clears the default.
-                                this.update(cx, |p| {
-                                    p.set_agent_enabled(kind, on);
-                                })
-                            },
-                        ))
-                        .into_any_element(),
-                );
-            }
-            let description = installed
-                .map(|_| {
-                    format!(
-                        "{} {} available.",
-                        models.len(),
-                        if models.len() == 1 { "model" } else { "models" }
-                    )
-                })
-                .unwrap_or_else(|| kind.unavailable_hint());
-            let description = if self.ctx.no_terminal_sessions {
-                format!("{description} {NO_TERMINAL_HINT}")
-            } else {
-                description
-            };
-            // Search reveals the first provider row for the shared surface setting.
-            let id = (index == 0).then_some("session-surface");
-            clis.push(self.row(id, index == 0, label, Some(description.into()), controls));
-        }
-        if self.discovery_loading {
-            clis.insert(0, note("Checking installed CLIs…"));
-        }
+        let agents = self.agent_groups(window, cx);
         // Any installed harness that can write one-off text, with the models
         // its sessions have listed; the harness default when none are loaded.
         let mut background = vec![(
@@ -316,7 +134,7 @@ impl SettingsView {
             self.row(Some("idle-agents"),true,"Keep idle agents ready",Some("Keep up to this many idle agents running for faster follow-ups. Uses additional memory.".into()),vec![self.segmented("idle-agents","Keep idle agents ready",&p.idle_agents.to_string(),&[("0","None"),("1","1"),("2","2"),("3","3"),("5","5")],cx,|this,value,cx|if let Ok(value)=value.parse(){this.update(cx,|p|p.idle_agents=value)})]),
             self.row(Some("claude-hooks"),false,"Claude Code hooks",Some("Run your configured Claude Code hooks. Changes apply on the next turn.".into()),vec![self.toggle("claude-hooks","Claude Code hooks",p.claude_hooks,false,cx,|this,on,cx|this.update(cx,|p|p.claude_hooks=on))]),
             self.row(Some("claude-entrypoint"),false,"Identify as Monoptah to Claude (experimental)",Some("Report Monoptah as the client instead of the default sdk-cli, which community tests show uses the 5-hour limit up to ~2x faster. Anthropic hasn't confirmed this or whether relabeling is allowed. Applies to new sessions.".into()),vec![self.toggle("claude-entrypoint","Identify as Monoptah to Claude",p.claude_entrypoint,false,cx,|this,on,cx|this.update(cx,|p|p.claude_entrypoint=on))])];
-        vec![
+        let mut page = vec![
             self.group(
                 Some("provider-accounts"),
                 true,
@@ -326,23 +144,17 @@ impl SettingsView {
                 accounts,
             ),
             self.group(None, false, "Usage and privacy", None, None, usage),
-            self.group(
-                Some("agent-clis"),
-                false,
-                "Agent CLIs",
-                Some("Choose available agents and default models for new conversations.".into()),
-                None,
-                clis,
-            ),
-            self.group(
-                None,
-                false,
-                "Background tasks",
-                Some("Small jobs Monoptah runs with a model on your behalf.".into()),
-                None,
-                background,
-            ),
-            self.group(None, false, "Advanced", None, None, advanced),
-        ]
+        ];
+        page.extend(agents);
+        page.push(self.group(
+            None,
+            false,
+            "Background tasks",
+            Some("Small jobs Monoptah runs with a model on your behalf.".into()),
+            None,
+            background,
+        ));
+        page.push(self.group(None, false, "Advanced", None, None, advanced));
+        page
     }
 }

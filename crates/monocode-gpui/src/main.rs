@@ -35,6 +35,7 @@ mod conversation;
 #[cfg(debug_assertions)]
 mod dev_reload;
 mod diff_view;
+mod disclosure;
 mod document_lightbox;
 mod drawer;
 mod editor_analysis;

@@ -72,6 +72,33 @@ impl HarnessUpdates {
         })
         .detach();
     }
+    /// Each pending update and how far it is, for the Agent CLIs settings.
+    pub(crate) fn settings_rows(&self) -> Vec<crate::settings::AgentUpdate> {
+        use crate::settings::{AgentUpdate, AgentUpdateState};
+        self.updates
+            .iter()
+            .map(|update| AgentUpdate {
+                kind: update.harness,
+                latest: update.latest.clone(),
+                state: match self.rows.get(&update.harness) {
+                    None => AgentUpdateState::Available,
+                    Some(RowState::Updating) => AgentUpdateState::Updating,
+                    Some(RowState::Updated(version)) => AgentUpdateState::Updated(version.clone()),
+                    Some(RowState::Failed(error)) => AgentUpdateState::Failed(error.clone()),
+                },
+            })
+            .collect()
+    }
+    /// Run one agent's pending update, as its Update button in the notice does.
+    pub(crate) fn update_one(&mut self, kind: Kind, cx: &mut Context<Self>) {
+        let targets: Vec<Update> = self
+            .updates
+            .iter()
+            .filter(|update| update.harness == kind)
+            .cloned()
+            .collect();
+        self.start(targets, cx);
+    }
     pub(crate) fn dismiss(&mut self, cx: &mut Context<Self>) {
         if self.busy() {
             return;

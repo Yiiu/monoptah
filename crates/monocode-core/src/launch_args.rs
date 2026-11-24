@@ -228,6 +228,90 @@ pub fn args_lead(kind: Kind) -> bool {
     !matches!(kind, Kind::Claude | Kind::Pi | Kind::Omp)
 }
 
+/// The reasoning effort levels Settings → Agents offers for an agent, lowest first. Empty
+/// where the agent takes no effort setting of its own (its models advertise their options
+/// per session instead): the field is hidden.
+pub fn effort_levels(kind: Kind) -> &'static [&'static str] {
+    match kind {
+        Kind::Claude => &["low", "medium", "high", "xhigh", "max"],
+        Kind::Codex | Kind::Pi | Kind::Omp => &["minimal", "low", "medium", "high", "xhigh"],
+        Kind::Grok | Kind::Hermes => &["low", "medium", "high"],
+        _ => &[],
+    }
+}
+
+/// The model, effort and permission flags a new session of `kind` puts on its command
+/// line. A terminal session passes `tui_launch::structured_flags`; a chat session passes
+/// flags only where its transport takes them on the command line (Claude, Grok, Fx's
+/// model). The other chat transports send these settings over their protocol, so nothing
+/// is listed for them.
+pub fn structured_flags(
+    kind: Kind,
+    terminal: bool,
+    model: Option<&str>,
+    effort: Option<&str>,
+    access: AccessMode,
+) -> Vec<String> {
+    if terminal {
+        return crate::tui_launch::structured_flags(kind, model, effort, access);
+    }
+    let model = model.and_then(|m| crate::store::native_model(m, kind.id()));
+    let effort = effort.filter(|e| !e.trim().is_empty());
+    let mut args: Vec<String> = Vec::new();
+    match kind {
+        Kind::Claude => {
+            if let Some(mode) = access.claude() {
+                args.extend(["--permission-mode".into(), mode.into()]);
+                if mode == "bypassPermissions" {
+                    args.push("--allow-dangerously-skip-permissions".into());
+                }
+            }
+            if let Some(effort) = effort {
+                args.extend(["--effort".into(), effort.into()]);
+            }
+            if let Some(model) = model {
+                args.extend(["--model".into(), model]);
+            }
+        }
+        Kind::Grok => {
+            if let Some(model) = model {
+                args.extend(["--model".into(), model]);
+            }
+            if let Some(effort) = effort {
+                args.extend(["--reasoning-effort".into(), effort.into()]);
+            }
+            if access == AccessMode::FullAccess {
+                args.push("--always-approve".into());
+            }
+        }
+        Kind::Fx => {
+            if let Some(model) = model {
+                args.extend(["--model".into(), model]);
+            }
+        }
+        _ => {}
+    }
+    args
+}
+
+/// Whether a chat session of `kind` sends its model, effort and permission over the
+/// agent's protocol instead of the command line, so `structured_flags` lists none of them.
+pub fn chat_uses_protocol(kind: Kind) -> bool {
+    !matches!(kind, Kind::Claude | Kind::Grok)
+}
+
+/// Arguments joined back into one line that `split` reads the same way.
+pub fn join(args: &[String]) -> String {
+    args.iter()
+        .map(|arg| {
+            shlex::try_quote(arg)
+                .map(|quoted| quoted.into_owned())
+                .unwrap_or_else(|_| arg.clone())
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Add the user's variables. Call after the app's own session environment and before the
 /// account (`Profile::apply`), so the account wins a collision.
 pub fn apply_env(command: &mut Command, env: &[(String, String)]) {
@@ -277,6 +361,84 @@ mod tests {
         assert!(parse_env("1BAD=x").is_err());
         assert!(parse_env("BAD-NAME=x").is_err());
         assert!(parse_env("=x").is_err());
+    }
+
+    #[test]
+    fn joined_arguments_split_back_to_the_same_list() {
+        let args = strings(&["--add-dir", "a b", "--flag=x y", "plain", "it's"]);
+        assert_eq!(split(&join(&args)).unwrap(), args);
+        assert_eq!(join(&strings(&["--search"])), "--search");
+    }
+
+    #[test]
+    fn the_preview_flags_follow_the_session_kind() {
+        // A terminal session passes exactly what `tui_launch::build` does.
+        assert_eq!(
+            structured_flags(
+                Kind::Claude,
+                true,
+                Some("opus"),
+                Some("high"),
+                AccessMode::AutoAcceptEdits
+            ),
+            strings(&[
+                "--model",
+                "opus",
+                "--permission-mode",
+                "acceptEdits",
+                "--effort",
+                "high"
+            ])
+        );
+        assert_eq!(
+            structured_flags(Kind::Codex, true, None, None, AccessMode::FullAccess),
+            strings(&["--dangerously-bypass-approvals-and-sandbox"])
+        );
+        // The agent's own settings pass no permission flag anywhere.
+        for kind in Kind::ALL {
+            for terminal in [true, false] {
+                assert!(
+                    structured_flags(kind, terminal, None, None, AccessMode::AgentDefault)
+                        .is_empty(),
+                    "{kind:?} {terminal}"
+                );
+            }
+        }
+        // Chat: Claude takes flags, Codex sends everything over its protocol.
+        assert_eq!(
+            structured_flags(Kind::Claude, false, None, None, AccessMode::FullAccess),
+            strings(&[
+                "--permission-mode",
+                "bypassPermissions",
+                "--allow-dangerously-skip-permissions"
+            ])
+        );
+        assert!(structured_flags(
+            Kind::Codex,
+            false,
+            Some("gpt-5"),
+            Some("high"),
+            AccessMode::Auto
+        )
+        .is_empty());
+        assert!(chat_uses_protocol(Kind::Codex));
+        assert!(!chat_uses_protocol(Kind::Claude));
+        // A terminal of an agent whose flags are not verified gets none.
+        assert!(structured_flags(
+            Kind::Grok,
+            true,
+            Some("grok-4"),
+            None,
+            AccessMode::FullAccess
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn effort_levels_exist_only_where_the_agent_takes_one() {
+        assert_eq!(effort_levels(Kind::Claude).last(), Some(&"max"));
+        assert!(effort_levels(Kind::Codex).contains(&"minimal"));
+        assert!(effort_levels(Kind::Cursor).is_empty());
     }
 
     #[test]

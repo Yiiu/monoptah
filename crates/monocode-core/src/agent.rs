@@ -141,6 +141,30 @@ impl Permission {
     pub fn parse(id: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|level| level.id() == id)
     }
+    /// The name Settings → Agents shows.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Own => "Agent's own settings",
+            Self::Ask => "Ask for approval",
+            Self::AcceptEdits => "Accept edits",
+            Self::Auto => "Approve for me",
+            Self::Full => "Full access",
+        }
+    }
+    /// One line on what the level lets an agent do.
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Own => {
+                "Monoptah passes no permission setting. The agent uses its own configuration."
+            }
+            Self::Ask => "Asks before editing files or running commands.",
+            Self::AcceptEdits => "Edits files without asking. Asks before running commands.",
+            Self::Auto => {
+                "The agent reviews approval requests itself and asks only for risky ones."
+            }
+            Self::Full => "Never asks. Can edit any file and run any command.",
+        }
+    }
     pub fn access(self) -> AccessMode {
         match self {
             Self::Own => AccessMode::AgentDefault,

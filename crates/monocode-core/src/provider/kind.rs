@@ -109,7 +109,7 @@ impl Kind {
         }
     }
     /// The install command React shows in its hint, when it has one.
-    fn install_command(self) -> Option<&'static str> {
+    pub fn install_command(self) -> Option<&'static str> {
         match self {
             Self::Grok => Some("curl -fsSL https://x.ai/cli/install.sh | bash"),
             Self::Pi => Some("npm i -g @earendil-works/pi-coding-agent"),
@@ -123,6 +123,22 @@ impl Kind {
             #[cfg(not(windows))]
             Self::Devin => Some("curl -fsSL https://cli.devin.ai/install.sh | bash"),
             Self::Codex | Self::Claude | Self::Cursor | Self::OpenCode | Self::Antigravity => None,
+        }
+    }
+    /// Where the agent's CLI is documented: install steps, flags and configuration.
+    pub fn docs_url(self) -> &'static str {
+        match self {
+            Self::Codex => "https://developers.openai.com/codex/cli",
+            Self::Claude => "https://code.claude.com/docs",
+            Self::Cursor => "https://cursor.com/docs/cli/overview",
+            Self::Grok => "https://x.ai/cli",
+            Self::OpenCode => "https://opencode.ai/docs",
+            Self::Antigravity => "https://antigravity.google/docs",
+            Self::Pi => "https://pi.dev",
+            Self::Omp => "https://omp.sh",
+            Self::Fx => "https://fx.sh",
+            Self::Hermes => "https://hermes-agent.nousresearch.com/docs",
+            Self::Devin => "https://docs.devin.ai",
         }
     }
     /// The same "not found" copy React uses. React only checks that a binary

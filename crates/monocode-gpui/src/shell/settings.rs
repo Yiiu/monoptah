@@ -125,6 +125,7 @@ impl Shell {
                 })
                 .unwrap_or_default(),
             catalogs,
+            agent_updates: self.notification_state.harness.read(cx).settings_rows(),
             classic: self.workspace.classic_layout,
             new_layout_boxy: self.workspace.new_layout_boxy,
             no_terminal_sessions: !self.surface_supported,
@@ -217,6 +218,12 @@ impl Shell {
                     this.notification_state
                         .harness
                         .update(cx, |notice, cx| notice.check_now(hidden, cx));
+                }
+                SettingsEvent::UpdateAgent(kind) => {
+                    let kind = *kind;
+                    this.notification_state
+                        .harness
+                        .update(cx, |notice, cx| notice.update_one(kind, cx));
                 }
                 SettingsEvent::Changed(prefs) => {
                     #[cfg(target_os = "linux")]

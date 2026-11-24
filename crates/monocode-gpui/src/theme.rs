@@ -334,6 +334,47 @@ pub(crate) fn success_color() -> Hsla {
 pub(crate) fn danger_color() -> Hsla {
     rgb(if is_light() { 0xdc2626 } else { 0xf87171 }).into()
 }
+/// A permission level's colour, the same wherever the level shows: the Agent CLIs settings
+/// and the composer's access menu. Own is neutral ink, ask the accent, accept edits teal,
+/// approve for me violet and full access the danger red; darker on light themes.
+pub(crate) fn permission_color(level: monocode_core::agent::Permission) -> Hsla {
+    use monocode_core::agent::Permission;
+    match level {
+        Permission::Own => content(0.6),
+        Permission::Ask => accent_color(),
+        Permission::AcceptEdits => rgb(if is_light() { 0x13917c } else { 0x3fbfa8 }).into(),
+        Permission::Auto => rgb(if is_light() { 0x7c5cd6 } else { 0xa78bfa }).into(),
+        Permission::Full => danger_color(),
+    }
+}
+/// A permission level's icon; see `permission_color`.
+pub(crate) fn permission_icon(level: monocode_core::agent::Permission) -> &'static str {
+    use monocode_core::agent::Permission;
+    match level {
+        Permission::Own => "settings",
+        Permission::Ask => "hand",
+        Permission::AcceptEdits => "pencil-line",
+        Permission::Auto => "shield-check",
+        Permission::Full => "shield-off",
+    }
+}
+/// A session access mode's icon: its permission level's, with a lock for read-only (a
+/// composer-only mode that is not a settings level).
+pub(crate) fn access_icon(mode: monocode_core::agent::AccessMode) -> &'static str {
+    use monocode_core::agent::{AccessMode, Permission};
+    match mode {
+        AccessMode::ReadOnly => "square-lock",
+        mode => permission_icon(Permission::from_access(mode)),
+    }
+}
+/// A session access mode's colour; read-only is neutral ink.
+pub(crate) fn access_color(mode: monocode_core::agent::AccessMode) -> Hsla {
+    use monocode_core::agent::{AccessMode, Permission};
+    match mode {
+        AccessMode::ReadOnly => content(0.6),
+        mode => permission_color(Permission::from_access(mode)),
+    }
+}
 /// The opaque card behind popovers and modals in light themes, and wherever
 /// the renderer has no backdrop blur.
 pub(crate) fn floating_fill() -> Hsla {

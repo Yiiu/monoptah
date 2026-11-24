@@ -135,12 +135,7 @@ impl Preferences {
             .permissions
             .get(id)
             .and_then(|p| Permission::parse(p));
-        let global = agents
-            .permission
-            .as_deref()
-            .and_then(Permission::parse)
-            .unwrap_or(Permission::Own);
-        let configured = own.unwrap_or(global);
+        let configured = own.unwrap_or_else(|| self.agent_permission());
         let permission = if Permission::supported(kind).contains(&configured) {
             configured
         } else {
@@ -174,6 +169,15 @@ impl Preferences {
             surface: self.agent_surface(kind),
             enabled: !self.hidden_providers.iter().any(|hidden| hidden == id),
         }
+    }
+
+    /// The permission level every agent follows unless it has its own.
+    pub(crate) fn agent_permission(&self) -> Permission {
+        self.agents
+            .permission
+            .as_deref()
+            .and_then(Permission::parse)
+            .unwrap_or(Permission::Own)
     }
 
     /// "chat", "tui" or "per-agent".

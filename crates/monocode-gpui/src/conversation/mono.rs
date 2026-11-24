@@ -515,26 +515,27 @@ impl Conversation {
         let provider = Kind::from_id(&self.summary.provider);
         let mut items = vec![
             MenuAction::new("access:read-only", "Read-only")
-                .icon("square-lock")
+                .icon(access_icon(AccessMode::ReadOnly))
+                .icon_color(access_color(AccessMode::ReadOnly))
                 .description("Inspect without changing files.")
                 .checked(self.settings.access == AccessMode::ReadOnly)
                 .into(),
         ];
-        items.extend(ACCESS_MODES.iter().map(|(id, label, hint, glyph)| {
+        items.extend(ACCESS_MODES.iter().map(|(id, label, hint)| {
+                    let mode = AccessMode::from_id(id);
                     let hint = match (provider,*id) {
+                        (_,"own") => *hint,
                         (Kind::Cursor,"supervised") => "Confirm commands using Cursor's permission policy; Cursor may accept edits automatically.",
                         (Kind::Pi | Kind::Omp,_) => "Tool confirmations follow this provider's configured extensions.",
                         _ => *hint,
                     };
-                    let action = MenuAction::new(format!("access:{id}"), *label)
-                        .icon(glyph)
-                        .description(hint)
-                        .checked(self.settings.access.id() == *id);
-                    MenuItem::from(if *id == "full-access" {
-                        action.icon_color(tint(AMBER_400, 0.9))
-                    } else {
-                        action
-                    })
+                    MenuItem::from(
+                        MenuAction::new(format!("access:{id}"), *label)
+                            .icon(access_icon(mode))
+                            .icon_color(access_color(mode))
+                            .description(hint)
+                            .checked(self.settings.access == mode),
+                    )
                 }));
         if self.busy {
             items.push(MenuItem::Note("Changes apply to the next turn.".into()));
@@ -1239,22 +1240,8 @@ impl Conversation {
                                         this.toggle_menu(ComposerMenu::Access, window, cx)
                                     }))
                                     .child(
-                                        icon(
-                                            match self.settings.access {
-                                                AccessMode::FullAccess => "shield-alert",
-                                                AccessMode::AutoAcceptEdits => "pencil-edit",
-                                                AccessMode::Auto => "sparkles",
-                                                _ => "square-lock",
-                                            },
-                                            14.,
-                                        )
-                                        .text_color(
-                                            if self.settings.access == AccessMode::FullAccess {
-                                                tint(AMBER_400, 0.9)
-                                            } else {
-                                                content(1.)
-                                            },
-                                        ),
+                                        icon(access_icon(self.settings.access), 14.)
+                                            .text_color(access_color(self.settings.access)),
                                     )
                                     .child(pill_label(self.settings.access.label()))
                                     .child(icon("chevron-down", 12.)),

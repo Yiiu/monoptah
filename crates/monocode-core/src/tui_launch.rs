@@ -76,24 +76,16 @@ pub fn build(input: LaunchInput) -> TuiLaunch {
     let caps = tui_caps(input.kind);
     let mut args: Vec<OsString> = Vec::new();
     let mut minted_id = None;
-    let model = input
-        .model
-        .as_deref()
-        .and_then(|m| crate::store::native_model(m, input.kind.id()));
-    let effort = non_blank(&input.effort);
-    if caps.launch_flags && input.kind == Kind::Codex {
-        codex_flags(model, effort, input.access, &mut args);
-    } else if caps.launch_flags {
-        if let Some(model) = model {
-            args.extend(["--model".into(), model.into()]);
-        }
-        if let Some(mode) = input.access.claude() {
-            args.extend(["--permission-mode".into(), mode.into()]);
-        }
-        if let Some(effort) = effort.filter(|e| CLAUDE_EFFORTS.contains(e)) {
-            args.extend(["--effort".into(), effort.into()]);
-        }
-    }
+    args.extend(
+        structured_flags(
+            input.kind,
+            input.model.as_deref(),
+            input.effort.as_deref(),
+            input.access,
+        )
+        .into_iter()
+        .map(OsString::from),
+    );
     if input.kind == Kind::Claude && !input.windows {
         if let Some((cli, spool)) = &input.hook {
             args.extend(["--settings".into(), hook_settings_json(cli, spool).into()]);
@@ -137,6 +129,37 @@ pub fn build(input: LaunchInput) -> TuiLaunch {
     }
 }
 
+/// The model, effort and permission flags a terminal session of `kind` starts with; empty
+/// where the CLI's interactive flags are not verified (`tui_caps`). `build` passes exactly
+/// these, and the settings page shows them in its launch preview.
+pub fn structured_flags(
+    kind: Kind,
+    model: Option<&str>,
+    effort: Option<&str>,
+    access: AccessMode,
+) -> Vec<String> {
+    let mut args: Vec<String> = Vec::new();
+    if !tui_caps(kind).launch_flags {
+        return args;
+    }
+    let model = model.and_then(|m| crate::store::native_model(m, kind.id()));
+    let effort = effort.filter(|e| !e.trim().is_empty());
+    if kind == Kind::Codex {
+        codex_flags(model, effort, access, &mut args);
+        return args;
+    }
+    if let Some(model) = model {
+        args.extend(["--model".into(), model]);
+    }
+    if let Some(mode) = access.claude() {
+        args.extend(["--permission-mode".into(), mode.into()]);
+    }
+    if let Some(effort) = effort.filter(|e| CLAUDE_EFFORTS.contains(e)) {
+        args.extend(["--effort".into(), effort.into()]);
+    }
+    args
+}
+
 /// Codex's interactive flags, checked against codex-cli 0.172.0 (`codex --help`):
 /// `--model`, `-c model_reasoning_effort=..`, `-a on-request|never`, `-s <sandbox>` and
 /// `--dangerously-bypass-approvals-and-sandbox`. "Approve for me" uses the
@@ -146,18 +169,15 @@ fn codex_flags(
     model: Option<String>,
     effort: Option<&str>,
     access: AccessMode,
-    args: &mut Vec<OsString>,
+    args: &mut Vec<String>,
 ) {
     if let Some(model) = model {
-        args.extend(["--model".into(), model.into()]);
+        args.extend(["--model".into(), model]);
     }
     if let Some(effort) =
         effort.filter(|e| e.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
     {
-        args.extend([
-            "-c".into(),
-            format!("model_reasoning_effort=\"{effort}\"").into(),
-        ]);
+        args.extend(["-c".into(), format!("model_reasoning_effort=\"{effort}\"")]);
     }
     let flags: &[&str] = match access {
         AccessMode::AgentDefault => &[],
@@ -174,7 +194,7 @@ fn codex_flags(
         ],
         AccessMode::FullAccess => &["--dangerously-bypass-approvals-and-sandbox"],
     };
-    args.extend(flags.iter().map(OsString::from));
+    args.extend(flags.iter().map(|flag| (*flag).to_owned()));
 }
 
 /// The `--settings` JSON that makes Claude call back into this app. Claude merges

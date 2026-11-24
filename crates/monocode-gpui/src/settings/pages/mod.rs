@@ -1,4 +1,5 @@
 //! One file per Settings page, each a port of its SettingsView.tsx function.
+mod agents;
 mod appearance;
 mod archive;
 mod chat;
@@ -20,6 +21,7 @@ mod web_activity;
 pub(super) mod web_app;
 mod worktrees;
 
+pub(super) use agents::{AgentsState, agent_for_setting};
 pub(super) use appearance::parse_hex;
 pub(crate) use appearance::{ACCENTS, swatch};
 pub(super) use cloud::CloudState;
@@ -50,7 +52,7 @@ impl SettingsView {
             Section::Appearance => self.appearance_page(window, cx),
             Section::Keybindings => self.keybindings_page(cx),
             Section::Chat => self.chat_page(cx),
-            Section::Providers => self.providers_page(cx),
+            Section::Providers => self.providers_page(window, cx),
             Section::Mcp => self.mcp_page(cx),
             Section::Skills => self.skills_page(cx),
             Section::Monos => self.monos_page(cx),

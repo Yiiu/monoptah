@@ -6,8 +6,8 @@ use crate::{
     theme::*,
 };
 use gpui::{
-    AnyElement, Context, Div, ElementId, FontWeight, Hsla, MouseButton, MouseDownEvent, Role,
-    SharedString, Stateful, div, prelude::*, px, relative, rgb,
+    AnyElement, Context, Div, ElementId, Entity, FontWeight, Hsla, MouseButton, MouseDownEvent,
+    Role, SharedString, Stateful, div, prelude::*, px, relative, rgb,
 };
 
 pub(super) const RED: u32 = 0xf87171;
@@ -453,6 +453,23 @@ impl SettingsView {
         cx: &mut Context<Self>,
         change: impl Fn(&mut Self, &'static str, &mut Context<Self>) + Clone + 'static,
     ) -> AnyElement {
+        let options: Vec<(&'static str, &str, Option<&'static str>)> = options
+            .iter()
+            .map(|&(option, text)| (option, text, None))
+            .collect();
+        self.segmented_icons(id, label, value, &options, cx, change)
+    }
+
+    /// Segmented whose options may lead with a 12px icon.
+    pub(super) fn segmented_icons(
+        &self,
+        id: impl Into<SharedString>,
+        label: impl Into<SharedString>,
+        value: &str,
+        options: &[(&'static str, &str, Option<&'static str>)],
+        cx: &mut Context<Self>,
+        change: impl Fn(&mut Self, &'static str, &mut Context<Self>) + Clone + 'static,
+    ) -> AnyElement {
         let id: SharedString = id.into();
         div()
             .id(SharedString::from(format!("segmented-{id}")))
@@ -468,7 +485,7 @@ impl SettingsView {
             .p(px(2.))
             .text_size(px(12.))
             .line_height(px(16.))
-            .children(options.iter().map(|&(option, text)| {
+            .children(options.iter().map(|&(option, text, glyph)| {
                 let selected = value == option;
                 let change = change.clone();
                 let id = id.clone();
@@ -483,7 +500,9 @@ impl SettingsView {
                     .aria_selected(selected)
                     .min_w_0()
                     .flex()
+                    .items_center()
                     .justify_center()
+                    .gap_1()
                     .whitespace_nowrap()
                     .rounded(px(5.))
                     .px(px(10.))
@@ -496,6 +515,13 @@ impl SettingsView {
                             d.text_color(content(0.5))
                                 .hover(|s| s.text_color(content(1.)))
                         }
+                    })
+                    .when_some(glyph, |d, glyph| {
+                        d.child(icon(glyph, 12.).text_color(content(if selected {
+                            1.
+                        } else {
+                            0.5
+                        })))
                     })
                     .child(text.to_owned())
                     .on_click(cx.listener(move |this, _, _, cx| change(this, option, cx)))
@@ -926,6 +952,650 @@ impl SettingsView {
             .when(!self.discovery_loading, |d| {
                 d.on_click(cx.listener(|this, _, _, cx| this.refresh(cx)))
             })
+            .into_any_element()
+    }
+}
+
+// --- Building blocks first used by the Agent CLIs settings. They are stateless, take their
+// colours from the theme and keep the metrics of the widgets above.
+
+/// `color` at another opacity: the fill behind a badge, an icon tile or a banner.
+pub(crate) fn tinted(color: Hsla, alpha: f32) -> Hsla {
+    let mut color = color;
+    color.a = alpha;
+    color
+}
+
+/// A small tag: an optional 12px icon and 11px medium text on a 13% tint of `color`.
+/// Used for Default, Off and permission badges.
+pub(crate) fn badge(
+    text: impl Into<SharedString>,
+    glyph: Option<&'static str>,
+    color: Hsla,
+) -> Div {
+    let ink = tinted(color, 1.);
+    div()
+        .flex()
+        .flex_shrink_0()
+        .items_center()
+        .gap_1()
+        .h(px(18.))
+        .rounded(px(4.))
+        .bg(tinted(color, 0.13))
+        .px(px(6.))
+        .text_size(px(11.))
+        .line_height(px(16.))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(ink)
+        .whitespace_nowrap()
+        .when_some(glyph, |d, glyph| d.child(icon(glyph, 12.).text_color(ink)))
+        .child(text.into())
+}
+
+/// A monospace chip, such as one argument of a split argument line.
+pub(crate) fn chip(text: impl Into<SharedString>) -> Div {
+    div()
+        .flex_shrink_0()
+        .rounded(px(4.))
+        .bg(content(0.08))
+        .px(px(6.))
+        .font_family(crate::fonts::mono())
+        .text_size(px(11.))
+        .line_height(px(16.))
+        .text_color(content(0.72))
+        .child(text.into())
+}
+
+/// A square tile holding an icon on a 13% tint of its colour.
+pub(crate) fn icon_tile(glyph: &'static str, color: Hsla, side: f32) -> Div {
+    div()
+        .size(px(side))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(5.))
+        .bg(tinted(color, 0.13))
+        .child(icon(glyph, (side * 0.6).round()).text_color(tinted(color, 1.)))
+}
+
+/// One field of a details panel: a 136px label column beside its controls, which stack.
+/// Rows draw their own top rule, as `row` does.
+pub(super) fn field(
+    first: bool,
+    label: impl Into<SharedString>,
+    hint: Option<SharedString>,
+    body: Vec<AnyElement>,
+) -> AnyElement {
+    div()
+        .flex()
+        .items_start()
+        .gap_4()
+        .py_3()
+        .when(!first, |d| d.border_t_1().border_color(content(0.05)))
+        .child(
+            div()
+                .w(px(136.))
+                .flex_shrink_0()
+                .pt(px(4.))
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .line_height(px(19.5))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(content(1.))
+                        .child(label.into()),
+                )
+                .when_some(hint, |d, hint| {
+                    d.child(
+                        div()
+                            .mt(px(2.))
+                            .text_size(px(12.))
+                            .line_height(px(16.))
+                            .text_color(content(0.45))
+                            .child(hint),
+                    )
+                }),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .children(body),
+        )
+        .into_any_element()
+}
+
+/// A muted help line under a control.
+pub(super) fn help(text: impl Into<SharedString>) -> Div {
+    div()
+        .text_size(px(12.))
+        .line_height(px(16.))
+        .text_color(content(0.45))
+        .child(text.into())
+}
+
+/// A validation error under a field.
+pub(super) fn field_error(
+    id: impl Into<ElementId>,
+    selector: String,
+    text: impl Into<SharedString>,
+) -> AnyElement {
+    let text = text.into();
+    div()
+        .id(id)
+        .debug_selector(move || selector.clone())
+        .role(Role::Alert)
+        .aria_label(text.clone())
+        .flex()
+        .items_start()
+        .gap_1()
+        .text_size(px(12.))
+        .line_height(px(16.))
+        .text_color(danger_color())
+        .child(icon("circle-x", 12.).mt(px(2.)).text_color(danger_color()))
+        .child(div().min_w_0().flex_1().child(text))
+        .into_any_element()
+}
+
+/// "Saved", shown briefly after a field commits.
+pub(super) fn saved_flash() -> AnyElement {
+    div()
+        .debug_selector(|| "settings-saved".into())
+        .flex()
+        .items_center()
+        .gap_1()
+        .text_size(px(12.))
+        .line_height(px(16.))
+        .text_color(success_color())
+        .child(icon("check", 12.).text_color(success_color()))
+        .child("Saved")
+        .into_any_element()
+}
+
+/// A status dot followed by short facts; a monospace fact is a path or a version.
+pub(super) fn status_line(dot: Hsla, facts: Vec<(SharedString, bool)>) -> AnyElement {
+    div()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .gap(px(6.))
+        .text_size(px(12.))
+        .line_height(px(16.))
+        .text_color(content(0.5))
+        .child(div().size(px(6.)).flex_shrink_0().rounded_full().bg(dot))
+        .children(facts.into_iter().map(|(text, mono)| {
+            div()
+                .min_w_0()
+                .when(mono, |d| {
+                    d.font_family(crate::fonts::mono()).text_size(px(11.))
+                })
+                .child(text)
+        }))
+        .into_any_element()
+}
+
+/// The frame around a one-line text field: 28px, the select trigger's border and fill.
+pub(super) fn text_box(input: Entity<crate::input::Input>, mono: bool, invalid: bool) -> Div {
+    div()
+        .min_w_0()
+        .flex_1()
+        .h(px(28.))
+        .flex()
+        .items_center()
+        .rounded_md()
+        .border_1()
+        .border_color(if invalid {
+            danger_color()
+        } else {
+            content(0.1)
+        })
+        .bg(content(0.05))
+        .px_2()
+        .when(mono, |d| d.font_family(crate::fonts::mono()))
+        .child(div().min_w_0().flex_1().child(input))
+}
+
+/// The frame around a multi-line text field.
+pub(super) fn text_area(input: Entity<crate::input::Input>, mono: bool, invalid: bool) -> Div {
+    div()
+        .w_full()
+        .rounded_md()
+        .border_1()
+        .border_color(if invalid {
+            danger_color()
+        } else {
+            content(0.1)
+        })
+        .bg(content(0.05))
+        .px_2()
+        .py(px(6.))
+        .when(mono, |d| d.font_family(crate::fonts::mono()))
+        .child(input)
+}
+
+/// A tinted notice inside a card: an icon, a message and an optional action. `ink` is the
+/// message colour (the text colour for an error to read, the tint itself for a warning).
+pub(super) fn inline_banner(
+    id: impl Into<ElementId>,
+    glyph: &'static str,
+    color: Hsla,
+    ink: Hsla,
+    text: impl Into<SharedString>,
+    action: Option<AnyElement>,
+) -> Stateful<Div> {
+    let text = text.into();
+    div()
+        .id(id)
+        .role(Role::Alert)
+        .aria_label(text.clone())
+        .flex()
+        .items_start()
+        .gap_2()
+        .rounded_md()
+        .bg(tinted(color, 0.1))
+        .px_3()
+        .py_2()
+        .text_size(px(12.))
+        .line_height(px(16.))
+        .child(icon(glyph, 14.).mt(px(1.)).text_color(tinted(color, 1.)))
+        .child(div().min_w_0().flex_1().text_color(ink).child(text))
+        .children(action)
+}
+
+/// A placeholder row while a list loads: an icon tile and a text bar.
+pub(super) fn skeleton_row() -> AnyElement {
+    div()
+        .h(px(56.))
+        .flex()
+        .items_center()
+        .gap_3()
+        .border_t_1()
+        .border_color(content(0.05))
+        .px_4()
+        .child(div().size(px(28.)).rounded(px(7.)).bg(content(0.08)))
+        .child(
+            div()
+                .w(px(180.))
+                .h(px(10.))
+                .rounded(px(4.))
+                .bg(content(0.08)),
+        )
+        .into_any_element()
+}
+
+/// A monospace block under a small header with an action on the right, such as a launch
+/// preview with Copy.
+pub(super) fn code_block(
+    glyph: &'static str,
+    title: impl Into<SharedString>,
+    action: AnyElement,
+    body: AnyElement,
+) -> Div {
+    div()
+        .rounded_md()
+        .border_1()
+        .border_color(content(0.1))
+        .bg(content(0.03))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .pl_3()
+                .pr(px(6.))
+                .pt(px(6.))
+                .text_size(px(12.))
+                .line_height(px(16.))
+                .text_color(content(0.5))
+                .child(icon(glyph, 13.))
+                .child(div().min_w_0().flex_1().child(title.into()))
+                .child(action),
+        )
+        .child(
+            div()
+                .px_3()
+                .pt_1()
+                .pb(px(10.))
+                .font_family(crate::fonts::mono())
+                .text_size(px(12.))
+                .line_height(px(19.))
+                .text_color(content(0.8))
+                .child(body),
+        )
+}
+
+/// The frame of a read-only variables table; its rows are `env_row`s.
+pub(super) fn env_table(rows: Vec<AnyElement>) -> Div {
+    div()
+        .rounded_md()
+        .border_1()
+        .border_color(content(0.1))
+        .bg(content(0.03))
+        .overflow_hidden()
+        .flex()
+        .flex_col()
+        .children(rows)
+}
+
+/// One variable: its name, its (possibly masked) value, an optional note such as who
+/// overrides it, and a trailing control such as the reveal button.
+pub(super) fn env_row(
+    first: bool,
+    key: impl Into<SharedString>,
+    value: impl Into<SharedString>,
+    note: Option<SharedString>,
+    trailing: Option<AnyElement>,
+) -> AnyElement {
+    div()
+        .min_h(px(30.))
+        .flex()
+        .items_center()
+        .gap_2()
+        .pl(px(10.))
+        .pr_1()
+        .when(!first, |d| d.border_t_1().border_color(content(0.05)))
+        .text_size(px(12.))
+        .line_height(px(16.))
+        .child(
+            div()
+                .w(px(200.))
+                .flex_shrink_0()
+                .truncate()
+                .font_family(crate::fonts::mono())
+                .text_color(content(1.))
+                .child(key.into()),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .flex_1()
+                .truncate()
+                .font_family(crate::fonts::mono())
+                .text_color(content(0.55))
+                .child(value.into()),
+        )
+        .when_some(note, |d, note| {
+            d.child(
+                div()
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .text_size(px(11.))
+                    .text_color(warning_color())
+                    .child(icon("lock", 11.).text_color(warning_color()))
+                    .child(note),
+            )
+        })
+        .child(
+            div()
+                .size(px(24.))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .children(trailing),
+        )
+        .into_any_element()
+}
+
+/// A notice at the bottom right of Settings: an icon, a message and an optional action
+/// such as Undo. One shows at a time.
+pub(super) fn settings_toast(
+    glyph: &'static str,
+    text: impl Into<SharedString>,
+    action: Option<AnyElement>,
+) -> AnyElement {
+    let text = text.into();
+    crate::notifications::surface::toast_frame()
+        .id("settings-toast")
+        .debug_selector(|| "settings-toast".into())
+        .role(Role::Status)
+        .aria_label(text.clone())
+        .w(px(380.))
+        .child(
+            div()
+                .relative()
+                .flex()
+                .items_start()
+                .gap(px(10.))
+                .px_3()
+                .py(px(10.))
+                .text_size(px(12.))
+                .line_height(px(16.))
+                .child(icon(glyph, 16.).text_color(accent_color()))
+                .child(div().min_w_0().flex_1().text_color(content(1.)).child(text))
+                .children(action),
+        )
+        .into_any_element()
+}
+
+/// One card of `radio_cards`.
+pub(super) struct RadioCard {
+    pub value: &'static str,
+    pub title: SharedString,
+    pub description: SharedString,
+    /// The compact card's leading icon.
+    pub glyph: Option<&'static str>,
+    /// The regular card's 56px preview.
+    pub preview: Option<AnyElement>,
+}
+
+impl SettingsView {
+    /// Radio cards: one choice among a few, each with a title and a line of description.
+    /// Regular cards sit in equal columns under a preview and a radio mark; compact cards
+    /// lead with an icon. The selected card takes the accent border and a faint accent fill.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn radio_cards(
+        &self,
+        id: impl Into<SharedString>,
+        label: impl Into<SharedString>,
+        value: &str,
+        cards: Vec<RadioCard>,
+        compact: bool,
+        cx: &mut Context<Self>,
+        change: impl Fn(&mut Self, &'static str, &mut Context<Self>) + Clone + 'static,
+    ) -> AnyElement {
+        let id: SharedString = id.into();
+        div()
+            .id(SharedString::from(format!("radio-cards-{id}")))
+            .role(Role::RadioGroup)
+            .aria_label(label.into())
+            .grid()
+            .grid_cols(cards.len() as u16)
+            .gap_2()
+            .children(cards.into_iter().map(|card| {
+                let selected = value == card.value;
+                let option = card.value;
+                let change = change.clone();
+                let title = div()
+                    .text_size(px(13.))
+                    .line_height(px(19.5))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(content(1.))
+                    .child(card.title.clone());
+                let description = div()
+                    .text_size(px(12.))
+                    .line_height(px(16.))
+                    .text_color(content(0.45))
+                    .child(card.description.clone());
+                div()
+                    .id(SharedString::from(format!("radio-card-{id}-{option}")))
+                    .debug_selector({
+                        let id = id.clone();
+                        move || format!("settings-{id}-{option}")
+                    })
+                    .role(Role::RadioButton)
+                    .aria_label(card.title.clone())
+                    .aria_selected(selected)
+                    .relative()
+                    .min_w_0()
+                    .rounded_md()
+                    .border_1()
+                    .cursor_pointer()
+                    .map(|d| {
+                        if selected {
+                            d.border_color(accent_color()).bg(accent(0.06))
+                        } else {
+                            d.border_color(content(0.1))
+                                .hover(|s| s.border_color(content(0.2)))
+                        }
+                    })
+                    .map(|d| {
+                        if compact {
+                            d.flex()
+                                .items_start()
+                                .gap_2()
+                                .px(px(10.))
+                                .py_2()
+                                .when_some(card.glyph, |d, glyph| {
+                                    d.child(icon(glyph, 16.).mt(px(2.)).text_color(if selected {
+                                        accent_color()
+                                    } else {
+                                        content(0.6)
+                                    }))
+                                })
+                                .child(div().min_w_0().flex_1().child(title).child(description))
+                        } else {
+                            d.p_2()
+                                .when_some(card.preview, |d, preview| {
+                                    d.child(
+                                        div()
+                                            .h(px(56.))
+                                            .mb_2()
+                                            .overflow_hidden()
+                                            .rounded(px(4.))
+                                            .bg(content(0.05))
+                                            .p_2()
+                                            .child(preview),
+                                    )
+                                })
+                                .child(title)
+                                .child(description)
+                                // The radio mark of `modal::radio_row`.
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .top(px(8.))
+                                        .right(px(8.))
+                                        .size(px(14.))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_full()
+                                        .border_1()
+                                        .border_color(if selected {
+                                            accent_color()
+                                        } else {
+                                            content(0.3)
+                                        })
+                                        .bg(shell_fill())
+                                        .when(selected, |d| {
+                                            d.child(
+                                                div()
+                                                    .size(px(6.))
+                                                    .rounded_full()
+                                                    .bg(accent_color()),
+                                            )
+                                        }),
+                                )
+                        }
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| change(this, option, cx)))
+            }))
+            .into_any_element()
+    }
+
+    /// A ladder of levels, lowest first, after a "Default" step: each step shows as many lit
+    /// bars as its rank. Used for reasoning effort. The frame and selection are `segmented`'s.
+    pub(super) fn level_picker(
+        &self,
+        id: impl Into<SharedString>,
+        label: impl Into<SharedString>,
+        value: Option<&str>,
+        levels: &[(String, SharedString)],
+        cx: &mut Context<Self>,
+        change: impl Fn(&mut Self, Option<String>, &mut Context<Self>) + Clone + 'static,
+    ) -> AnyElement {
+        let id: SharedString = id.into();
+        let count = levels.len();
+        let steps = std::iter::once((None, SharedString::from("Default"), 0)).chain(
+            levels
+                .iter()
+                .enumerate()
+                .map(|(ix, (level, name))| (Some(level.clone()), name.clone(), ix + 1)),
+        );
+        div()
+            .id(SharedString::from(format!("levels-{id}")))
+            .role(Role::RadioGroup)
+            .aria_label(label.into())
+            .flex()
+            .flex_wrap()
+            .flex_shrink_0()
+            .gap(px(2.))
+            .rounded_md()
+            .border_1()
+            .border_color(content(0.1))
+            .p(px(2.))
+            .text_size(px(12.))
+            .line_height(px(16.))
+            .children(steps.map(|(level, name, rank)| {
+                let selected = value == level.as_deref();
+                let change = change.clone();
+                let key = level.clone().unwrap_or_else(|| "default".into());
+                let bars = div().h(px(10.)).flex().items_end().gap(px(2.)).map(|d| {
+                    if rank == 0 {
+                        d.child(icon("minus", 10.).text_color(content(0.5)))
+                    } else {
+                        d.children((0..count).map(|bar| {
+                            div()
+                                .w(px(3.))
+                                .h(px(4. + bar as f32 * 1.5))
+                                .rounded(px(1.))
+                                .bg(if bar < rank {
+                                    accent_color()
+                                } else {
+                                    content(0.2)
+                                })
+                        }))
+                    }
+                });
+                div()
+                    .id(SharedString::from(format!("level-{id}-{key}")))
+                    .debug_selector({
+                        let id = id.clone();
+                        move || format!("settings-{id}-{key}")
+                    })
+                    .role(Role::RadioButton)
+                    .aria_label(name.clone())
+                    .aria_selected(selected)
+                    .min_w(px(56.))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap_1()
+                    .rounded(px(5.))
+                    .px_2()
+                    .pt(px(6.))
+                    .pb_1()
+                    .whitespace_nowrap()
+                    .cursor_pointer()
+                    .map(|d| {
+                        if selected {
+                            d.bg(content(0.1)).text_color(content(1.))
+                        } else {
+                            d.text_color(content(0.5))
+                                .hover(|s| s.text_color(content(1.)))
+                        }
+                    })
+                    .child(bars)
+                    .child(name)
+                    .on_click(cx.listener(move |this, _, _, cx| change(this, level.clone(), cx)))
+            }))
             .into_any_element()
     }
 }

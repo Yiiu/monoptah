@@ -89,32 +89,34 @@ use std::{
 // Keep empty and docked composers aligned with the transcript column. Below
 // this width the empty session drops its title.
 const COMPOSER_COLUMN: f32 = COLUMN;
-// RUNTIME_MODE_LABEL and RUNTIME_MODE_HINT from the React session model,
-// with AccessPicker's icons; Full access is amber.
-const ACCESS_MODES: &[(&str, &str, &str, &str)] = &[
+// RUNTIME_MODE_LABEL and RUNTIME_MODE_HINT from the React session model, after the
+// agent's own settings. Each mode's icon and colour come from `theme::access_icon` and
+// `theme::access_color`, shared with Settings → Agents.
+const ACCESS_MODES: &[(&str, &str, &str)] = &[
+    (
+        "own",
+        "Agent's own settings",
+        "Pass no permission setting. The agent uses its own configuration.",
+    ),
     (
         "supervised",
         "Supervised",
         "Ask before commands and file changes.",
-        "square-lock",
     ),
     (
         "auto-accept-edits",
         "Auto-accept edits",
         "Auto-approve edits, ask before other actions.",
-        "pencil-edit",
     ),
     (
         "auto",
         "Auto",
         "An AI reviewer can approve or deny actions.",
-        "sparkles",
     ),
     (
         "full-access",
         "Full access",
         "Allow commands, edits, and supported MCP confirmations in non-plan turns without prompts.",
-        "shield-alert",
     ),
 ];
 // Tailwind v4 accents the composer menus tint their icons with.
@@ -3589,26 +3591,10 @@ impl Conversation {
                                                 this.toggle_menu(ComposerMenu::Access, window, cx)
                                             }))
                                             .child(
-                                                icon(
-                                                    match self.settings.access {
-                                                        AccessMode::FullAccess => "shield-alert",
-                                                        AccessMode::AutoAcceptEdits => {
-                                                            "pencil-edit"
-                                                        }
-                                                        AccessMode::Auto => "sparkles",
-                                                        _ => "square-lock",
-                                                    },
-                                                    14.,
-                                                )
-                                                .text_color(
-                                                    if self.settings.access
-                                                        == AccessMode::FullAccess
-                                                    {
-                                                        tint(AMBER_400, 0.9)
-                                                    } else {
-                                                        content(1.)
-                                                    },
-                                                ),
+                                                icon(access_icon(self.settings.access), 14.)
+                                                    .text_color(access_color(
+                                                        self.settings.access,
+                                                    )),
                                             )
                                             .child(pill_label(self.settings.access.label()))
                                             .child(icon("chevron-down", 12.)),
@@ -5004,6 +4990,45 @@ mod menu_tests {
             let next = cx.new(|cx| Conversation::new(second, store, cx));
             assert_eq!(next.read(cx).settings.access, AccessMode::AutoAcceptEdits);
         });
+    }
+
+    #[gpui::test]
+    fn the_access_menu_offers_the_agents_own_settings_with_the_shared_icons(
+        cx: &mut TestAppContext,
+    ) {
+        use monocode_core::agent::Permission;
+        let window = conversation(cx);
+        window
+            .update(cx, |c, _, cx| {
+                let items = c.mono_access_options();
+                let action = |id: &str| {
+                    items
+                        .iter()
+                        .find_map(|item| match item {
+                            MenuItem::Action(action) if action.id.as_ref() == id => {
+                                Some(action.clone())
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| panic!("{id} is not offered"))
+                };
+                assert_eq!(action("access:own").label.as_ref(), "Agent's own settings");
+                // Each level looks as it does in Settings → Agents.
+                for (id, level) in [
+                    ("access:own", Permission::Own),
+                    ("access:supervised", Permission::Ask),
+                    ("access:auto-accept-edits", Permission::AcceptEdits),
+                    ("access:auto", Permission::Auto),
+                    ("access:full-access", Permission::Full),
+                ] {
+                    let action = action(id);
+                    assert_eq!(action.icon, Some(permission_icon(level)), "{id}");
+                    assert_eq!(action.icon_color, Some(permission_color(level)), "{id}");
+                }
+                c.menu_choice("access:own", cx);
+                assert_eq!(c.settings.access, AccessMode::AgentDefault);
+            })
+            .unwrap();
     }
 
     #[gpui::test]

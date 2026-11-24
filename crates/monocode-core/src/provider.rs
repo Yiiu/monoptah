@@ -1548,6 +1548,67 @@ fn run_process(
     run_operation(request, cancel, controls, probe, false, false, emit)
 }
 
+/// The arguments a new chat session of `kind` starts its CLI with, for the launch preview
+/// in Settings → Agents. Pi, Omp and the ACP agents run the launch's own `configure`, so the
+/// preview cannot drift from it; Claude lists the flags `run_operation` passes for these
+/// settings (its other flags depend on the session), and Codex and OpenCode start a
+/// transport that takes model, effort and permission over its protocol.
+pub fn chat_launch_args(
+    kind: Kind,
+    model: Option<&str>,
+    effort: Option<&str>,
+    access: AccessMode,
+    user_args: &[String],
+) -> Vec<String> {
+    let lead = crate::launch_args::args_lead(kind);
+    let mut args: Vec<String> = Vec::new();
+    if lead {
+        args.extend(user_args.iter().cloned());
+    }
+    match kind {
+        Kind::Claude => args.extend(crate::launch_args::structured_flags(
+            kind, false, model, effort, access,
+        )),
+        Kind::Codex => args.push("app-server".into()),
+        Kind::OpenCode => args.push("serve".into()),
+        _ => {
+            let request = Request {
+                kind,
+                binary: PathBuf::new(),
+                cwd: PathBuf::new(),
+                prompt: String::new(),
+                provider_id: None,
+                model: model.map(str::to_owned),
+                settings: Settings {
+                    access,
+                    effort: effort.map(str::to_owned),
+                    ..Settings::default()
+                },
+            };
+            let mut command = Command::new("");
+            if kind.is_pi() {
+                pi::configure(&mut command, &request, false);
+            } else if kind == Kind::Devin && access == AccessMode::Supervised {
+                // The real launch writes Devin's ask-before-edits config and passes its
+                // path; a preview must not write files.
+                command.args(["--config", "<ask-before-edits config>", "acp"]);
+            } else {
+                // Only Devin's supervised config can fail, handled above.
+                let _ = acp::configure(&mut command, &request);
+            }
+            args.extend(
+                command
+                    .get_args()
+                    .map(|arg| arg.to_string_lossy().into_owned()),
+            );
+        }
+    }
+    if !lead {
+        args.extend(user_args.iter().cloned());
+    }
+    args
+}
+
 /// The start of every chat launch of a local CLI. Env order, later wins: the GUI env, the
 /// app's session env, the user's Settings → Agents env, then the account, so the account
 /// wins a collision. The user's arguments go in front of a transport subcommand
@@ -2085,6 +2146,83 @@ mod tests {
             .find(|(name, _)| *name == std::ffi::OsStr::new(key))
             .map(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()))
     }
+    #[test]
+    fn the_chat_launch_preview_places_arguments_as_the_launch_does() {
+        let user = vec!["--verbose".to_string()];
+        let args =
+            |kind, model, effort, access| chat_launch_args(kind, model, effort, access, &user);
+        // Grok: the user's arguments lead the `agent … stdio` transport and its flags.
+        assert_eq!(
+            args(
+                Kind::Grok,
+                Some("grok-4"),
+                Some("high"),
+                AccessMode::FullAccess
+            ),
+            [
+                "--verbose",
+                "--no-auto-update",
+                "agent",
+                "--no-leader",
+                "--model",
+                "grok-4",
+                "--reasoning-effort",
+                "high",
+                "--always-approve",
+                "stdio"
+            ]
+        );
+        // Fx: before `acp`, with the model after it.
+        assert_eq!(
+            args(Kind::Fx, Some("fx-1"), None, AccessMode::AgentDefault),
+            ["--verbose", "acp", "--model", "fx-1"]
+        );
+        // Pi and Omp pass a `provider/id` model on the command line; arguments come last.
+        assert_eq!(
+            args(
+                Kind::Pi,
+                Some("openai/gpt-5"),
+                None,
+                AccessMode::AgentDefault
+            ),
+            ["--mode", "rpc", "--model", "openai/gpt-5", "--verbose"]
+        );
+        assert_eq!(
+            args(Kind::Omp, Some("plain"), None, AccessMode::AgentDefault),
+            ["--mode", "rpc", "--verbose"]
+        );
+        // Codex and OpenCode start a transport; their settings travel over it.
+        assert_eq!(
+            args(Kind::Codex, Some("gpt-5"), Some("high"), AccessMode::Auto),
+            ["--verbose", "app-server"]
+        );
+        assert_eq!(
+            args(Kind::OpenCode, None, None, AccessMode::AgentDefault),
+            ["--verbose", "serve"]
+        );
+        // Claude takes its flags, then the user's arguments.
+        assert_eq!(
+            args(
+                Kind::Claude,
+                Some("opus"),
+                None,
+                AccessMode::AutoAcceptEdits
+            ),
+            [
+                "--permission-mode",
+                "acceptEdits",
+                "--model",
+                "opus",
+                "--verbose"
+            ]
+        );
+        // Devin's supervised config is named, not written.
+        assert_eq!(
+            args(Kind::Devin, None, None, AccessMode::Supervised),
+            ["--verbose", "--config", "<ask-before-edits config>", "acp"]
+        );
+    }
+
     #[test]
     fn agent_env_sits_between_the_session_env_and_the_account() {
         let tmp = tempfile::tempdir().unwrap();

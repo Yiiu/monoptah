@@ -870,6 +870,8 @@ pub(crate) struct MenuAction {
     pub id: SharedString,
     pub label: SharedString,
     pub description: Option<SharedString>,
+    /// A monospace line under the description, such as the flag a permission level passes.
+    pub detail: Option<SharedString>,
     pub shortcut: Option<SharedString>,
     pub icon: Option<&'static str>,
     pub icon_artwork: Option<&'static str>,
@@ -899,6 +901,10 @@ impl MenuAction {
     }
     pub(crate) fn description(mut self, text: impl Into<SharedString>) -> Self {
         self.description = Some(text.into());
+        self
+    }
+    pub(crate) fn detail(mut self, text: impl Into<SharedString>) -> Self {
+        self.detail = Some(text.into());
         self
     }
     pub(crate) fn shortcut(mut self, text: impl Into<SharedString>) -> Self {
@@ -1649,6 +1655,15 @@ impl Menu {
                 )
                 .child(text)
         });
+        let detail = action.detail.clone().map(|text| {
+            div()
+                .mt(px(4.))
+                .font_family(crate::fonts::mono())
+                .text_size(px(11.))
+                .line_height(px(16.))
+                .text_color(content(0.6))
+                .child(text)
+        });
         div()
             .flex_1()
             .min_w_0()
@@ -1677,6 +1692,7 @@ impl Menu {
                 None => title.into_any(),
             })
             .children(hint)
+            .children(detail)
     }
 }
 impl Render for Menu {

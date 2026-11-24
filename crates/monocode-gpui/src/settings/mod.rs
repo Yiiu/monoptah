@@ -47,6 +47,24 @@ pub(crate) struct ArchivedSession {
     pub updated_at: u64,
 }
 
+/// Where an agent CLI's update stands, from the shell's update notice.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum AgentUpdateState {
+    Available,
+    Updating,
+    /// Updated to this version.
+    Updated(String),
+    Failed(String),
+}
+
+/// A newer release of an agent's CLI, shown as the Update button on its row.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AgentUpdate {
+    pub kind: monocode_core::provider::Kind,
+    pub latest: String,
+    pub state: AgentUpdateState,
+}
+
 /// What Settings shows about the workspace around it.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SettingsContext {
@@ -71,6 +89,8 @@ pub(crate) struct SettingsContext {
     pub sessions: Vec<(i64, String, bool)>,
     pub quick_error: Option<String>,
     pub catalogs: HashMap<String, Vec<(String, String)>>,
+    /// Agent CLIs with a newer release, and how far their update is.
+    pub agent_updates: Vec<AgentUpdate>,
     pub inbox_connections: HashMap<String, (bool, String)>,
     /// Mobile access, or `None` when this desktop cannot offer it.
     pub mobile: Option<monocode_core::mobile::Status>,
@@ -114,6 +134,7 @@ impl PartialEq for SettingsContext {
             && self.sessions == other.sessions
             && self.quick_error == other.quick_error
             && self.catalogs == other.catalogs
+            && self.agent_updates == other.agent_updates
             && self.inbox_connections == other.inbox_connections
             && self.mobile == other.mobile
             && self.mobile_invite == other.mobile_invite
@@ -142,6 +163,8 @@ pub(crate) enum SettingsEvent {
     WhatsNew,
     CheckAppUpdates,
     CheckHarnessUpdates,
+    /// Run the update the shell's notice found for this agent's CLI.
+    UpdateAgent(monocode_core::provider::Kind),
     ManageInboxProvider(String),
     /// General's Work day starts at, in minutes after midnight.
     TodayRollover(u32),
@@ -337,7 +360,8 @@ pub(crate) struct SettingsView {
     /// Worktree paths ticked for bulk delete on the Worktrees page.
     selected_trees: std::collections::HashSet<String>,
     management_generation: u64,
-    binary_anchors: RefCell<HashMap<monocode_core::provider::Kind, AnchorSlot>>,
+    /// The Agent CLIs groups of the Providers page.
+    agents: pages::AgentsState,
     mcp_show_all: bool,
     mcp_remove_scopes: HashMap<String, String>,
     mcp_busy: bool,
@@ -495,7 +519,7 @@ impl SettingsView {
             management: None,
             selected_trees: Default::default(),
             management_generation: 0,
-            binary_anchors: RefCell::default(),
+            agents: pages::AgentsState::default(),
             mcp_show_all: false,
             mcp_remove_scopes: HashMap::new(),
             mcp_busy: false,
@@ -559,6 +583,7 @@ impl SettingsView {
                 this.skill_documents.clear();
                 this.discovery = data;
                 this.discovery_loading = false;
+                this.agents_detected(cx);
                 this.prune_selected_trees();
                 if this.section == Section::Mcp {
                     this.refresh_mcp_health(cx);
@@ -588,6 +613,7 @@ impl SettingsView {
     pub(crate) fn set_preferences(&mut self, prefs: &Preferences, cx: &mut Context<Self>) {
         if &self.prefs != prefs {
             self.prefs = prefs.clone();
+            self.agent_undo_expired();
             self.notification_deadline(cx);
             cx.notify();
         }
@@ -609,11 +635,14 @@ impl SettingsView {
                 self.refocus = self.refocus || abandoned;
             }
             self.management = None;
+            // The Agent CLIs menus and open row belong to the Providers page.
+            self.set_expanded_agent(None, cx);
             self.selected_trees.clear();
             self.management_generation += 1;
             self.leave_mobile(cx);
             self.leave_connections(cx);
             self.section = section;
+            self.inspect_installed_agents(cx);
             self.watch_mobile(cx);
             self.watch_connections(cx);
             if section == Section::Mcp {
@@ -684,6 +713,7 @@ impl SettingsView {
     /// Change preferences and tell the shell to keep them.
     fn update(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut Preferences)) {
         change(&mut self.prefs);
+        self.agent_undo_expired();
         self.notification_deadline(cx);
         cx.emit(SettingsEvent::Changed(Box::new(self.prefs.clone())));
         cx.notify();
@@ -703,6 +733,10 @@ impl SettingsView {
         self.search_query.clear();
         self.search
             .update(cx, |input, cx| input.set_text(String::new(), cx));
+        // An agent's row opens when search lands on it.
+        if let Some(kind) = result.setting.and_then(pages::agent_for_setting) {
+            self.set_expanded_agent(Some(kind), cx);
+        }
         self.reveal_setting(result.setting.map(str::to_owned), cx);
     }
     /// Scroll to a row or group and flash it for 1.8s.
@@ -1274,6 +1308,7 @@ impl Render for SettingsView {
                 &self.focus
             })
             .key_context("SettingsView")
+            .relative()
             .size_full()
             .min_w_0()
             .min_h_0()
@@ -1324,6 +1359,8 @@ impl Render for SettingsView {
                         .into_any_element(),
                 ]
             })
+            .children(self.agent_menu_overlay(cx))
+            .children(self.agent_toast_overlay(cx))
             .children(self.management_overlay(window, cx))
             .children(self.notification_overlay(cx))
             .children(self.fix_overlay(window))
