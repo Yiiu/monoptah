@@ -382,3 +382,42 @@ fn a_forwarded_link_never_goes_to_the_active_cloud_session(cx: &mut TestAppConte
         })
         .unwrap();
 }
+
+// Monoptah: a click opens a file in the editor; with no session to open it beside, a file the
+// preview can show is previewed instead of refused.
+#[gpui::test]
+fn open_path_with_no_session_to_attach_to_previews_the_document(cx: &mut TestAppContext) {
+    let dir = Scratch::new("no-session");
+    let doc = dir.file("notes.md", b"# Notes");
+    let source = dir.file("main.rs", SOURCE.as_bytes());
+    let (window, mut visual) = start(cx);
+    window
+        .update(&mut visual, |shell, w, cx| {
+            shell.workspace.active = None;
+            shell.workspace.tabs.clear();
+            w.dispatch_action(Box::new(crate::file_editor::OpenPath(text(&doc))), cx);
+        })
+        .unwrap();
+    visual.run_until_parked();
+    window
+        .update(&mut visual, |shell, w, cx| {
+            assert_eq!(
+                shell.document_preview_path(cx).as_deref(),
+                Some(doc.as_path())
+            );
+            assert!(shell.error.is_none(), "{:?}", shell.error);
+            // Source has no preview: it still needs a chat to open beside.
+            w.dispatch_action(Box::new(crate::file_editor::OpenPath(text(&source))), cx);
+        })
+        .unwrap();
+    visual.run_until_parked();
+    window
+        .update(&mut visual, |shell, _, _| {
+            let error = shell.error.clone().unwrap_or_default();
+            assert!(
+                error.starts_with("Open a chat in this project first"),
+                "{error}"
+            );
+        })
+        .unwrap();
+}
