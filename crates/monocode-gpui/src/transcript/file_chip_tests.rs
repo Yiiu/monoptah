@@ -1,7 +1,7 @@
-//! A file chip in a chat is a button: a left click previews the file, a right click keeps the
-//! link menu.
+//! A file chip in a chat is a button: a left click opens the file in the editor (Monoptah; the
+//! in-app preview is the link menu's "Preview"), a right click keeps the link menu.
 use super::*;
-use crate::file_preview::PreviewPath;
+use crate::file_editor::OpenPath;
 use gpui::{Modifiers, MouseButton, TestAppContext, VisualTestContext, WindowHandle, point};
 use std::{cell::RefCell, rc::Rc};
 
@@ -30,11 +30,11 @@ fn document(cx: &mut TestAppContext) -> WindowHandle<TranscriptView> {
 }
 
 #[gpui::test]
-fn a_left_click_on_a_file_chip_previews_the_file(cx: &mut TestAppContext) {
+fn a_left_click_on_a_file_chip_opens_the_file_in_the_editor(cx: &mut TestAppContext) {
     let seen = Rc::new(RefCell::new(Vec::<String>::new()));
     let log = seen.clone();
     cx.update(|cx| {
-        cx.on_action(move |preview: &PreviewPath, _| log.borrow_mut().push(preview.0.clone()));
+        cx.on_action(move |open: &OpenPath, _| log.borrow_mut().push(open.0.clone()));
     });
     let window = document(cx);
     let visual = &mut VisualTestContext::from_window(window.into(), cx);
@@ -66,11 +66,11 @@ fn a_word_in_code_is_not_a_file_chip(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn a_right_click_on_a_file_chip_does_not_preview_it(cx: &mut TestAppContext) {
+fn a_right_click_on_a_file_chip_does_not_open_it(cx: &mut TestAppContext) {
     let seen = Rc::new(RefCell::new(Vec::<String>::new()));
     let log = seen.clone();
     cx.update(|cx| {
-        cx.on_action(move |preview: &PreviewPath, _| log.borrow_mut().push(preview.0.clone()));
+        cx.on_action(move |open: &OpenPath, _| log.borrow_mut().push(open.0.clone()));
     });
     let window = document(cx);
     let visual = &mut VisualTestContext::from_window(window.into(), cx);
