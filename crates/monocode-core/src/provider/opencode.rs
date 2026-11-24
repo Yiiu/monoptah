@@ -627,7 +627,9 @@ fn catalog(request: &Request, cancel: &AtomicBool, v2: bool) -> Result<Value, St
     let mut models = Vec::new();
     let mut agents = Vec::new();
     if v2 {
-        let (mut client, _) = connect(request, cancel, true)?;
+        // A server of its own (app access, or a Settings → Agents launch) stops when
+        // dropped, so it is kept until every catalog request has returned.
+        let (mut client, _server) = connect(request, cancel, true)?;
         client.directory.clear();
         let raw = client.request("GET", &client.path("/model"), None)?;
         let providers = client.request("GET", &client.path("/provider"), None)?;
