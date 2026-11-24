@@ -62,7 +62,17 @@ fill (`modal::surface`). Do not hand-roll a card.
   `choices.close(window, cx)` (dropping alone leaves focus on the closed list). Used by
   `cloud_settings/mod.rs`, `emoji_library/view.rs`, `monos/emoji_ui.rs`.
 - Settings pages use their own `select`/`segmented`/`toggle`/`slider` helpers in
-  `settings/widgets.rs`; use those inside Settings.
+  `settings/widgets.rs`; use those inside Settings. The same file also has `segmented_icons`,
+  `radio_cards`, `level_picker`, `badge`, `chip`, `field`, `help`, `field_error`,
+  `saved_flash`, `status_line`, `text_box`/`text_area`, `inline_banner`, `skeleton_row`,
+  `code_block`, `env_table` and `settings_toast` (added with the Agent CLIs page); reuse them
+  before building another.
+- `MenuAction::detail(text)` adds a monospace second line under an option's description.
+- Expand/collapse: `src/disclosure.rs` (`Disclosure`) animates a measured height open and
+  closed (same curve as the chevron), keeps content mounted until it has shut, and honours
+  reduce-motion. Use it for any accordion instead of fading content in.
+- Hover needs an element id: GPUI keeps hover state per id, so a `.hover(..)` on a div without
+  `.id(..)` only repaints when something else redraws the view (hover appears "sometimes").
 
 ### Theme and colors — `src/theme.rs`
 
@@ -70,7 +80,9 @@ fill (`modal::surface`). Do not hand-roll a card.
   (`configure_project`, with a 360 ms tween between projects). Read them through functions,
   never hardcode hex in views: `content(alpha)` for ink at an opacity, `accent_color()`,
   `pane_fill()`, `shell_fill()`, `floating_fill()`, `danger_color()`, `warning_color()`,
-  `success_color()`, `is_light()`.
+  `success_color()`, `is_light()`. Permission levels: `permission_color(level)` and
+  `permission_icon(level)` (`access_color`/`access_icon` for `AccessMode`), shared by the
+  composer access menu and the Agent CLIs settings page.
 - Interaction fills are translucent ink (`content(0.07)` on hover), not opaque greys (comment
   at the top of `theme.rs`).
 - Shared metrics are constants: `TITLE_BAR_HEIGHT`, `PANE_HEADER_HEIGHT`, `TAB_PLATE_HEIGHT`,

@@ -293,7 +293,14 @@ pub(super) fn enforce_idle_limit() {
     drop(retired);
     opencode::retire_idle(&retire);
 }
+/// The key under the Settings → Agents launch as saved now. Live paths key a process by
+/// the launch it was started with (`key_for`).
+#[cfg(all(test, unix))]
 pub(super) fn key(request: &Request) -> String {
+    key_for(request, &crate::cli::launch(request.kind))
+}
+/// The key of a process started with `launch` (Settings → Agents arguments and environment).
+pub(super) fn key_for(request: &Request, launch: &crate::launch_args::Launch) -> String {
     let mut settings = request.settings.clone();
     settings.turns.clear();
     settings.attachments.clear();
@@ -315,7 +322,9 @@ pub(super) fn key(request: &Request) -> String {
             .as_ref()
             .map(|mono| (&mono.root, &mono.mono.id)),
         request.settings.disable_claude_hooks,
-        crate::accounts::claude_entrypoint()
+        crate::accounts::claude_entrypoint(),
+        // Settings → Agents arguments and environment: an edit starts a fresh process.
+        launch
     ])
     .to_string()
 }
@@ -352,7 +361,7 @@ pub(super) fn put(wire: Wire, mut protocol: Protocol) {
     if !process::may_park(wire.epoch) {
         return;
     }
-    let key = key(&protocol.request);
+    let key = key_for(&protocol.request, &protocol.launch);
     protocol.emitted.clear();
     protocol.tools.clear();
     protocol.active_compaction = None;

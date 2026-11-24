@@ -43,6 +43,9 @@ struct Fx {
     /// The codespace session and a local one, both in the project.
     cs: i64,
     local: i64,
+    /// A send submits a turn: no test here may start a real installed CLI, which would
+    /// wait for it forever on a machine that has one.
+    _clis: crate::shell::surface_tests::NoClis,
 }
 
 impl Fx {
@@ -64,6 +67,7 @@ impl Fx {
 /// fake codespace `octo-run` (cached state `cache`; `gh codespace view` says
 /// `view`) and one local session.
 fn fixture(cx: &mut TestAppContext, view: &'static str, cache: CloudState) -> Fx {
+    let clis = crate::shell::surface_tests::NoClis::new();
     crate::conversation::Conversation::reset_wake_sends();
     let (window, _, _) = crate::shell::tests::window(cx);
     let repo = github_project();
@@ -114,6 +118,7 @@ fn fixture(cx: &mut TestAppContext, view: &'static str, cache: CloudState) -> Fx
         host,
         cs,
         local,
+        _clis: clis,
     }
 }
 

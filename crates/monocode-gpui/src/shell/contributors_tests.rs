@@ -914,7 +914,7 @@ mod ask {
     }
 
     #[gpui::test]
-    fn without_a_chosen_provider_the_project_default_is_used(cx: &mut TestAppContext) {
+    fn without_a_chosen_provider_the_settings_default_is_used(cx: &mut TestAppContext) {
         let _clis = NoClis::new();
         let project = project();
         let (window, before, _) = start(
@@ -922,14 +922,15 @@ mod ask {
             &project,
             request(None, "contributors-2026-10.json"),
             |shell| {
-                shell.workspace.preferences.default_provider = Some("codex".into());
+                shell.workspace.preferences.default_provider = Some("claude".into());
+                // Retired per-project defaults no longer apply.
                 shell
                     .workspace
                     .preferences
                     .project_providers
                     .entry(project.clone())
                     .or_default()
-                    .provider = Some("claude".into());
+                    .provider = Some("codex".into());
             },
         );
         window
@@ -1033,7 +1034,7 @@ mod ask {
     }
 
     #[gpui::test]
-    fn the_dialog_offers_the_providers_the_picker_shows_with_the_project_default(
+    fn the_dialog_offers_the_providers_the_picker_shows_with_the_settings_default(
         cx: &mut TestAppContext,
     ) {
         let (window, _, _) = super::super::tests::window(cx);
@@ -1054,14 +1055,17 @@ mod ask {
                 assert!(all.providers.contains(&Kind::Claude));
                 assert!(all.providers.contains(&Kind::Codex));
                 assert!(
-                    !all.providers.contains(&Kind::Cursor),
-                    "hidden for the project"
+                    all.providers.contains(&Kind::Cursor),
+                    "retired project hidden lists no longer apply"
                 );
-                assert!(!all.providers.contains(&Kind::Grok), "hidden everywhere");
-                assert_eq!(all.default, Some(Kind::Claude), "the project's own default");
+                assert!(!all.providers.contains(&Kind::Grok), "disabled everywhere");
+                assert_eq!(all.default, Some(Kind::Codex), "the Settings default");
                 // Once probed, only the installed CLIs are offered.
                 shell.installed_providers = Some(vec![Kind::Codex, Kind::Cursor]);
-                assert_eq!(shell.ask_choices("/work/alpha").providers, [Kind::Codex]);
+                assert_eq!(
+                    shell.ask_choices("/work/alpha").providers,
+                    [Kind::Codex, Kind::Cursor]
+                );
                 let elsewhere = shell.ask_choices("/work/beta");
                 assert_eq!(elsewhere.providers, [Kind::Codex, Kind::Cursor]);
                 assert_eq!(elsewhere.default, Some(Kind::Codex));

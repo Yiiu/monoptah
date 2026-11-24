@@ -1,11 +1,9 @@
 //! React Settings forms and their asynchronous actions.
 use super::widgets::{note, secondary_button};
 use super::*;
-use monocode_core::provider::Kind;
 
 #[derive(Clone)]
 pub(super) enum Target {
-    Cli(Kind),
     Mcp,
     Skill,
     Worktree,
@@ -25,8 +23,6 @@ pub(super) struct Editor {
     pub bulk: Option<bulk_delete::BulkDelete>,
     pub busy: bool,
     pub error: Option<String>,
-    pub editing: bool,
-    pub inspection: Option<monocode_core::cli::Inspection>,
     previous: Option<FocusHandle>,
     _subscriptions: Vec<Subscription>,
 }
@@ -42,7 +38,6 @@ impl SettingsView {
         }
         self.management_generation += 1;
         let (label, placeholder) = match target {
-            Target::Cli(_) => ("CLI path", "Auto-detected path"),
             Target::Mcp => ("Name (optional with mcpServers)", "my-server"),
             Target::Skill => ("Skill name", "skill-name"),
             _ => ("New branch name", "feature/my-task"),
@@ -52,18 +47,6 @@ impl SettingsView {
             input.set_font_size(12.);
             input
         });
-        if let Target::Cli(kind) = target {
-            name.update(cx, |input, cx| {
-                input.set_text(
-                    self.prefs
-                        .binary_paths
-                        .get(kind.id())
-                        .cloned()
-                        .unwrap_or_default(),
-                    cx,
-                )
-            });
-        }
         if matches!(target, Target::Skill) {
             name.update(cx, |input, cx| {
                 input.set_font_size(13.);
@@ -81,7 +64,7 @@ impl SettingsView {
         let previous = window.focused(cx);
         if matches!(
             target,
-            Target::Cli(_) | Target::DeleteTree(_) | Target::DeleteTrees(_) | Target::ResetMono(_)
+            Target::DeleteTree(_) | Target::DeleteTrees(_) | Target::ResetMono(_)
         ) {
             window.focus(&self.focus, cx);
         } else {
@@ -118,14 +101,9 @@ impl SettingsView {
             bulk: None,
             busy: false,
             error: None,
-            editing: false,
-            inspection: None,
             previous,
             _subscriptions: subscriptions,
         });
-        if let Target::Cli(kind) = target {
-            self.inspect_cli(kind, false, cx);
-        }
         cx.notify();
     }
     pub(super) fn close_management(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -137,49 +115,6 @@ impl SettingsView {
             window.focus(&focus, cx);
         }
         self.select_open = None;
-        cx.notify();
-    }
-    fn inspect_cli(&mut self, kind: Kind, save: bool, cx: &mut Context<Self>) {
-        let Some(editor) = &mut self.management else {
-            return;
-        };
-        let draft = editor.name.read(cx).content.trim().to_owned();
-        editor.busy = true;
-        editor.error = None;
-        let generation = self.management_generation;
-        let work = cx
-            .background_executor()
-            .spawn(async move { monocode_core::cli::inspect(kind, Some(&draft)) });
-        cx.spawn(async move |this, cx| {
-            let result = work.await;
-            let _ = this.update(cx, |this, cx| {
-                if this.management_generation != generation {
-                    return;
-                }
-                if let Some(editor) = &mut this.management {
-                    editor.busy = false;
-                    match result {
-                        Ok(inspection) => {
-                            editor.inspection = Some(inspection);
-                            if save {
-                                let value = editor.name.read(cx).content.trim().to_owned();
-                                this.update(cx, |p| {
-                                    if value.is_empty() {
-                                        p.binary_paths.remove(kind.id());
-                                    } else {
-                                        p.binary_paths.insert(kind.id().into(), value);
-                                    }
-                                });
-                                this.management = None;
-                            }
-                        }
-                        Err(e) => editor.error = Some(e),
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
         cx.notify();
     }
     /// True while a worktree delete is running, so Settings must stay open to
@@ -232,7 +167,6 @@ impl SettingsView {
             return String::new();
         };
         match &editor.target {
-            Target::Cli(kind) => format!("{} CLI details", kind.label()),
             Target::Mcp => "Add MCP server".into(),
             Target::Worktree => "Create worktree".into(),
             Target::DeleteTree(_) => "Delete worktree?".into(),
@@ -342,10 +276,6 @@ impl SettingsView {
         if editor.busy {
             return;
         }
-        if let Target::Cli(kind) = editor.target {
-            self.inspect_cli(kind, true, cx);
-            return;
-        }
         let name = editor.name.read(cx).content.trim().to_owned();
         let body = editor.body.read(cx).content.to_string();
         let cwd = self.selected_project.clone();
@@ -443,8 +373,6 @@ impl SettingsView {
                 b.failures().to_vec(),
             )
         });
-        let editing = e.editing;
-        let inspection = e.inspection.clone();
         let mut rows = Vec::new();
         match &target {
             Target::ResetMono(mono) => {
@@ -462,78 +390,6 @@ impl SettingsView {
                         .child("Its conversation, projects, memory and habits will be kept.")
                         .into_any_element(),
                 );
-            }
-            Target::Cli(kind) => {
-                let overridden = self.prefs.binary_paths.contains_key(kind.id());
-                let pending = monocode_core::cli::configured(*kind)
-                    .as_ref()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    != self.prefs.binary_paths.get(kind.id()).cloned();
-                rows.push(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap_3()
-                        .text_size(px(12.))
-                        .child(format!("{} CLI", kind.label()))
-                        .child(
-                            div()
-                                .text_size(px(10.))
-                                .text_color(content(0.5))
-                                .child(format!(
-                                    "Global path · {}",
-                                    if error.is_some() {
-                                        "Needs attention"
-                                    } else if pending {
-                                        "Restart required"
-                                    } else if overridden {
-                                        "Configured"
-                                    } else {
-                                        "Auto-detected"
-                                    }
-                                )),
-                        )
-                        .into_any_element(),
-                );
-                if editing {
-                    rows.push(form_field("CLI path", name, 32.));
-                    rows.push(note("Enter the absolute path to the CLI executable. Changes apply after restarting Monoptah."));
-                } else {
-                    rows.push(
-                        div()
-                            .p_2()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(content(0.1))
-                            .bg(content(0.03))
-                            .text_size(px(10.))
-                            .child(
-                                div().font_family(crate::fonts::mono()).child(
-                                    inspection
-                                        .as_ref()
-                                        .map(|i| i.path.display().to_string())
-                                        .unwrap_or_else(|| {
-                                            if busy {
-                                                "Checking the selected CLI…".into()
-                                            } else {
-                                                "CLI could not be resolved".into()
-                                            }
-                                        }),
-                                ),
-                            )
-                            .child(div().mt_1().text_color(content(0.4)).child(
-                                inspection.map(|i| i.version).unwrap_or_else(|| {
-                                    if busy {
-                                        "Checking version…".into()
-                                    } else {
-                                        "Retry to check this CLI".into()
-                                    }
-                                }),
-                            ))
-                            .into_any_element(),
-                    );
-                }
             }
             Target::Mcp => {
                 let available = self.scroll.bounds().size.width.as_f32();
@@ -935,66 +791,7 @@ impl SettingsView {
             );
         }
         let mut actions = div().flex().items_center().justify_end().gap_2();
-        if let Target::Cli(kind) = target {
-            if !editing {
-                if self.management.as_ref().is_some_and(|e| e.error.is_some()) {
-                    actions =
-                        actions.child(
-                            secondary_button("retry-cli", "Retry CLI inspection", false, busy)
-                                .child("Retry")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.inspect_cli(kind, false, cx)
-                                })),
-                        );
-                }
-                let path = self
-                    .management
-                    .as_ref()
-                    .and_then(|e| e.inspection.as_ref())
-                    .map(|i| i.path.clone());
-                actions = actions
-                    .child(
-                        secondary_button("reveal-cli", "Open CLI location", false, path.is_none())
-                            .child("Open location")
-                            .on_click(move |_, _, cx| {
-                                if let Some(path) = &path {
-                                    cx.reveal_path(path);
-                                }
-                            }),
-                    )
-                    .child(
-                        secondary_button("edit-cli", "Edit CLI path", false, busy)
-                            .child("Edit path")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                if let Some(e) = &mut this.management {
-                                    e.editing = true;
-                                    window.focus(&e.name.read(cx).focus_handle(cx), cx);
-                                }
-                                cx.notify();
-                            })),
-                    );
-                rows.push(actions.into_any_element());
-                return div()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .children(rows)
-                    .into_any_element();
-            } else if self.prefs.binary_paths.contains_key(kind.id()) {
-                actions = actions.child(
-                    secondary_button("auto-cli", "Use auto-detected path", false, busy)
-                        .child("Use auto-detected path")
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if let Some(e) = &mut this.management {
-                                e.name.update(cx, |i, cx| i.set_text(String::new(), cx));
-                            }
-                            this.inspect_cli(kind, true, cx);
-                        })),
-                );
-            }
-        }
         let label = match target {
-            Target::Cli(_) => "Save path",
             Target::Mcp => {
                 if busy {
                     "Adding…"
@@ -1081,28 +878,6 @@ impl SettingsView {
         }
         let title = self.management_title();
         let form = self.management_form(cx);
-        if let Target::Cli(kind) = target {
-            let slot = self
-                .binary_anchors
-                .borrow()
-                .get(&kind)
-                .cloned()
-                .unwrap_or_default();
-            return Some(
-                popover("cli-details", Anchor::Slot(slot))
-                    .side(Side::Bottom)
-                    .align(Align::Start)
-                    .width(440.)
-                    .on_dismiss({
-                        let weak = cx.weak_entity();
-                        move |window, cx| {
-                            let _ = weak.update(cx, |this, cx| this.close_management(window, cx));
-                        }
-                    })
-                    .child(div().p_3().child(form))
-                    .into_any_element(),
-            );
-        }
         let overlay = div()
             .absolute()
             .inset_0()

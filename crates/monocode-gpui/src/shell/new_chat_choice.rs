@@ -1,10 +1,11 @@
 //! The provider and model a new conversation starts with. One resolver, so
 //! every way of starting a chat agrees.
 //!
-//! Order: project default, Settings default, last choice (`recent_models[0]`),
-//! then Codex (or the first allowed provider). A step is skipped when its
-//! provider is hidden. Hidden providers are ignored for remote projects, as
-//! the model picker ignores them there.
+//! Order: Settings default, last choice's provider (`recent_models[0]`), then Codex (or
+//! the first allowed provider). The model is always the agent's Settings model. A step is
+//! skipped when its provider is disabled. Per-project provider defaults are retired and no
+//! longer apply. Hidden providers are ignored for remote projects, as the model picker
+//! ignores them there.
 use super::*;
 use crate::settings::Preferences;
 
@@ -15,23 +16,18 @@ pub(crate) struct NewChatChoice {
 }
 
 impl NewChatChoice {
-    /// A provider picked by the caller: the model follows project then Settings.
-    pub(crate) fn explicit(prefs: &Preferences, cwd: &str, kind: Kind) -> Self {
-        Self::of(kind, default_model(prefs, cwd, kind))
+    /// A provider picked by the caller: the model follows Settings.
+    pub(crate) fn explicit(prefs: &Preferences, _cwd: &str, kind: Kind) -> Self {
+        Self::of(kind, default_model(prefs, kind))
     }
     fn of(kind: Kind, model: Option<String>) -> Self {
         Self { kind, model }
     }
 }
 
-/// The project's model for the provider, else the Settings default.
-fn default_model(prefs: &Preferences, cwd: &str, kind: Kind) -> Option<String> {
-    prefs
-        .project_providers
-        .get(cwd)
-        .and_then(|p| p.models.get(kind.id()))
-        .or(prefs.default_models.get(kind.id()))
-        .cloned()
+/// The agent's model from Settings → Agents; `None` is the agent's default.
+fn default_model(prefs: &Preferences, kind: Kind) -> Option<String> {
+    prefs.agent(kind).model
 }
 
 fn allowed(prefs: &Preferences, cwd: &str, kind: Kind) -> bool {
@@ -40,35 +36,29 @@ fn allowed(prefs: &Preferences, cwd: &str, kind: Kind) -> bool {
 }
 
 pub(crate) fn resolve(prefs: &Preferences, cwd: &str) -> NewChatChoice {
-    // 1. The project's provider.
-    // 2. The Settings provider.
-    for id in [
-        prefs
-            .project_providers
-            .get(cwd)
-            .and_then(|p| p.provider.as_deref()),
-        prefs.default_provider.as_deref(),
-    ] {
-        if let Some(kind) = id.and_then(Kind::parse).filter(|k| allowed(prefs, cwd, *k)) {
-            return NewChatChoice::of(kind, default_model(prefs, cwd, kind));
-        }
+    // 1. The Settings provider.
+    if let Some(kind) = prefs
+        .default_provider
+        .as_deref()
+        .and_then(Kind::parse)
+        .filter(|k| allowed(prefs, cwd, *k))
+    {
+        return NewChatChoice::of(kind, default_model(prefs, kind));
     }
-    // 3. The last model picked anywhere.
+    // 2. The last model picked anywhere.
     if let Some(recent) = prefs.recent_models.first()
         && let Some(kind) = Kind::parse(&recent.provider).filter(|k| allowed(prefs, cwd, *k))
     {
-        return NewChatChoice::of(
-            kind,
-            default_model(prefs, cwd, kind).or_else(|| recent.model.clone()),
-        );
+        // Only the provider: its model stays in that session (`None` is the agent's default).
+        return NewChatChoice::of(kind, default_model(prefs, kind));
     }
-    // 4. Codex, or the first provider left.
+    // 3. Codex, or the first provider left.
     let kind = [Kind::Codex]
         .into_iter()
         .chain(Kind::ALL)
         .find(|k| allowed(prefs, cwd, *k))
         .unwrap_or(Kind::Codex);
-    NewChatChoice::of(kind, default_model(prefs, cwd, kind))
+    NewChatChoice::of(kind, default_model(prefs, kind))
 }
 
 impl Shell {

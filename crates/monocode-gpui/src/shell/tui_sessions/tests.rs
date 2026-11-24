@@ -398,8 +398,7 @@ fn a_clean_exit_never_replaces_the_last_tab_with_another_terminal(cx: &mut TestA
             shell
                 .workspace
                 .preferences
-                .provider_surfaces
-                .insert("claude".into(), Surface::Tui);
+                .set_agent_surface(Kind::Claude, Surface::Tui);
             shell.workspace.preferences.default_provider = Some("claude".into());
             assert_eq!(shell.provider_surface(Kind::Claude), Surface::Tui);
         })

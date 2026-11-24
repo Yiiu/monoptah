@@ -46,8 +46,7 @@ pub(crate) fn all_terminal(shell: &mut Shell) {
         shell
             .workspace
             .preferences
-            .provider_surfaces
-            .insert(kind.id().into(), Surface::Tui);
+            .set_agent_surface(kind, Surface::Tui);
     }
     assert_eq!(shell.provider_surface(Kind::Claude), Surface::Tui);
     assert_eq!(shell.provider_surface(Kind::Codex), Surface::Tui);
@@ -105,8 +104,7 @@ fn a_new_session_opens_as_its_providers_preferred_surface(cx: &mut TestAppContex
             shell
                 .workspace
                 .preferences
-                .provider_surfaces
-                .insert("claude".into(), Surface::Tui);
+                .set_agent_surface(Kind::Claude, Surface::Tui);
             shell.create(Kind::Claude, cx);
             before
         })
@@ -156,8 +154,7 @@ fn a_new_session_in_a_folder_follows_the_default_providers_surface(cx: &mut Test
             shell
                 .workspace
                 .preferences
-                .provider_surfaces
-                .insert("claude".into(), Surface::Tui);
+                .set_agent_surface(Kind::Claude, Surface::Tui);
             shell
                 .groups
                 .entry(PROJECT.into())
@@ -194,8 +191,7 @@ fn a_split_follows_the_preference_of_the_focused_sessions_provider(cx: &mut Test
             shell
                 .workspace
                 .preferences
-                .provider_surfaces
-                .insert("claude".into(), Surface::Tui);
+                .set_agent_surface(Kind::Claude, Surface::Tui);
             let before = known(shell);
             shell.split_session(SplitDir::Right, cx);
             before
@@ -230,8 +226,7 @@ fn the_new_session_command_skips_the_prompt_when_one_provider_is_installed(
             shell
                 .workspace
                 .preferences
-                .provider_surfaces
-                .insert("claude".into(), Surface::Tui);
+                .set_agent_surface(Kind::Claude, Surface::Tui);
             shell.installed_providers = Some(vec![Kind::Claude]);
             let before = known(shell);
             shell.request_new_session(window, cx);
@@ -258,8 +253,7 @@ fn a_database_that_cannot_store_terminals_opens_chats_and_never_asks(cx: &mut Te
             shell
                 .workspace
                 .preferences
-                .provider_surfaces
-                .insert("claude".into(), Surface::Tui);
+                .set_agent_surface(Kind::Claude, Surface::Tui);
             shell.installed_providers = Some(Kind::ALL.to_vec());
             assert!(shell.should_prompt_for_provider());
             assert!(!shell.settings_context(cx).no_terminal_sessions);

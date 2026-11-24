@@ -778,6 +778,35 @@ impl Store {
             true,
         ))
     }
+    /// The access of a shared session. `sessions.runtime_mode` is shared with the desktop
+    /// app, which does not know `AgentDefault` ("own"), so native writes the peer id there
+    /// and keeps "own" in its `agent:{id}` sidecar blob. "own" applies only while the shared
+    /// column still holds the peer id written with it. Otherwise the desktop changed the
+    /// mode since and its value wins; the stale "own" is then dropped from the blob so a
+    /// later return to the peer id cannot revive it. (A desktop edit that sets exactly the
+    /// peer id again cannot be told apart and keeps "own".)
+    fn shared_read_access(
+        &self,
+        id: i64,
+        saved: Option<&str>,
+        native: crate::agent::AccessMode,
+        shared: &str,
+    ) -> crate::agent::AccessMode {
+        use crate::agent::AccessMode;
+        let desktop = AccessMode::from_id(shared);
+        if native != AccessMode::AgentDefault {
+            return desktop;
+        }
+        if shared == AccessMode::AgentDefault.peer_id() {
+            return AccessMode::AgentDefault;
+        }
+        if let Some(mut blob) = saved.and_then(|raw| serde_json::from_str::<Value>(raw).ok()) {
+            blob["access"] = json!(desktop.id());
+            // Best effort: a read-only store keeps the blob, and the next read decides again.
+            let _ = self.shared_save_setting(&format!("agent:{id}"), &blob.to_string());
+        }
+        desktop
+    }
     pub(super) fn shared_agent(&self, id: i64) -> Result<Option<Settings>, String> {
         let fields = ["harness", "model", "model_settings", "runtime_mode"]
             .into_iter()
@@ -834,11 +863,9 @@ impl Store {
             return Ok(None);
         };
         let mut controls: HashMap<String, String> = parse(&controls)?;
-        let mut settings: Settings = self
-            .shared_setting(&format!("agent:{id}"))?
-            .map(|raw| parse(&raw))
-            .transpose()?
-            .unwrap_or_default();
+        let saved = self.shared_setting(&format!("agent:{id}"))?;
+        let mut settings: Settings = saved.as_deref().map(parse).transpose()?.unwrap_or_default();
+        let native_access = settings.access;
         settings.model = super::monocode_import::native_model(&model, &provider);
         // A prior native launch may have created an untouched default blank.
         // Seed only that blank, never a saved or resumed conversation's model.
@@ -859,7 +886,7 @@ impl Store {
                 controls = defaults.model_settings;
             }
         }
-        settings.access = crate::agent::AccessMode::from_id(&access);
+        settings.access = self.shared_read_access(id, saved.as_deref(), native_access, &access);
         settings.effort = [
             "effort",
             "reasoning",
@@ -959,7 +986,9 @@ impl Store {
         }
         let mut fields = vec![
             ("model_settings", json!(encode(&controls)?)),
-            ("runtime_mode", json!(settings.access.id())),
+            // The desktop app shares this column and only knows its own modes: "own" is
+            // stored as the peer id here, and kept in the native `agent:{id}` blob.
+            ("runtime_mode", json!(settings.access.peer_id())),
             ("worktree_cwd", json!(settings.worktree_cwd)),
             ("worktree_removed", json!(settings.worktree_removed)),
             ("provider_account_id", json!(settings.account.id)),
@@ -2586,6 +2615,7 @@ impl Store {
             .conn
             .execute("DELETE FROM sessions WHERE id=?1", [original]))?;
         self.shared_delete_setting(&format!("context:{id}"))?;
+        self.shared_delete_setting(&format!("agent:{id}"))?;
         sql(tx.commit())?;
         self.shared
             .as_ref()

@@ -673,7 +673,8 @@ pub(crate) fn mobile_access_modes()
 -> impl Iterator<Item = (&'static str, &'static str, &'static str)> {
     ACCESS_MODES
         .iter()
-        .map(|(id, label, hint, _)| (*id, *label, *hint))
+        .filter(|(id, ..)| *id != AccessMode::AgentDefault.id())
+        .map(|(id, label, hint)| (*id, *label, *hint))
 }
 
 /// Saved and live watches use the same desktop-owned state and reset wording.

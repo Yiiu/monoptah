@@ -36,7 +36,7 @@ impl Shell {
             cwd.clone(),
             new.kind,
             new.model,
-            crate::conversation::default_access(cx),
+            crate::conversation::default_access(new.kind.id(), cx),
         );
         let mut choice = self
             .quick
@@ -44,7 +44,10 @@ impl Shell {
             .clone()
             .filter(|v| self.workspace.projects.contains(&v.cwd))
             .unwrap_or(initial);
-        choice.access = crate::conversation::default_access(cx);
+        // Permission and effort follow Settings → Agents on every show; the composer
+        // applies the agent's effort when the choice carries none.
+        choice.access = crate::conversation::default_access(choice.kind.id(), cx);
+        choice.effort = None;
         choice
     }
     /// The menu bar's Quick Composer: brings the composer forward rather
@@ -135,7 +138,6 @@ impl Shell {
         let store = self.store.clone();
         let mut choice = launch.clone();
         let attachments = std::mem::take(&mut choice.attachments);
-        crate::conversation::remember_access(choice.access, cx);
         crate::pickers::remember_model(choice.kind, choice.model.clone(), cx);
         let account = crate::accounts::get(cx)
             .map(|a| a.read(cx).selected(launch.kind, &launch.cwd))
@@ -205,6 +207,7 @@ mod tests {
     use super::*;
     use crate::shell::surface_tests::{all_terminal, assert_chat, known, since};
     use gpui::TestAppContext;
+    use monocode_core::agent::AccessMode;
 
     #[gpui::test]
     fn a_quick_composer_launch_is_a_chat_whatever_the_preference(cx: &mut TestAppContext) {
@@ -237,6 +240,39 @@ mod tests {
                 assert_eq!(ids.len(), 1);
                 assert_chat(shell, ids[0]);
                 assert_eq!(shell.session_summaries[&ids[0]].provider, "claude");
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_fresh_show_keeps_the_last_model_but_takes_settings_effort_and_access(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, _, _) = crate::shell::tests::window(cx);
+        window
+            .update(cx, |shell, _, cx| {
+                cx.update_global::<crate::settings::Preferences, _>(|prefs, _| {
+                    prefs.agents.permission = Some("auto".into());
+                    prefs.agents.efforts = [("codex".to_owned(), "low".to_owned())].into();
+                });
+                let mut last = crate::quick_composer::Launch::choice(
+                    shell.workspace.project.clone(),
+                    Kind::Codex,
+                    Some("gpt-last".into()),
+                    AccessMode::FullAccess,
+                );
+                last.effort = Some("xhigh".into());
+                shell.quick.last = Some(last);
+                let choice = shell.quick_choice(cx);
+                assert_eq!(choice.kind, Kind::Codex);
+                assert_eq!(choice.model.as_deref(), Some("gpt-last"));
+                assert_eq!(choice.access, AccessMode::Auto);
+                // No retained effort: the composer applies the Settings effort.
+                assert_eq!(choice.effort, None);
+                assert_eq!(
+                    crate::conversation::preferred_effort(choice.kind.id(), cx).as_deref(),
+                    Some("low")
+                );
             })
             .unwrap();
     }

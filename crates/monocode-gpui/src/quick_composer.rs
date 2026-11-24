@@ -50,26 +50,28 @@ const COMMANDS: [(Command, &str); 4] = [
         "Save this message without starting the agent.",
     ),
 ];
-/// RUNTIME_MODES, with their icons and hints.
-const PERMISSIONS: [(AccessMode, &str, &str); 4] = [
+/// The agent's own settings, then RUNTIME_MODES, with their hints (as the composer's
+/// access menu). Icons and colours are `theme::access_icon` and
+/// `theme::access_color`, as in the composer and Settings → Agents.
+const PERMISSIONS: [(AccessMode, &str); 5] = [
+    (
+        AccessMode::AgentDefault,
+        "Pass no permission setting. The agent uses its own configuration.",
+    ),
     (
         AccessMode::Supervised,
-        "lock",
         "Ask before commands and file changes.",
     ),
     (
         AccessMode::AutoAcceptEdits,
-        "pencil",
         "Auto-approve edits, ask before other actions.",
     ),
     (
         AccessMode::Auto,
-        "sparkles",
         "An AI reviewer can approve or deny actions.",
     ),
     (
         AccessMode::FullAccess,
-        "shield",
         "Allow commands, edits, and supported MCP confirmations in non-plan turns without prompts.",
     ),
 ];
@@ -326,6 +328,7 @@ impl QuickComposer {
             .effort
             .or_else(|| crate::conversation::preferred_effort(self.kind.id(), cx));
         self.fast = choice.fast;
+        self.access = choice.access;
         if self.cwd != choice.cwd {
             self.cwd = choice.cwd;
             self.workspace = Workspace::default();
@@ -353,18 +356,11 @@ impl QuickComposer {
         self.workspace = Workspace::default();
         let p = cx.global::<crate::settings::Preferences>();
         let kind = p
-            .project_providers
-            .get(&self.cwd)
-            .and_then(|v| v.provider.as_deref())
-            .or(p.default_provider.as_deref())
+            .default_provider
+            .as_deref()
             .map(Kind::from_id)
             .unwrap_or(self.kind);
-        let model = p
-            .project_providers
-            .get(&self.cwd)
-            .and_then(|v| v.models.get(kind.id()))
-            .or(p.default_models.get(kind.id()))
-            .cloned();
+        let model = p.agent(kind).model;
         self.set_model(kind, model, cx);
         self.load_git(cx);
         self.update_placeholder(cx);
@@ -1251,10 +1247,6 @@ impl QuickComposer {
                 .on_click(cx.listener(|this, _, window, cx| this.open(Picker::Model, window, cx))),
             )
             .when(self.kind != Kind::Fx, |d| {
-                let permission = PERMISSIONS
-                    .iter()
-                    .find(|(mode, ..)| *mode == self.access)
-                    .map_or("lock", |(_, icon, _)| *icon);
                 d.child(
                     pill(
                         "quick-permissions",
@@ -1264,13 +1256,9 @@ impl QuickComposer {
                     )
                     .px_2()
                     .py_1()
-                    .child(icon(permission, 14.).text_color(
-                        if self.access == AccessMode::FullAccess {
-                            amber(0.9)
-                        } else {
-                            content(0.7)
-                        },
-                    ))
+                    .child(
+                        icon(access_icon(self.access), 14.).text_color(access_color(self.access)),
+                    )
                     .child(div().truncate().child(self.access.label()))
                     .child(icon("chevron-down", 12.).text_color(content(0.4)))
                     .on_click(
@@ -1452,7 +1440,7 @@ impl QuickComposer {
                 PERMISSIONS
                     .into_iter()
                     .enumerate()
-                    .map(|(ix, (mode, glyph, hint))| {
+                    .map(|(ix, (mode, hint))| {
                         let selected = mode == self.access;
                         self.option_row(("quick-permission", ix), ix == self.highlight, cx)
                             .aria_label(mode.label())
@@ -1462,13 +1450,7 @@ impl QuickComposer {
                             .flex()
                             .items_center()
                             .gap_3()
-                            .child(
-                                icon(glyph, 16.).text_color(if mode == AccessMode::FullAccess {
-                                    amber(0.9)
-                                } else {
-                                    content(0.75)
-                                }),
-                            )
+                            .child(icon(access_icon(mode), 16.).text_color(access_color(mode)))
                             .child(
                                 div()
                                     .flex_1()
@@ -2184,6 +2166,55 @@ mod tests {
         });
         cx.run_until_parked();
         window
+    }
+
+    #[gpui::test]
+    fn reopening_applies_the_choices_access_and_the_picker_can_restore_the_agents_own(
+        cx: &mut TestAppContext,
+    ) {
+        let window = open(cx);
+        window
+            .update(cx, |view, window, cx| {
+                assert_eq!(view.access, AccessMode::Supervised);
+                let projects = view.projects.clone();
+                view.reopen(
+                    projects,
+                    HashMap::new(),
+                    Launch::choice(
+                        "/work/app".into(),
+                        Kind::Codex,
+                        None,
+                        AccessMode::AgentDefault,
+                    ),
+                    cx,
+                );
+                assert_eq!(view.access, AccessMode::AgentDefault);
+                // Picking an explicit level, then the agent's own settings again.
+                view.open(Picker::Permissions, window, cx);
+                let supervised = PERMISSIONS
+                    .iter()
+                    .position(|(mode, _)| *mode == AccessMode::Supervised)
+                    .unwrap();
+                view.choose_permission(supervised, window, cx);
+                assert_eq!(view.access, AccessMode::Supervised);
+                view.open(Picker::Permissions, window, cx);
+                let own = PERMISSIONS
+                    .iter()
+                    .position(|(mode, _)| *mode == AccessMode::AgentDefault)
+                    .expect("the agent's own settings are offered");
+                view.choose_permission(own, window, cx);
+                assert_eq!(view.access, AccessMode::AgentDefault);
+                // The four explicit levels stay.
+                for mode in [
+                    AccessMode::Supervised,
+                    AccessMode::AutoAcceptEdits,
+                    AccessMode::Auto,
+                    AccessMode::FullAccess,
+                ] {
+                    assert!(PERMISSIONS.iter().any(|(m, _)| *m == mode), "{mode:?}");
+                }
+            })
+            .unwrap();
     }
 
     #[gpui::test]

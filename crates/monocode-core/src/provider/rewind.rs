@@ -62,6 +62,8 @@ pub fn rewind_last_turn(
     let mut command = Command::new(&request.binary);
     crate::scm::shell::apply_gui_env(&mut command);
     command.envs(&request.settings.environment);
+    // The user's Settings → Agents env (not its arguments), before the account.
+    crate::launch_args::apply_env(&mut command, &crate::cli::launch(request.kind).env);
     request.settings.account.apply(request.kind, &mut command)?;
     if request.kind == Kind::Codex {
         command.arg("app-server");

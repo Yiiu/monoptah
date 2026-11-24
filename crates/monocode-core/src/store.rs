@@ -280,6 +280,50 @@ impl Store {
             .optional()
             .map_err(|e| e.to_string())
     }
+    /// One time per database: Codex terminal sessions launched the bare CLI before
+    /// Settings → Agents existed, so the access they carry was never applied. They are
+    /// set to the agent's own settings, so they keep launching without permission flags.
+    /// The marker lives with the sessions (native-only settings), so sessions created
+    /// afterwards are never touched. Claude terminals (which always passed their mode) and
+    /// chats are left alone. Returns how many changed.
+    ///
+    /// The migration must never run twice: a second run would reset a permission the user
+    /// picked after the first. In the native database the marker and the rewrites commit in
+    /// one transaction, so a failure leaves nothing behind and the retry starts clean. The
+    /// shared database keeps settings in a separate file, so there the marker is claimed
+    /// before any rewrite: a failure part way leaves some terminals unmigrated (they launch
+    /// with their stored mode), never a later choice overwritten.
+    pub fn migrate_codex_terminal_access(&self) -> Result<usize, String> {
+        const MARKER: &str = "migration:codex-terminal-own-access";
+        if self.setting(MARKER)?.is_some() {
+            return Ok(0);
+        }
+        let tx = (self.shared.is_none() && self.conn.is_autocommit())
+            .then(|| self.conn.unchecked_transaction())
+            .transpose()
+            .map_err(|e| e.to_string())?;
+        self.save_setting(MARKER, "1")?;
+        let mut changed = 0;
+        for session in self.sessions()? {
+            if session.provider != crate::provider::Kind::Codex.id()
+                || !session.surface.is_tui()
+                || session.id < 0
+                || session.cwd.starts_with("remote://")
+            {
+                continue;
+            }
+            let mut settings = self.agent_settings(session.id)?.unwrap_or_default();
+            if settings.access != crate::agent::AccessMode::AgentDefault {
+                settings.access = crate::agent::AccessMode::AgentDefault;
+                self.save_agent_settings(session.id, &settings)?;
+                changed += 1;
+            }
+        }
+        if let Some(tx) = tx {
+            tx.commit().map_err(|e| e.to_string())?;
+        }
+        Ok(changed)
+    }
     pub fn save_setting(&self, key: &str, value: &str) -> Result<(), String> {
         if self.shared.is_some() {
             return self.shared_save_setting(key, value);
@@ -2191,5 +2235,50 @@ mod tests {
             store.sessions().unwrap()[0].provider_id.as_deref(),
             Some("conv-1")
         );
+    }
+}
+
+#[cfg(test)]
+mod codex_terminal_access_tests {
+    use super::*;
+    use crate::agent::AccessMode;
+    use crate::surface::Surface;
+
+    #[test]
+    fn existing_codex_terminals_move_to_their_own_settings_once() {
+        let stores = [
+            Store::open(Path::new(":memory:")).unwrap(),
+            Store::open_monocode(Path::new(":memory:")).unwrap(),
+        ];
+        for store in stores {
+            let codex_tui = store
+                .create_with_surface("codex", "/work", Surface::Tui)
+                .unwrap();
+            let picked = store
+                .create_with_surface("codex", "/work", Surface::Tui)
+                .unwrap();
+            let mut settings = store.agent_settings(picked.id).unwrap().unwrap_or_default();
+            settings.access = AccessMode::Auto;
+            store.save_agent_settings(picked.id, &settings).unwrap();
+            let claude_tui = store
+                .create_with_surface("claude", "/work", Surface::Tui)
+                .unwrap();
+            let codex_chat = store.create("codex", "/work").unwrap();
+            let access = |id| store.agent_settings(id).unwrap().unwrap_or_default().access;
+            assert_eq!(store.migrate_codex_terminal_access().unwrap(), 2);
+            assert_eq!(access(codex_tui.id), AccessMode::AgentDefault);
+            assert_eq!(access(picked.id), AccessMode::AgentDefault);
+            assert_eq!(access(claude_tui.id), AccessMode::Supervised);
+            assert_eq!(access(codex_chat.id), AccessMode::Supervised);
+            // A Codex terminal created afterwards keeps what Settings gave it.
+            let later = store
+                .create_with_surface("codex", "/work", Surface::Tui)
+                .unwrap();
+            let mut settings = store.agent_settings(later.id).unwrap().unwrap_or_default();
+            settings.access = AccessMode::FullAccess;
+            store.save_agent_settings(later.id, &settings).unwrap();
+            assert_eq!(store.migrate_codex_terminal_access().unwrap(), 0);
+            assert_eq!(access(later.id), AccessMode::FullAccess);
+        }
     }
 }

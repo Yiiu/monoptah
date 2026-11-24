@@ -186,12 +186,17 @@ pub(crate) fn prepare(request: Request) -> Result<Prepared, String> {
             Some((cli, tui_hook::spool_dir(data_dir.as_deref()?)))
         })
         .flatten();
-    let (env_set, env_remove) = profile.env(kind)?;
+    let (account_set, env_remove) = profile.env(kind)?;
+    // Settings → Agents arguments and environment (`Preferences::agent`, pushed to core).
+    let extra = monocode_core::cli::launch(kind);
+    let env_set = agent_env(extra.env, account_set, &env_remove);
     let launch = tui_launch::build(LaunchInput {
         kind,
         binary,
         model: settings.model.clone(),
+        effort: settings.effort.clone(),
         access: settings.access,
+        args: extra.args,
         provider_id: if claim.is_some() { None } else { saved.clone() },
         new_id: claim.clone(),
         initial_prompt,
@@ -227,6 +232,89 @@ pub(crate) fn prepare(request: Request) -> Result<Prepared, String> {
         claimed: claim.is_some(),
         launch,
     })
+}
+
+/// The user's variables, then the account's on top. A user variable the account sets or
+/// removes is dropped, so the account wins on every platform (Windows ignores removals).
+fn agent_env(
+    user: Vec<(String, String)>,
+    account: Vec<(String, std::ffi::OsString)>,
+    removed: &[&str],
+) -> Vec<(String, std::ffi::OsString)> {
+    agent_env_on(user, account, removed, cfg!(windows))
+}
+
+/// `agent_env` for a host whose variable names are case-insensitive (`windows`) or not.
+fn agent_env_on(
+    user: Vec<(String, String)>,
+    account: Vec<(String, std::ffi::OsString)>,
+    removed: &[&str],
+    windows: bool,
+) -> Vec<(String, std::ffi::OsString)> {
+    let same = |a: &str, b: &str| {
+        if windows {
+            a.eq_ignore_ascii_case(b)
+        } else {
+            a == b
+        }
+    };
+    let owned = |key: &str| {
+        account.iter().any(|(k, _)| same(k, key)) || removed.iter().any(|k| same(k, key))
+    };
+    let mut env: Vec<(String, std::ffi::OsString)> = user
+        .into_iter()
+        .filter(|(key, _)| !owned(key))
+        .map(|(key, value)| (key, value.into()))
+        .collect();
+    env.extend(account);
+    env
+}
+
+#[cfg(test)]
+mod agent_env_tests {
+    #[test]
+    fn the_account_wins_over_the_users_variables() {
+        let env = super::agent_env(
+            vec![
+                ("HTTP_PROXY".into(), "http://127.0.0.1:9".into()),
+                ("CODEX_HOME".into(), "/user".into()),
+                ("OPENAI_API_KEY".into(), "not-a-real-key".into()),
+            ],
+            vec![("CODEX_HOME".into(), "/account".into())],
+            &["OPENAI_API_KEY"],
+        );
+        assert_eq!(
+            env,
+            vec![
+                ("HTTP_PROXY".to_string(), "http://127.0.0.1:9".into()),
+                ("CODEX_HOME".to_string(), "/account".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_matches_account_variables_whatever_their_case() {
+        let user = || {
+            vec![
+                ("codex_home".into(), "/user".into()),
+                ("Openai_Api_Key".into(), "not-a-real-key".into()),
+                ("openai_api_key".into(), "not-a-real-key".into()),
+                ("HTTP_PROXY".into(), "http://127.0.0.1:9".into()),
+            ]
+        };
+        let account = || vec![("CODEX_HOME".into(), "/account".into())];
+        let windows = super::agent_env_on(user(), account(), &["OPENAI_API_KEY"], true);
+        assert_eq!(
+            windows,
+            vec![
+                ("HTTP_PROXY".to_string(), "http://127.0.0.1:9".into()),
+                ("CODEX_HOME".to_string(), "/account".into()),
+            ]
+        );
+        // Elsewhere names are case-sensitive: these are different variables.
+        let unix = super::agent_env_on(user(), account(), &["OPENAI_API_KEY"], false);
+        assert_eq!(unix.len(), 5, "{unix:?}");
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

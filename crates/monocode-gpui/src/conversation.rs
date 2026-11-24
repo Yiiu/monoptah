@@ -89,32 +89,34 @@ use std::{
 // Keep empty and docked composers aligned with the transcript column. Below
 // this width the empty session drops its title.
 const COMPOSER_COLUMN: f32 = COLUMN;
-// RUNTIME_MODE_LABEL and RUNTIME_MODE_HINT from the React session model,
-// with AccessPicker's icons; Full access is amber.
-const ACCESS_MODES: &[(&str, &str, &str, &str)] = &[
+// RUNTIME_MODE_LABEL and RUNTIME_MODE_HINT from the React session model, after the
+// agent's own settings. Each mode's icon and colour come from `theme::access_icon` and
+// `theme::access_color`, shared with Settings → Agents.
+const ACCESS_MODES: &[(&str, &str, &str)] = &[
+    (
+        "own",
+        "Agent's own settings",
+        "Pass no permission setting. The agent uses its own configuration.",
+    ),
     (
         "supervised",
         "Supervised",
         "Ask before commands and file changes.",
-        "square-lock",
     ),
     (
         "auto-accept-edits",
         "Auto-accept edits",
         "Auto-approve edits, ask before other actions.",
-        "pencil-edit",
     ),
     (
         "auto",
         "Auto",
         "An AI reviewer can approve or deny actions.",
-        "sparkles",
     ),
     (
         "full-access",
         "Full access",
         "Allow commands, edits, and supported MCP confirmations in non-plan turns without prompts.",
-        "shield-alert",
     ),
 ];
 // Tailwind v4 accents the composer menus tint their icons with.
@@ -809,7 +811,7 @@ impl Conversation {
             resolved_model: None,
             settings: Settings {
                 account,
-                access: default_access(cx),
+                access: default_access(&summary.provider, cx),
                 effort: preferred_effort(&summary.provider, cx),
                 ..Default::default()
             },
@@ -2531,10 +2533,10 @@ impl Conversation {
             eprintln!("native settings session={} action={id}", self.summary.id);
         }
         if let Some(mode) = id.strip_prefix("access:") {
+            // Session only: new sessions start from Settings → Agents.
             self.settings.access = AccessMode::from_id(mode);
-            remember_access(self.settings.access, cx);
         } else if let Some(effort) = id.strip_prefix("effort:") {
-            self.set_effort_choice(effort, cx);
+            self.set_effort_choice(effort);
         } else if let Some(tier) = id.strip_prefix("tier:") {
             self.settings.service_tier = (!tier.is_empty()).then(|| tier.to_owned());
             self.settings.model_settings.remove("serviceTier");
@@ -2543,7 +2545,7 @@ impl Conversation {
                 if is_effort_key(&key)
                     && (!self.is_remote() || matches!(key.as_str(), "effort" | "reasoningEffort"))
                 {
-                    self.set_effort_choice(&value, cx);
+                    self.set_effort_choice(&value);
                 }
                 self.settings.model_settings.insert(key, value);
             }
@@ -2598,21 +2600,12 @@ impl Conversation {
         self.save_settings(cx);
         cx.notify();
     }
-    fn set_effort_choice(&mut self, effort: &str, cx: &mut Context<Self>) {
+    fn set_effort_choice(&mut self, effort: &str) {
         self.settings
             .model_settings
             .retain(|key, _| !is_effort_key(key));
+        // Session only: new sessions start from Settings → Agents.
         self.settings.effort = (!effort.is_empty()).then(|| effort.to_owned());
-        let provider = self.summary.provider.clone();
-        if cx.has_global::<crate::settings::Preferences>() {
-            cx.update_global::<crate::settings::Preferences, _>(|prefs, _| {
-                if effort.is_empty() {
-                    prefs.provider_efforts.remove(&provider);
-                } else {
-                    prefs.provider_efforts.insert(provider, effort.to_owned());
-                }
-            });
-        }
     }
     fn selected_effort(&self) -> Option<&str> {
         self.settings
@@ -3598,26 +3591,10 @@ impl Conversation {
                                                 this.toggle_menu(ComposerMenu::Access, window, cx)
                                             }))
                                             .child(
-                                                icon(
-                                                    match self.settings.access {
-                                                        AccessMode::FullAccess => "shield-alert",
-                                                        AccessMode::AutoAcceptEdits => {
-                                                            "pencil-edit"
-                                                        }
-                                                        AccessMode::Auto => "sparkles",
-                                                        _ => "square-lock",
-                                                    },
-                                                    14.,
-                                                )
-                                                .text_color(
-                                                    if self.settings.access
-                                                        == AccessMode::FullAccess
-                                                    {
-                                                        tint(AMBER_400, 0.9)
-                                                    } else {
-                                                        content(1.)
-                                                    },
-                                                ),
+                                                icon(access_icon(self.settings.access), 14.)
+                                                    .text_color(access_color(
+                                                        self.settings.access,
+                                                    )),
                                             )
                                             .child(pill_label(self.settings.access.label()))
                                             .child(icon("chevron-down", 12.)),
@@ -4090,19 +4067,15 @@ fn perf_prompt(cx: &mut Context<Conversation>) {
     .detach();
 }
 
-/// The access mode the last composer pick left as the default for new chats.
-pub(crate) fn default_access(cx: &gpui::App) -> AccessMode {
+/// The access mode a new session of `provider` starts with: its permission from
+/// Settings → Agents (`Preferences::agent`). A composer change stays in its session.
+pub(crate) fn default_access(provider: &str, cx: &gpui::App) -> AccessMode {
+    let Some(kind) = Kind::parse(provider) else {
+        return AccessMode::default();
+    };
     cx.try_global::<crate::settings::Preferences>()
-        .and_then(|prefs| prefs.default_access.as_deref())
-        .map(AccessMode::from_id)
+        .map(|prefs| prefs.agent(kind).access())
         .unwrap_or_default()
-}
-pub(crate) fn remember_access(mode: AccessMode, cx: &mut gpui::App) {
-    if cx.has_global::<crate::settings::Preferences>() {
-        cx.update_global::<crate::settings::Preferences, _>(|prefs, _| {
-            prefs.default_access = Some(mode.id().into());
-        });
-    }
 }
 fn is_effort_key(key: &str) -> bool {
     matches!(
@@ -4110,10 +4083,14 @@ fn is_effort_key(key: &str) -> bool {
         "effort" | "reasoning" | "reasoningEffort" | "reasoning_effort"
     )
 }
+/// The effort a new session (or a model change) of `provider` starts with: the agent's
+/// effort from Settings → Agents.
 pub(crate) fn preferred_effort(provider: &str, cx: &gpui::App) -> Option<String> {
+    let kind = Kind::parse(provider)?;
     cx.try_global::<crate::settings::Preferences>()
-        .and_then(|prefs| prefs.provider_efforts.get(provider).cloned())
+        .and_then(|prefs| prefs.agent(kind).effort)
 }
+
 pub(crate) fn effort_name(value: &str) -> String {
     match value {
         "default" => "Default",
@@ -4984,12 +4961,16 @@ mod menu_tests {
     }
 
     #[gpui::test]
-    fn picked_access_becomes_the_default_for_new_chats(cx: &mut TestAppContext) {
+    fn picked_access_stays_in_its_session_and_new_chats_start_from_settings(
+        cx: &mut TestAppContext,
+    ) {
         let store = Store::open(Path::new(":memory:")).unwrap();
         let first = store.create("codex", "/work").unwrap();
         let second = store.create("codex", "/work").unwrap();
         let store = Arc::new(Mutex::new(store));
-        cx.update(|cx| cx.set_global(crate::settings::Preferences::default()));
+        let mut prefs = crate::settings::Preferences::default();
+        prefs.agents.permission = Some("edits".into());
+        cx.update(|cx| cx.set_global(prefs.clone()));
         let window = cx.update(|cx| {
             cx.open_window(Default::default(), |_, cx| {
                 cx.new(|cx| Conversation::new(first, store.clone(), cx))
@@ -4998,51 +4979,83 @@ mod menu_tests {
         });
         window
             .update(cx, |c, _, cx| {
-                assert_eq!(c.settings.access, AccessMode::Supervised);
+                assert_eq!(c.settings.access, AccessMode::AutoAcceptEdits);
                 c.menu_choice("access:auto", cx);
+                assert_eq!(c.settings.access, AccessMode::Auto);
             })
             .unwrap();
         cx.update(|cx| {
-            assert_eq!(
-                cx.global::<crate::settings::Preferences>()
-                    .default_access
-                    .as_deref(),
-                Some("auto")
-            );
+            // Nothing global changed: the pick belongs to that session only.
+            assert_eq!(cx.global::<crate::settings::Preferences>(), &prefs);
             let next = cx.new(|cx| Conversation::new(second, store, cx));
-            assert_eq!(next.read(cx).settings.access, AccessMode::Auto);
+            assert_eq!(next.read(cx).settings.access, AccessMode::AutoAcceptEdits);
         });
     }
 
     #[gpui::test]
-    fn effort_choices_survive_provider_switches_and_new_projects(cx: &mut TestAppContext) {
-        cx.update(|cx| cx.set_global(crate::settings::Preferences::default()));
+    fn the_access_menu_offers_the_agents_own_settings_with_the_shared_icons(
+        cx: &mut TestAppContext,
+    ) {
+        use monocode_core::agent::Permission;
         let window = conversation(cx);
         window
             .update(cx, |c, _, cx| {
+                let items = c.mono_access_options();
+                let action = |id: &str| {
+                    items
+                        .iter()
+                        .find_map(|item| match item {
+                            MenuItem::Action(action) if action.id.as_ref() == id => {
+                                Some(action.clone())
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| panic!("{id} is not offered"))
+                };
+                assert_eq!(action("access:own").label.as_ref(), "Agent's own settings");
+                // Each level looks as it does in Settings → Agents.
+                for (id, level) in [
+                    ("access:own", Permission::Own),
+                    ("access:supervised", Permission::Ask),
+                    ("access:auto-accept-edits", Permission::AcceptEdits),
+                    ("access:auto", Permission::Auto),
+                    ("access:full-access", Permission::Full),
+                ] {
+                    let action = action(id);
+                    assert_eq!(action.icon, Some(permission_icon(level)), "{id}");
+                    assert_eq!(action.icon_color, Some(permission_color(level)), "{id}");
+                }
+                c.menu_choice("access:own", cx);
+                assert_eq!(c.settings.access, AccessMode::AgentDefault);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn effort_choices_stay_in_their_session_and_new_chats_use_the_agents_effort(
+        cx: &mut TestAppContext,
+    ) {
+        let mut prefs = crate::settings::Preferences::default();
+        prefs.agents.efforts.insert("codex".into(), "low".into());
+        cx.update(|cx| cx.set_global(prefs.clone()));
+        let window = conversation(cx);
+        window
+            .update(cx, |c, _, cx| {
+                // Claude has no effort in Settings: the agent's default.
+                assert_eq!(c.settings.effort, None);
                 c.menu_choice("effort:medium", cx);
-                c.apply_model_pick(&ModelPicked(Kind::Codex, Some("gpt-6.1-sol".into())), cx);
-                c.menu_choice("effort:xhigh", cx);
-                c.apply_model_pick(
-                    &ModelPicked(Kind::Claude, Some("claude-opus-5-5".into())),
-                    cx,
-                );
                 assert_eq!(c.settings.effort.as_deref(), Some("medium"));
+                // A model change starts from the new agent's settings.
                 c.apply_model_pick(&ModelPicked(Kind::Codex, Some("gpt-6.1-sol".into())), cx);
-                assert_eq!(c.settings.effort.as_deref(), Some("xhigh"));
-                c.menu_choice("access:auto", cx);
-                let encoded =
-                    serde_json::to_string(cx.global::<crate::settings::Preferences>()).unwrap();
-                let restored: crate::settings::Preferences =
-                    serde_json::from_str(&encoded).unwrap();
-                assert_eq!(restored.provider_efforts["claude"], "medium");
-                assert_eq!(restored.provider_efforts["codex"], "xhigh");
-                assert_eq!(restored.default_access.as_deref(), Some("auto"));
+                assert_eq!(c.settings.effort.as_deref(), Some("low"));
+                c.menu_choice("effort:xhigh", cx);
+                c.menu_choice("access:full-access", cx);
+                assert_eq!(cx.global::<crate::settings::Preferences>(), &prefs);
                 let store = Store::open(Path::new(":memory:")).unwrap();
                 let summary = store.create("codex", "/different/project").unwrap();
                 let next = cx.new(|cx| Conversation::new(summary, Arc::new(Mutex::new(store)), cx));
-                assert_eq!(next.read(cx).settings.effort.as_deref(), Some("xhigh"));
-                assert_eq!(next.read(cx).settings.access, AccessMode::Auto);
+                assert_eq!(next.read(cx).settings.effort.as_deref(), Some("low"));
+                assert_eq!(next.read(cx).settings.access, AccessMode::AgentDefault);
             })
             .unwrap();
     }

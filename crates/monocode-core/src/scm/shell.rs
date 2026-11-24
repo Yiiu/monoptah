@@ -217,7 +217,7 @@ pub(crate) fn apply_gui_env(cmd: &mut Command) {
     }
 }
 
-fn which_in_path(path: &str, name: &str) -> Option<PathBuf> {
+pub(crate) fn which_in_path(path: &str, name: &str) -> Option<PathBuf> {
     std::env::split_paths(std::ffi::OsStr::new(path)).find_map(|dir| {
         if dir.as_os_str().is_empty() {
             return None;
@@ -226,7 +226,7 @@ fn which_in_path(path: &str, name: &str) -> Option<PathBuf> {
     })
 }
 
-fn existing_binary(path: PathBuf) -> Option<PathBuf> {
+pub(crate) fn existing_binary(path: PathBuf) -> Option<PathBuf> {
     #[cfg(windows)]
     if path.extension().is_none() {
         for ext in ["exe", "cmd", "bat", "com"] {

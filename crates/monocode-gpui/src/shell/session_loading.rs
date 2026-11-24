@@ -101,25 +101,25 @@ impl Shell {
 
 /// Preserve remembered source controls when they refer to the selected model.
 /// A deliberate native model override starts with fresh model-specific controls.
+/// `None` is the agent's default: the source's model (a retired per-project or
+/// last-used model) never applies, and its model-specific controls go with it.
 pub(super) fn new_session_settings(
     source: Option<monocode_core::agent::Settings>,
     model: Option<String>,
 ) -> monocode_core::agent::Settings {
     let mut settings = source.unwrap_or_default();
-    if let Some(model) = model {
-        if settings
-            .model
-            .as_ref()
-            .is_some_and(|source| source != &model)
-        {
-            settings.effort = None;
-            settings.fast = false;
-            settings.thinking = None;
-            settings.service_tier = None;
-            settings.model_settings.clear();
-        }
-        settings.model = Some(model);
+    if settings
+        .model
+        .as_ref()
+        .is_some_and(|source| model.as_ref() != Some(source))
+    {
+        settings.effort = None;
+        settings.fast = false;
+        settings.thinking = None;
+        settings.service_tier = None;
+        settings.model_settings.clear();
     }
+    settings.model = model;
     settings
 }
 
@@ -150,7 +150,7 @@ impl NewSessionDefaults {
             account: crate::accounts::get(cx)
                 .map(|center| center.read(cx).selected(kind, cwd))
                 .unwrap_or_default(),
-            access: crate::conversation::default_access(cx),
+            access: crate::conversation::default_access(kind.id(), cx),
             effort: crate::conversation::preferred_effort(kind.id(), cx),
             surface,
         }
@@ -325,6 +325,29 @@ mod tests {
         assert_eq!(changed.model.as_deref(), Some("model-b"));
         assert!(changed.effort.is_none());
         assert!(changed.model_settings.is_empty());
+    }
+
+    #[test]
+    fn the_agents_default_model_never_takes_a_remembered_project_model() {
+        let project = Settings {
+            model: Some("project-model".into()),
+            effort: Some("high".into()),
+            model_settings: [("reasoningEffort".into(), "high".into())].into(),
+            ..Default::default()
+        };
+        let settings = new_session_settings(Some(project), None);
+        assert_eq!(settings.model, None);
+        assert!(settings.effort.is_none());
+        assert!(settings.model_settings.is_empty());
+        // Controls remembered without a model still seed the agent's default.
+        let controls = Settings {
+            effort: Some("low".into()),
+            model_settings: [("reasoningEffort".into(), "low".into())].into(),
+            ..Default::default()
+        };
+        let settings = new_session_settings(Some(controls), None);
+        assert_eq!(settings.model, None);
+        assert_eq!(settings.effort.as_deref(), Some("low"));
     }
 
     #[gpui::test]

@@ -204,8 +204,7 @@ mod tests {
                     shell
                         .workspace
                         .preferences
-                        .provider_surfaces
-                        .insert((*provider).into(), *surface);
+                        .set_agent_surface(Kind::from_id(provider), *surface);
                 }
             })
             .unwrap();

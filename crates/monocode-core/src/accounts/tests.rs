@@ -454,3 +454,22 @@ fn resolve_reports_ambiguous_labels_with_their_ids() {
     // An exact id still resolves.
     assert_eq!(resolve(&book, Kind::Claude, &first.id).unwrap(), first.id);
 }
+
+#[test]
+fn owned_keys_list_what_a_selected_account_sets_or_removes() {
+    let root = Path::new("/accounts-root");
+    let default = Profile::default();
+    assert!(default.owned_keys(Kind::Codex).is_empty());
+    let work = Profile::new("work", root);
+    let codex = work.owned_keys(Kind::Codex);
+    assert!(codex.contains(&"CODEX_HOME") && codex.contains(&"OPENAI_API_KEY"));
+    let claude = work.owned_keys(Kind::Claude);
+    for key in [
+        "CLAUDE_CONFIG_DIR",
+        "ANTHROPIC_API_KEY",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+    ] {
+        assert!(claude.contains(&key), "{key}");
+    }
+    assert!(work.owned_keys(Kind::Hermes).is_empty());
+}

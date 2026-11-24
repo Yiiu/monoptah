@@ -1143,6 +1143,12 @@ impl Shell {
         let metadata: Vec<_> = summaries.iter().map(|s| (s.id, s.cwd.clone())).collect();
         let workspace = Workspace::restore(saved.as_deref(), &metadata, &cwd);
         monocode_core::cli::initialize(&workspace.preferences.binary_paths);
+        monocode_core::cli::set_launches(workspace.preferences.launches());
+        // Before any terminal can launch: Codex terminals made before Settings → Agents keep
+        // launching without permission flags. One settings read once it has run.
+        if let Err(error) = locked(&store).and_then(|store| store.migrate_codex_terminal_access()) {
+            eprintln!("Could not keep Codex terminals on their own settings: {error}");
+        }
         let latest_state = Arc::new(Mutex::new(serde_json::to_string(&workspace).unwrap()));
         let quit_state = latest_state.clone();
         let quit_store = store.clone();
@@ -14139,11 +14145,10 @@ mod tests {
         cx.update(|cx| {
             bind_keys(cx);
             cx.set_reduce_motion(true);
-            cx.set_global(crate::settings::Preferences::default());
-            crate::conversation::remember_access(
-                monocode_core::agent::AccessMode::from_id("auto"),
-                cx,
-            );
+            // The permission set in Settings → Agents ("approve for me").
+            let mut prefs = crate::settings::Preferences::default();
+            prefs.agents.permission = Some("auto".into());
+            cx.set_global(prefs);
         });
         window
             .update(cx, |shell, w, cx| {

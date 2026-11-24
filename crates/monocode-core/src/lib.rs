@@ -62,6 +62,7 @@ pub mod skills;
 pub mod search;
 
 pub mod cli;
+pub mod launch_args;
 pub mod mcp;
 
 pub mod worktree_management;

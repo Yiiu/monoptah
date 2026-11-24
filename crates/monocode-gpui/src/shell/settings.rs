@@ -125,6 +125,7 @@ impl Shell {
                 })
                 .unwrap_or_default(),
             catalogs,
+            agent_updates: self.notification_state.harness.read(cx).settings_rows(),
             classic: self.workspace.classic_layout,
             new_layout_boxy: self.workspace.new_layout_boxy,
             no_terminal_sessions: !self.surface_supported,
@@ -217,6 +218,12 @@ impl Shell {
                     this.notification_state
                         .harness
                         .update(cx, |notice, cx| notice.check_now(hidden, cx));
+                }
+                SettingsEvent::UpdateAgent(kind) => {
+                    let kind = *kind;
+                    this.notification_state
+                        .harness
+                        .update(cx, |notice, cx| notice.update_one(kind, cx));
                 }
                 SettingsEvent::Changed(prefs) => {
                     #[cfg(target_os = "linux")]
@@ -549,7 +556,9 @@ impl Shell {
             self.update_chat_visibility(cx);
             self.invalidate_chrome(cx);
         }
+        // Both are replaced on every change, so the next launch uses them without a restart.
         monocode_core::cli::initialize(&self.workspace.preferences.binary_paths);
+        monocode_core::cli::set_launches(self.workspace.preferences.launches());
         self.keep_visible_idle_agents(cx);
         monocode_core::provider::configure_idle_agents(
             self.workspace.preferences.idle_agents as usize,

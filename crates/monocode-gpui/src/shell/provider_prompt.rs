@@ -1,13 +1,13 @@
 //! NewSessionProviderDialog.tsx and newSessionProviderPrompt.ts: a terminal
-//! session gives no way to switch provider afterwards, so when the default
-//! provider opens as one, a new session asks which provider to use first.
+//! session gives no way to switch provider afterwards, so when any available
+//! agent opens as one, a new session asks which provider to use first.
 use super::*;
 use monocode_core::surface::{Surface, new_session_surface};
 
 const TITLE: &str = "Choose a provider";
 const DESCRIPTION: &str = "For this session only";
 const HINT: &str =
-    "The default provider opens as a terminal session, which can't switch providers afterwards.";
+    "Terminal sessions can't switch providers afterwards, so pick the one to start with.";
 
 /// The providers the model picker would show for this project: not hidden for it,
 /// and installed once that is known (`None` while the CLIs are not probed yet, so
@@ -22,18 +22,19 @@ pub(super) fn new_session_providers(hidden: &[String], installed: Option<&[Kind]
         .collect()
 }
 
-/// A new session should ask which provider to use when the default one opens as
-/// a terminal. With fewer than two providers (`available`, as listed by
-/// [`new_session_providers`]) there is nothing to choose, and a project on
-/// another machine opens a chat whatever the preference says.
+/// A new session asks which provider to use when at least two are available (as
+/// listed by [`new_session_providers`]) and any of them opens as a terminal
+/// (`surface`, the Settings → Agents resolver). A project on another machine opens a
+/// chat whatever the preference says, so it never asks.
 pub(super) fn should_prompt_for_provider(
     cwd: &str,
-    default_kind: Kind,
-    surfaces: &HashMap<String, Surface>,
     available: &[Kind],
+    surface: impl Fn(Kind) -> Surface,
 ) -> bool {
-    let preferred = surfaces.get(default_kind.id()).copied().unwrap_or_default();
-    new_session_surface(default_kind, cwd, preferred).is_tui() && available.len() >= 2
+    available.len() >= 2
+        && available
+            .iter()
+            .any(|kind| new_session_surface(*kind, cwd, surface(*kind)).is_tui())
 }
 
 /// Move the highlight one row, wrapping like the model picker menus.
@@ -54,18 +55,13 @@ pub(super) struct Prompt {
 }
 
 impl Shell {
-    /// How a new session of `kind` opens: the Settings preference, as a chat when
-    /// the database cannot store a terminal session.
+    /// How a new session of `kind` opens: the open mode from Settings → Agents
+    /// (`Preferences::agent`), as a chat when the database cannot store a terminal session.
     pub(super) fn provider_surface(&self, kind: Kind) -> Surface {
         if !self.surface_supported {
             return Surface::Chat;
         }
-        self.workspace
-            .preferences
-            .provider_surfaces
-            .get(kind.id())
-            .copied()
-            .unwrap_or_default()
+        self.workspace.preferences.agent(kind).surface
     }
 
     fn prompt_providers(&self) -> Vec<Kind> {
@@ -77,21 +73,12 @@ impl Shell {
     }
 
     pub(super) fn should_prompt_for_provider(&self) -> bool {
-        let none = HashMap::new();
-        let surfaces = if self.surface_supported {
-            &self.workspace.preferences.provider_surfaces
-        } else {
-            &none
-        };
-        should_prompt_for_provider(
-            &self.workspace.project,
-            self.default_choice().kind,
-            surfaces,
-            &self.prompt_providers(),
-        )
+        should_prompt_for_provider(&self.workspace.project, &self.prompt_providers(), |kind| {
+            self.provider_surface(kind)
+        })
     }
 
-    /// Cmd+T and the New buttons: ask which provider first when the default one
+    /// Cmd+T and the New buttons: ask which provider first when any available one
     /// opens as a terminal, else open the default straight away.
     pub(super) fn request_new_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.should_prompt_for_provider() {
@@ -412,104 +399,64 @@ mod tests {
 
     const PROJECT: &str = "/work/monocode";
 
-    fn surfaces(entries: &[(Kind, Surface)]) -> HashMap<String, Surface> {
-        entries
-            .iter()
-            .map(|(kind, surface)| (kind.id().to_owned(), *surface))
-            .collect()
+    /// The rule with `tui` opening as terminals and every other agent as a chat.
+    fn prompts(cwd: &str, tui: &[Kind], available: &[Kind]) -> bool {
+        should_prompt_for_provider(cwd, available, |kind| {
+            if tui.contains(&kind) {
+                Surface::Tui
+            } else {
+                Surface::Chat
+            }
+        })
     }
 
-    // newSessionProviderPrompt.test.ts: shouldPromptForProvider
     #[test]
-    fn it_does_not_prompt_when_the_default_provider_opens_as_a_chat() {
+    fn it_does_not_prompt_when_every_agent_opens_as_a_chat() {
         let all = new_session_providers(&[], None);
-        let chat = surfaces(&[(Kind::Claude, Surface::Chat)]);
-        assert!(!should_prompt_for_provider(
-            PROJECT,
-            Kind::Claude,
-            &chat,
-            &all
-        ));
-        assert!(!should_prompt_for_provider(
-            PROJECT,
-            Kind::Claude,
-            &HashMap::new(),
-            &all
-        ));
+        assert!(!prompts(PROJECT, &[], &all));
     }
 
     #[test]
     fn it_prompts_when_the_default_provider_opens_as_a_terminal() {
         let all = new_session_providers(&[], None);
-        let tui = surfaces(&[(Kind::Claude, Surface::Tui)]);
-        assert!(should_prompt_for_provider(
-            PROJECT,
-            Kind::Claude,
-            &tui,
-            &all
-        ));
+        assert!(prompts(PROJECT, &[Kind::Claude], &all));
     }
 
     #[test]
-    fn it_only_looks_at_the_default_providers_surface() {
+    fn it_prompts_when_any_available_agent_opens_as_a_terminal() {
+        // Not only the default: Codex opening as a terminal is enough.
         let all = new_session_providers(&[], None);
-        let tui = surfaces(&[(Kind::Codex, Surface::Tui)]);
-        assert!(!should_prompt_for_provider(
-            PROJECT,
-            Kind::Claude,
-            &tui,
-            &all
-        ));
+        assert!(prompts(PROJECT, &[Kind::Codex], &all));
+        // A terminal agent that is disabled or not installed does not count.
+        let hidden = new_session_providers(&["codex".to_string()], None);
+        assert!(!prompts(PROJECT, &[Kind::Codex], &hidden));
+        let installed = new_session_providers(&[], Some(&[Kind::Claude, Kind::Grok]));
+        assert!(!prompts(PROJECT, &[Kind::Codex], &installed));
     }
 
     #[test]
     fn it_does_not_prompt_in_a_remote_project_where_a_terminal_becomes_a_chat() {
         let all = new_session_providers(&[], None);
-        let tui = surfaces(&[(Kind::Claude, Surface::Tui)]);
-        assert!(!should_prompt_for_provider(
-            "remote://env/repo",
-            Kind::Claude,
-            &tui,
-            &all
-        ));
+        assert!(!prompts("remote://env/repo", &[Kind::Claude], &all));
     }
 
     // shouldPromptForProvider with few providers
-    fn tui() -> HashMap<String, Surface> {
-        surfaces(&[(Kind::Claude, Surface::Tui)])
-    }
-
     #[test]
     fn it_does_not_prompt_when_no_provider_is_installed() {
         let none = new_session_providers(&[], Some(&[]));
-        assert!(!should_prompt_for_provider(
-            PROJECT,
-            Kind::Claude,
-            &tui(),
-            &none
-        ));
+        assert!(!prompts(PROJECT, &[Kind::Claude], &none));
     }
 
     #[test]
     fn it_does_not_prompt_when_only_one_provider_is_installed() {
         let one = new_session_providers(&[], Some(&[Kind::Claude]));
-        assert!(!should_prompt_for_provider(
-            PROJECT,
-            Kind::Claude,
-            &tui(),
-            &one
-        ));
+        assert!(!prompts(PROJECT, &[Kind::Claude], &one));
     }
 
     #[test]
     fn it_prompts_when_two_providers_are_installed() {
         let two = new_session_providers(&[], Some(&[Kind::Claude, Kind::Codex]));
-        assert!(should_prompt_for_provider(
-            PROJECT,
-            Kind::Claude,
-            &tui(),
-            &two
-        ));
+        assert!(prompts(PROJECT, &[Kind::Claude], &two));
     }
 
     // newSessionProviders
@@ -561,9 +508,7 @@ mod tests {
                 let prefs = &mut shell.workspace.preferences;
                 prefs.default_provider = Some("claude".into());
                 for kind in tui {
-                    prefs
-                        .provider_surfaces
-                        .insert(kind.id().into(), Surface::Tui);
+                    prefs.set_agent_surface(*kind, Surface::Tui);
                 }
                 shell.installed_providers = Some(Kind::ALL.to_vec());
             })
@@ -605,24 +550,28 @@ mod tests {
     }
 
     #[gpui::test]
-    fn the_dialog_excludes_a_provider_hidden_for_the_project(cx: &mut TestAppContext) {
+    fn the_dialog_excludes_a_disabled_agent_and_ignores_retired_project_lists(
+        cx: &mut TestAppContext,
+    ) {
         let window = window(cx, &[Kind::Claude]);
         window
             .update(cx, |shell, _, _| {
-                shell
-                    .workspace
-                    .preferences
+                let prefs = &mut shell.workspace.preferences;
+                prefs.set_agent_enabled(Kind::Codex, false);
+                // Per-project hidden lists are retired: Grok stays available.
+                prefs
                     .project_providers
                     .entry(PROJECT.into())
                     .or_default()
                     .hidden
-                    .push("codex".into());
+                    .push("grok".into());
             })
             .unwrap();
         open(window, cx);
         let kinds: Vec<_> = rows(window, cx).into_iter().map(|(kind, _)| kind).collect();
         assert!(!kinds.contains(&Kind::Codex));
         assert!(kinds.contains(&Kind::Claude));
+        assert!(kinds.contains(&Kind::Grok));
     }
 
     #[gpui::test]
@@ -633,8 +582,7 @@ mod tests {
                 shell
                     .workspace
                     .preferences
-                    .provider_surfaces
-                    .insert("codex".into(), Surface::Chat);
+                    .set_agent_surface(Kind::Codex, Surface::Chat);
             })
             .unwrap();
         open(window, cx);
@@ -661,7 +609,7 @@ mod tests {
         assert_eq!(DESCRIPTION, "For this session only");
         assert_eq!(
             HINT,
-            "The default provider opens as a terminal session, which can't switch providers afterwards."
+            "Terminal sessions can't switch providers afterwards, so pick the one to start with."
         );
         let window = window(cx, &[Kind::Claude]);
         open(window, cx);
@@ -829,8 +777,8 @@ mod tests {
     }
 
     #[gpui::test]
-    fn a_default_that_opens_as_a_chat_creates_the_session_without_asking(cx: &mut TestAppContext) {
-        let window = window(cx, &[Kind::Codex]);
+    fn every_agent_opening_as_a_chat_creates_the_session_without_asking(cx: &mut TestAppContext) {
+        let window = window(cx, &[]);
         let before = window
             .update(cx, |shell, _, _| shell.session_summaries.len())
             .unwrap();
@@ -842,6 +790,29 @@ mod tests {
                 let id = shell.workspace.active.unwrap();
                 assert_eq!(shell.session_summaries[&id].provider, "claude");
                 assert_eq!(shell.session_summaries[&id].surface, Surface::Chat);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_chat_default_still_asks_when_another_available_agent_opens_as_a_terminal(
+        cx: &mut TestAppContext,
+    ) {
+        let window = window(cx, &[Kind::Codex]);
+        open(window, cx);
+        window
+            .update(cx, |shell, _, _| {
+                assert!(shell.provider_prompt.is_some());
+                assert!(
+                    shell
+                        .provider_prompt_rows()
+                        .contains(&(Kind::Codex, Surface::Tui))
+                );
+                assert!(
+                    shell
+                        .provider_prompt_rows()
+                        .contains(&(Kind::Claude, Surface::Chat))
+                );
             })
             .unwrap();
     }

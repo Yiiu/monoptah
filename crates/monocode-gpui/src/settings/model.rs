@@ -143,7 +143,7 @@ impl Section {
                 "transcript composer prompt message diff review layout format save editor"
             }
             Section::Providers => {
-                "account sign in login model harness claude codex gemini cli default hooks"
+                "account sign in login model harness claude codex gemini cli default hooks agent permission arguments env"
             }
             Section::Mcp => {
                 "tools servers connections oauth authenticate login claude codex cursor opencode"
@@ -475,13 +475,85 @@ pub(crate) const INDEX: &[(&str, Section, &str, &str)] = &[
         "agent-clis",
         Section::Providers,
         "Agent CLIs",
-        "codex opencode cursor grok pi omp fx hermes antigravity devin binary path",
+        "codex opencode cursor grok pi omp fx hermes antigravity devin binary path command install update detect",
     ),
     (
-        "session-surface",
+        "agent-open-mode",
         Section::Providers,
-        "Session surface",
-        "chat tui terminal interactive cli surface",
+        "Open new sessions in",
+        "session surface chat tui terminal interactive cli open in mode per agent",
+    ),
+    (
+        "agent-permission",
+        Section::Providers,
+        "Agent permissions",
+        "permission approval ask accept edits approve for me full access yolo bypass sandbox",
+    ),
+    (
+        "settings-agent-codex",
+        Section::Providers,
+        "Codex",
+        "agent cli command path model effort permission arguments args env environment install update",
+    ),
+    (
+        "settings-agent-claude",
+        Section::Providers,
+        "Claude Code",
+        "agent cli command path model effort permission arguments args env environment install update",
+    ),
+    (
+        "settings-agent-cursor",
+        Section::Providers,
+        "Cursor",
+        "agent cli command path model permission arguments args env environment install update",
+    ),
+    (
+        "settings-agent-grok",
+        Section::Providers,
+        "Grok Build",
+        "agent cli command path model effort permission arguments args env environment install update",
+    ),
+    (
+        "settings-agent-opencode",
+        Section::Providers,
+        "OpenCode",
+        "agent cli command path model permission arguments args env environment install update",
+    ),
+    (
+        "settings-agent-antigravity",
+        Section::Providers,
+        "Antigravity",
+        "agent cli command path model permission arguments args env environment install update agy",
+    ),
+    (
+        "settings-agent-pi",
+        Section::Providers,
+        "Pi",
+        "agent cli command path model effort arguments args env environment install update",
+    ),
+    (
+        "settings-agent-omp",
+        Section::Providers,
+        "omp",
+        "agent cli command path model effort arguments args env environment install update",
+    ),
+    (
+        "settings-agent-fx",
+        Section::Providers,
+        "fx",
+        "agent cli command path model permission arguments args env environment install update",
+    ),
+    (
+        "settings-agent-hermes",
+        Section::Providers,
+        "Hermes Agent",
+        "agent cli command path model effort permission arguments args env environment install update",
+    ),
+    (
+        "settings-agent-devin",
+        Section::Providers,
+        "Devin",
+        "agent cli command path model permission arguments args env environment install update",
     ),
     (
         "background-model",
@@ -612,7 +684,14 @@ pub(crate) fn search(query: &str, compositor: &str) -> Vec<SearchResult> {
         if id == "wayland-window-decorations" && compositor != "Wayland" {
             continue;
         }
-        if let Some(s) = score(&needle, label, keywords) {
+        if let Some(mut s) = score(&needle, label, keywords) {
+            // Every agent row shares the same words ("update", "model", ...): one found by
+            // those alone ranks after the other settings that have the word, so eleven agent
+            // rows cannot push them out of the results. A search by the agent's name is
+            // a name match and keeps its rank.
+            if s >= 2. && id.starts_with("settings-agent-") {
+                s += 0.25;
+            }
             scored.push((
                 s,
                 SearchResult {
@@ -709,19 +788,90 @@ mod tests {
             Section::Inbox.keywords().contains("clickup"),
             "section keywords"
         );
-        for query in ["session surface", "terminal", "tui"] {
+        for query in ["session surface", "terminal", "tui", "open new sessions"] {
             assert!(
                 search(query, "Wayland").iter().any(
-                    |r| r.section == Section::Providers && r.setting == Some("session-surface")
+                    |r| r.section == Section::Providers && r.setting == Some("agent-open-mode")
                 ),
                 "{query}"
             );
         }
+        for query in ["permission", "full access", "yolo", "approval"] {
+            assert!(
+                search(query, "Wayland")
+                    .iter()
+                    .any(|r| r.section == Section::Providers
+                        && r.setting == Some("agent-permission")),
+                "{query}"
+            );
+        }
+        // Each agent's row is a result of its own; the page opens it.
+        for kind in monocode_core::provider::Kind::ALL {
+            let id = format!("settings-agent-{}", kind.id());
+            assert!(
+                INDEX
+                    .iter()
+                    .any(|(setting, section, ..)| *setting == id && *section == Section::Providers),
+                "{id}"
+            );
+        }
+        assert!(
+            search("claude", "Wayland")
+                .iter()
+                .any(|r| r.setting == Some("settings-agent-claude"))
+        );
         let pages = search("archive", "Wayland");
         assert!(
             pages
                 .iter()
                 .any(|r| r.section == Section::Archive && r.setting.is_none())
         );
+    }
+
+    #[test]
+    fn update_finds_the_app_version_and_the_agent_clis_before_single_agents() {
+        let results = search("update", "Wayland");
+        let at = |id: &str| results.iter().position(|r| r.setting == Some(id));
+        let version = at("update").expect("General → Version is a result for update");
+        let group = at("agent-clis").expect("the Agent CLIs group is a result for update");
+        assert_eq!(results[version].section, Section::General);
+        for (ix, result) in results.iter().enumerate() {
+            if result
+                .setting
+                .is_some_and(|id| id.starts_with("settings-agent-"))
+            {
+                assert!(ix > version && ix > group, "{results:?}");
+            }
+        }
+        // A search by an agent's name still lands on its row first.
+        assert_eq!(
+            search("claude", "Wayland")[0].setting,
+            Some("settings-agent-claude")
+        );
+    }
+
+    #[test]
+    fn agent_rows_are_found_by_the_names_they_show() {
+        for kind in monocode_core::provider::Kind::ALL {
+            let id = format!("settings-agent-{}", kind.id());
+            let label = INDEX
+                .iter()
+                .find(|(setting, ..)| *setting == id)
+                .map(|(_, _, label, _)| *label);
+            assert_eq!(label, Some(kind.label()), "{id}");
+        }
+        for query in ["Grok Build", "grok", "Hermes Agent", "hermes"] {
+            let id = if query.to_lowercase().starts_with("grok") {
+                "settings-agent-grok"
+            } else {
+                "settings-agent-hermes"
+            };
+            assert!(
+                search(query, "Wayland")
+                    .iter()
+                    .any(|r| r.setting == Some(id)),
+                "{query}"
+            );
+        }
     }
 }

@@ -427,6 +427,11 @@ impl Client {
     fn permissions(&self, request: &Request) -> Value {
         let mut rules = if request.settings.access == AccessMode::FullAccess {
             vec![("*", "allow")]
+        } else if request.settings.access == AccessMode::AgentDefault {
+            // OpenCode's own configuration decides everything else. Its question tool is kept
+            // allowed: it only asks the user something and is not an action needing approval,
+            // and without the rule OpenCode would put a permission prompt in front of it.
+            vec![("question", "allow")]
         } else {
             vec![("*", "ask"), ("question", "allow")]
         };
