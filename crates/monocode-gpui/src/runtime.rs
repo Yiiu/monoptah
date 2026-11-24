@@ -710,8 +710,11 @@ fn run_turn_using(
                 shlex_quote(&cli.to_string_lossy())
             );
         }
-        // A plain local session (no Operator, no Mono) can still read the project's terminals.
+        // A plain local session (no Operator, no Mono) can still read the project's terminals,
+        // where the system lets the app tell what runs in them. On Windows `terminals.list`
+        // gives such a session nothing, so the line would only send the agent to a dead end.
         if !raw_native_command
+            && crate::shell::SESSIONS_CAN_READ_TERMINALS
             && !settings.operator_enabled
             && settings.mono.is_none()
             && !summary.cwd.starts_with("remote://")
