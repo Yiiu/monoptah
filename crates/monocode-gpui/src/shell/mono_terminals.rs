@@ -235,7 +235,9 @@ fn folder_allowed(project: &str, cwd: &str) -> bool {
 /// Whether the system can tell what runs in a terminal and where. Where it cannot (Windows),
 /// an agent CLI cannot be recognised, so a terminal the user opened is never listed or read,
 /// and a write is judged by the folder the terminal started in.
-const CAN_INSPECT: bool = cfg!(unix);
+/// A coding session can read terminals only here: elsewhere it has none to read (see
+/// `readable_origin`), so it is not told it can.
+pub(crate) const CAN_INSPECT: bool = cfg!(unix);
 
 const CANNOT_TELL: &str = "Mono cannot tell where this terminal is right now (a process holding it hides its folder or the lookup failed), so it does not type into it. Close it and open a new one with terminals.open";
 const AGENT_WRITE: &str = "This terminal runs, or ran, an agent CLI; Mono never types into those";

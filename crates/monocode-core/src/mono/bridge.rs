@@ -273,19 +273,32 @@ pub fn client(args: &[String]) -> Result<Value, String> {
     call(action, input, request_id)
 }
 
+/// Why the app cannot be reached when `key` is not in this process's environment. The
+/// variables reach only processes the app started for an agent; a shell that drops them (such
+/// as Codex with `shell_environment_policy.inherit = "core"`) gets this instead of a guess.
+fn missing_env(key: &str) -> String {
+    format!(
+        "Monoptah app access is unavailable: {key} is not set in this process. App actions \
+         work only from a process Monoptah started for an agent session with app access, \
+         and a shell that does not inherit that process's environment (for example Codex with \
+         shell_environment_policy.inherit = \"core\") cannot reach the app."
+    )
+}
+
 /// One authenticated request to the running app, with the capability this
 /// provider process inherited.
 fn call(action: String, input: Value, request_id: String) -> Result<Value, String> {
     let endpoint: SocketAddr = std::env::var("MONOCODE_APP_ENDPOINT")
-        .map_err(|_| "App access is unavailable outside a Mono's provider process")?
+        .map_err(|_| missing_env("MONOCODE_APP_ENDPOINT"))?
         .parse()
         .map_err(|_| "Invalid app endpoint")?;
     if !endpoint.ip().is_loopback() {
         return Err("App access requires a local endpoint".into());
     }
-    let token = std::env::var("MONOCODE_APP_TOKEN").map_err(|_| "App capability missing")?;
+    let token =
+        std::env::var("MONOCODE_APP_TOKEN").map_err(|_| missing_env("MONOCODE_APP_TOKEN"))?;
     let session = std::env::var("MONOCODE_APP_SESSION")
-        .map_err(|_| "App session missing")?
+        .map_err(|_| missing_env("MONOCODE_APP_SESSION"))?
         .parse()
         .map_err(|_| "Invalid app session")?;
     let wire = Wire {
@@ -478,6 +491,16 @@ pub fn mcp_stdio() -> Result<(), String> {
 #[cfg(test)]
 mod capability_tests {
     use super::*;
+    #[test]
+    fn a_missing_app_variable_is_named_instead_of_blaming_the_process() {
+        let message = missing_env("MONOCODE_APP_ENDPOINT");
+        assert!(
+            message.contains("MONOCODE_APP_ENDPOINT is not set"),
+            "{message}"
+        );
+        assert!(message.contains("shell_environment_policy"), "{message}");
+        assert!(!message.contains("outside a Mono"), "{message}");
+    }
     fn send(
         server: &Server,
         session: i64,

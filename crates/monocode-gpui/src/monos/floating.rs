@@ -308,8 +308,9 @@ impl Floating {
             )
     }
     /// A file chip or link in this panel's chat. The panel is small and floats over other apps,
-    /// so the file opens in the workspace window, which comes forward for it.
-    fn preview_path(&mut self, raw: &str, cx: &mut Context<Self>) {
+    /// so the file opens in the workspace window, which comes forward for it: in the editor for
+    /// a click (`editor`), in the in-app preview for the link menu's "Preview".
+    fn preview_path(&mut self, raw: &str, editor: bool, cx: &mut Context<Self>) {
         let owner = self.owner.read(cx);
         let (Some(parent), Some(shell)) = (owner.parent_window, owner.owner.upgrade()) else {
             return;
@@ -342,7 +343,11 @@ impl Floating {
                 // Already resolved against the Mono's own projects: not a link of the active
                 // cloud session's transcript, so no cloud lookup.
                 shell.update(cx, |shell, cx| {
-                    shell.preview_local_path(&target, window, cx)
+                    if editor {
+                        shell.open_local_path(&target, window, cx)
+                    } else {
+                        shell.preview_local_path(&target, window, cx)
+                    }
                 });
             });
         });
@@ -385,7 +390,12 @@ impl gpui::Render for Floating {
             .font_family(crate::fonts::UI)
             .on_action(
                 cx.listener(|this, event: &crate::file_preview::PreviewPath, _, cx| {
-                    this.preview_path(&event.0, cx)
+                    this.preview_path(&event.0, false, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, event: &crate::file_editor::OpenPath, _, cx| {
+                    this.preview_path(&event.0, true, cx)
                 }),
             )
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
@@ -707,7 +717,7 @@ mod tests {
         // The panel has no file viewer of its own: the click is forwarded to the workspace.
         floating
             .update(cx, |view, _, cx| {
-                view.preview_path(&report.to_string_lossy(), cx)
+                view.preview_path(&report.to_string_lossy(), false, cx)
             })
             .unwrap();
         cx.run_until_parked();
@@ -717,5 +727,57 @@ mod tests {
             .unwrap();
         assert_eq!(shown.as_deref(), Some(report.as_path()));
         let _ = std::fs::remove_file(report);
+    }
+
+    // Monoptah: a click (`OpenPath`) in the floating chat opens the file in the workspace
+    // window's editor, not the preview.
+    #[gpui::test]
+    fn a_file_click_in_the_floating_chat_opens_the_editor_in_the_workspace_window(
+        cx: &mut TestAppContext,
+    ) {
+        let s = setup(cx);
+        // Outside the project, so opening it starts no project watcher in this test.
+        let dir = std::env::temp_dir().join(format!(
+            "monoptah-floating-open-{}",
+            monocode_core::mono::new_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let report = dir.join("notes.md");
+        std::fs::write(&report, "# Notes").unwrap();
+        let visual = &mut VisualTestContext::from_window(s.window.into(), cx);
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        cx.update(|cx| {
+            s.manager
+                .update(cx, |m, cx| m.open_floating(s.id.clone(), cx))
+        });
+        cx.run_until_parked();
+        let floating = cx.update(|cx| {
+            s.manager.read(cx).floating[0]
+                .downcast::<Floating>()
+                .unwrap()
+        });
+        floating
+            .update(cx, |_, window, cx| {
+                window.dispatch_action(
+                    Box::new(crate::file_editor::OpenPath(
+                        report.to_string_lossy().into_owned(),
+                    )),
+                    cx,
+                );
+            })
+            .unwrap();
+        cx.run_until_parked();
+        s.window
+            .update(cx, |shell, _, cx| {
+                assert!(
+                    shell.document_preview_path(cx).is_none(),
+                    "no preview popup"
+                );
+                let path = shell.active_editor_path(cx).expect("the editor is open");
+                assert!(path.ends_with("notes.md"), "{path}");
+            })
+            .unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -102,6 +102,14 @@ impl Shell {
         }
     }
 
+    /// The file the active editor shows, for tests in other modules.
+    #[cfg(test)]
+    pub(crate) fn active_editor_path(&mut self, cx: &mut Context<Self>) -> Option<String> {
+        let review = self.active_review(cx)?;
+        let editor = review.read(cx).active_editor()?;
+        Some(editor.read(cx).path.clone())
+    }
+
     /// The file the document lightbox shows, for tests in other modules.
     #[cfg(test)]
     pub(crate) fn document_preview_path(&self, cx: &App) -> Option<PathBuf> {
@@ -169,6 +177,38 @@ impl Shell {
             return;
         }
         self.preview_local_path(raw, window, cx);
+    }
+
+    /// Opens a file a floating Mono forwarded, already resolved against its own projects, in
+    /// the editor: the `OpenPath` counterpart of [`Shell::preview_local_path`].
+    pub(crate) fn open_local_path(
+        &mut self,
+        raw: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_or_preview(raw, window, cx);
+    }
+
+    /// A file link clicked in a chat (Monoptah opens it in the editor, not the preview). With no
+    /// session in the project to open the editor beside, the file is shown as
+    /// [`Shell::preview_local_path`] shows it instead of being refused; a file the preview cannot
+    /// show still asks for a chat first.
+    pub(super) fn open_or_preview(
+        &mut self,
+        raw: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (cwd, path, location) = self.link_target(raw, cx);
+        let apart = self.mono_active(cx) || self.active_app_view.is_some();
+        if self.workspace.active.is_none() && !self.borrow_file_owner(apart, window, cx) {
+            // The preview has no lines to go to, and a located document would be routed back
+            // to the editor: preview the file itself.
+            self.preview_local_path(&path, window, cx);
+            return;
+        }
+        self.open_file_at(cwd, path, location, window, cx);
     }
 
     /// [`Shell::preview_path`] for a link that is known to name a file of this machine: one a

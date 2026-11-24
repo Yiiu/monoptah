@@ -70,6 +70,7 @@ impl Target {
                 };
                 let mut items = vec![
                     MenuAction::new("open-monocode", "Open in Monoptah").into(),
+                    MenuAction::new("preview", "Preview").into(),
                     MenuAction::new("open-default", "Open in Default App").into(),
                     MenuAction::new("reveal", reveal).into(),
                     MenuItem::Separator,
@@ -200,6 +201,13 @@ impl TranscriptView {
                     |(line, column)| format!("{path}:{line}:{column}"),
                 );
                 window.dispatch_action(Box::new(crate::file_editor::OpenPath(target)), cx);
+            }
+            ("preview", Target::File { path, location, .. }) => {
+                let target = location.map_or_else(
+                    || path.clone(),
+                    |(line, column)| format!("{path}:{line}:{column}"),
+                );
+                window.dispatch_action(Box::new(crate::file_preview::PreviewPath(target)), cx);
             }
             ("copy-path", Target::File { path, .. }) => {
                 cx.write_to_clipboard(ClipboardItem::new_string(path.clone()))
@@ -355,5 +363,58 @@ mod tests {
             std::fs::remove_dir_all(home),
             std::fs::remove_dir_all(project),
         );
+    }
+}
+
+#[cfg(test)]
+mod menu_tests {
+    use super::*;
+    use crate::file_preview::PreviewPath;
+    use gpui::{TestAppContext, point, size};
+    use std::{cell::RefCell, rc::Rc};
+
+    // Monoptah: a click opens a file link in the editor, so the in-app preview lives here.
+    #[gpui::test]
+    fn the_file_link_menu_offers_a_preview_that_keeps_the_line(cx: &mut TestAppContext) {
+        let target = Target::File {
+            path: "/project/docs/plan.md".into(),
+            location: Some((12, 3)),
+            base: Some("/project".into()),
+        };
+        let ids: Vec<String> = target
+            .items()
+            .into_iter()
+            .filter_map(|item| match item {
+                MenuItem::Action(action) => Some(action.id.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids[..2], ["open-monocode", "preview"]);
+
+        let seen = Rc::new(RefCell::new(Vec::<String>::new()));
+        let log = seen.clone();
+        cx.update(|cx| {
+            cx.on_action(move |preview: &PreviewPath, _| log.borrow_mut().push(preview.0.clone()));
+        });
+        let window = cx.update(|cx| {
+            cx.open_window(
+                gpui::WindowOptions {
+                    window_bounds: Some(gpui::WindowBounds::Windowed(Bounds::new(
+                        point(px(0.), px(0.)),
+                        size(px(400.), px(300.)),
+                    ))),
+                    ..Default::default()
+                },
+                |_, cx| cx.new(|cx| TranscriptView::document_in("x".into(), None, cx)),
+            )
+            .unwrap()
+        });
+        window
+            .update(cx, |view, window, cx| {
+                view.run_link_action("preview", &target, window, cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(*seen.borrow(), ["/project/docs/plan.md:12:3"]);
     }
 }

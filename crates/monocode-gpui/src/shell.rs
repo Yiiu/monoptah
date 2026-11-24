@@ -67,6 +67,7 @@ mod project_removal;
 pub(crate) use project_removal::FilesOutcome;
 mod cloud_workspaces;
 mod mono_terminals;
+pub(crate) use mono_terminals::CAN_INSPECT as SESSIONS_CAN_READ_TERMINALS;
 mod project_cloud;
 mod project_settings;
 mod provider_prompt;
@@ -9848,8 +9849,7 @@ impl Render for Shell {
                     if this.open_cloud_path(&event.0, window, cx) {
                         return;
                     }
-                    let (cwd, path, location) = this.link_target(&event.0, cx);
-                    this.open_file_at(cwd, path, location, window, cx);
+                    this.open_or_preview(&event.0, window, cx);
                 }),
             )
             .on_action(cx.listener(

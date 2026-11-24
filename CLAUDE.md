@@ -159,6 +159,19 @@ relinks the large `monocode-gpui` test binary (median 1.4 min, p90 4.1 min).
   such as `dckr_pat_...` in test sources. Build fake tokens with `concat!` or use obviously
   fake values.
 
+## Trellis
+
+The repo uses [Trellis](https://github.com/mindfold-ai/Trellis) (`.trellis/`) for task
+planning and spec context, wired into Claude Code (`.claude/settings.json`, `.claude/hooks/`)
+and Codex (`.codex/`, `.agents/`). Keep these true when re-running `trellis init` or
+`trellis update`:
+
+- Hook commands run `node scripts/trellis-python.mjs <hook>.py`, never `python` or `python3`
+  directly: Trellis writes whichever name fits the machine that ran `init`, which breaks on the
+  other platforms (macOS has no `python`, Windows' `python3` is often a Store stub). Set
+  `TRELLIS_PYTHON` to force an interpreter.
+- `.trellis/config.yaml` keeps `session_auto_commit: false`, so Trellis never commits to `main`.
+
 ## Cleaning up worktrees
 
 When a session created a PR and that PR is merged, the agent cleans up after itself: its
