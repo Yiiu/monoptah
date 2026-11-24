@@ -406,6 +406,22 @@ fn open_path_with_no_session_to_attach_to_previews_the_document(cx: &mut TestApp
                 Some(doc.as_path())
             );
             assert!(shell.error.is_none(), "{:?}", shell.error);
+            shell.document_lightbox = None;
+            // A located link to it is previewed too, not routed back to the editor.
+            w.dispatch_action(
+                Box::new(crate::file_editor::OpenPath(format!("{}:2:1", text(&doc)))),
+                cx,
+            );
+        })
+        .unwrap();
+    visual.run_until_parked();
+    window
+        .update(&mut visual, |shell, w, cx| {
+            assert_eq!(
+                shell.document_preview_path(cx).as_deref(),
+                Some(doc.as_path())
+            );
+            assert!(shell.error.is_none(), "{:?}", shell.error);
             // Source has no preview: it still needs a chat to open beside.
             w.dispatch_action(Box::new(crate::file_editor::OpenPath(text(&source))), cx);
         })

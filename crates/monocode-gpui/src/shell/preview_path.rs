@@ -203,7 +203,9 @@ impl Shell {
         let (cwd, path, location) = self.link_target(raw, cx);
         let apart = self.mono_active(cx) || self.active_app_view.is_some();
         if self.workspace.active.is_none() && !self.borrow_file_owner(apart, window, cx) {
-            self.preview_local_path(raw, window, cx);
+            // The preview has no lines to go to, and a located document would be routed back
+            // to the editor: preview the file itself.
+            self.preview_local_path(&path, window, cx);
             return;
         }
         self.open_file_at(cwd, path, location, window, cx);
