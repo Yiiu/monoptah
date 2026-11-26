@@ -33,32 +33,45 @@ pub(super) fn start_writer(store: Database, cx: &App) -> async_channel::Sender<W
         .spawn(async move {
             while let Ok(write) = pending.recv().await {
                 let save = || {
-                    locked(&store).and_then(|store| match &write {
-                        Write::Begin(id, at) => store.begin_session_turn(*id, *at),
-                        Write::Finish(id, started, end, summary) => store
-                            .finish_session_turn_with_summary(*id, *started, *end, Some(summary)),
-                        Write::Summary(id, end, summary) => store
-                            .update_progress_summary(*id, *end, summary)
-                            .map(|_| ()),
-                        Write::ArchivedWorktree(id, evidence) => {
-                            store.remember_worktree_archive(*id, evidence)
-                        }
-                        Write::Seen(id, end, at) => store.see_session_turn(*id, *end, *at),
-                        Write::Flush(done) => {
-                            let _ = done.try_send(());
-                            Ok(())
+                    locked(&store).and_then(|store| {
+                        let save = || match &write {
+                            Write::Begin(id, at) => store.begin_session_turn(*id, *at),
+                            Write::Finish(id, started, end, summary) => store
+                                .finish_session_turn_with_summary(
+                                    *id,
+                                    *started,
+                                    *end,
+                                    Some(summary),
+                                ),
+                            Write::Summary(id, end, summary) => store
+                                .update_progress_summary(*id, *end, summary)
+                                .map(|_| ()),
+                            Write::ArchivedWorktree(id, evidence) => {
+                                store.remember_worktree_archive(*id, evidence)
+                            }
+                            Write::Seen(id, end, at) => store.see_session_turn(*id, *end, *at),
+                            Write::Flush(done) => {
+                                let _ = done.try_send(());
+                                Ok(())
+                            }
+                        };
+                        match save() {
+                            Err(error)
+                                if error.contains("no such table: session_activity")
+                                    || error.contains("no such column")
+                                    || error.contains("table session_activity has no column") =>
+                            {
+                                if store.repair_session_activity(now_ms())? {
+                                    save()
+                                } else {
+                                    Err(error)
+                                }
+                            }
+                            result => result,
                         }
                     })
                 };
                 let mut result = save();
-                if result
-                    .as_ref()
-                    .is_err_and(|e| e.contains("no such table: session_activity"))
-                {
-                    result = locked(&store)
-                        .and_then(|store| store.restore_session_activity(now_ms()))
-                        .and_then(|_| save());
-                }
                 for delay in [50, 150, 350] {
                     if !result
                         .as_ref()

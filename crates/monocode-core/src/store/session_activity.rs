@@ -1,8 +1,23 @@
 //! Durable native turn receipts. The shared Desktop database remains untouched.
 use super::{shared, SessionLocation, Store};
 use crate::agent_status::{Outcome, TurnEnd};
-use rusqlite::{params, Connection, Transaction, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use std::collections::HashMap;
+
+const BACKFILL_KEY: &str = "session_activity_backfilled_at";
+const ACTIVITY_SCHEMA: &str = "(
+    session_id TEXT PRIMARY KEY NOT NULL,
+    turn_started_at INTEGER,
+    owner_pid INTEGER,
+    owner_started TEXT,
+    turn_ended_at INTEGER,
+    outcome TEXT,
+    seen_at INTEGER,
+    progress_summary TEXT,
+    auto_archive_key TEXT
+)";
+const ACTIVITY_COLUMNS: &str = "session_id,turn_started_at,owner_pid,owner_started,
+    turn_ended_at,outcome,seen_at,progress_summary,auto_archive_key";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SessionActivity {
@@ -31,22 +46,24 @@ impl Store {
             conn,
             TransactionBehavior::Immediate,
         ))?;
-        let migrate = !shared::has_table(&tx, "session_activity")?;
-        let sessions = self.session_activity_sessions(migrate)?;
-        if migrate {
-            sql(tx.execute_batch(
-                "CREATE TABLE session_activity (
-                    session_id TEXT PRIMARY KEY NOT NULL,
-                    turn_started_at INTEGER,
-                    owner_pid INTEGER,
-                    owner_started TEXT,
-                    turn_ended_at INTEGER,
-                    outcome TEXT,
-                    seen_at INTEGER,
-                    progress_summary TEXT,
-                    auto_archive_key TEXT
-                );",
-            ))?;
+        let existed = shared::has_table(&tx, "session_activity")?;
+        let recreated = !activity_schema_intact(&tx)?;
+        let had_recovery = shared::has_table(&tx, "session_activity_recovery")?;
+        sql(tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS native_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+        ))?;
+        let backfilled = activity_backfilled_at(&tx)?.is_some();
+        let backfill = !existed && !backfilled && !had_recovery;
+        let sessions = self.session_activity_sessions(backfill)?;
+        if recreated {
+            sql(tx.execute_batch(&format!(
+                "DROP TABLE IF EXISTS session_activity;
+                 CREATE TABLE session_activity {ACTIVITY_SCHEMA};"
+            )))?;
+        } else {
+            add_activity_fields(&tx)?;
+        }
+        if backfill {
             let mut insert = sql(tx.prepare(
                 "INSERT INTO session_activity(session_id,turn_ended_at,outcome,seen_at)
                  VALUES(?1,?2,?3,?4)",
@@ -60,26 +77,21 @@ impl Store {
                     sql_timestamp(now),
                 ]))?;
             }
-        } else {
-            for (column, migrate) in [
-                (
-                    "progress_summary",
-                    "ALTER TABLE session_activity ADD COLUMN progress_summary TEXT",
-                ),
-                (
-                    "auto_archive_key",
-                    "ALTER TABLE session_activity ADD COLUMN auto_archive_key TEXT",
-                ),
-            ] {
-                let present = sql(tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('session_activity') WHERE name=?1)",
-                    [column],
-                    |row| row.get::<_, bool>(0),
-                ))?;
-                if !present {
-                    sql(tx.execute(migrate, []))?;
-                }
-            }
+        }
+        if !backfilled {
+            sql(tx.execute(
+                "INSERT INTO native_settings(key,value) VALUES(?1,?2)",
+                params![BACKFILL_KEY, now.to_string()],
+            ))?;
+        }
+        if recreated && had_recovery {
+            sql(tx.execute_batch(&format!(
+                "INSERT INTO session_activity ({ACTIVITY_COLUMNS})
+                 SELECT {ACTIVITY_COLUMNS} FROM session_activity_recovery;"
+            )))?;
+        }
+        if !had_recovery || recreated {
+            install_activity_recovery(&tx, had_recovery)?;
         }
         self.recover_session_turns(&tx, &sessions, now)?;
 
@@ -112,6 +124,27 @@ impl Store {
         }
         sql(tx.commit())?;
         Ok(result)
+    }
+
+    /// Recreate a missing or incomplete table before retrying the failed write.
+    pub fn repair_session_activity(&self, now: u64) -> Result<bool, String> {
+        let conn = self.session_activity_db()?;
+        if activity_schema_intact(conn)?
+            && activity_has_column(conn, "progress_summary")?
+            && activity_has_column(conn, "auto_archive_key")?
+        {
+            return Ok(false);
+        }
+        self.restore_session_activity(now)?;
+        Ok(true)
+    }
+
+    pub fn session_activity_backfilled_at(&self) -> Result<Option<u64>, String> {
+        let conn = self.session_activity_db()?;
+        if !shared::has_table(conn, "native_settings")? {
+            return Ok(None);
+        }
+        activity_backfilled_at(conn)
     }
 
     /// The caller owns a local turn. Opening a terminal or mirroring a remote
@@ -325,6 +358,12 @@ impl Store {
         if shared::has_table(conn, "session_activity")? {
             sql(conn.execute("DELETE FROM session_activity WHERE session_id=?1", [key]))?;
         }
+        if shared::has_table(conn, "session_activity_recovery")? {
+            sql(conn.execute(
+                "DELETE FROM session_activity_recovery WHERE session_id=?1",
+                [key],
+            ))?;
+        }
         Ok(())
     }
 
@@ -380,6 +419,76 @@ impl Store {
         }
         Ok(())
     }
+}
+
+fn activity_schema_intact(conn: &Connection) -> Result<bool, String> {
+    sql(conn.query_row(
+        "SELECT count(*) = 7 FROM pragma_table_info('session_activity')
+         WHERE name IN ('session_id','turn_started_at','owner_pid','owner_started',
+                        'turn_ended_at','outcome','seen_at')",
+        [],
+        |row| row.get(0),
+    ))
+}
+
+fn add_activity_fields(tx: &Transaction<'_>) -> Result<(), String> {
+    for column in ["progress_summary", "auto_archive_key"] {
+        if !activity_has_column(tx, column)? {
+            sql(tx.execute(
+                &format!("ALTER TABLE session_activity ADD COLUMN {column} TEXT"),
+                [],
+            ))?;
+        }
+    }
+    Ok(())
+}
+
+fn activity_has_column(conn: &Connection, column: &str) -> Result<bool, String> {
+    sql(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('session_activity') WHERE name=?1)",
+        [column],
+        |row| row.get(0),
+    ))
+}
+
+fn activity_backfilled_at(conn: &Connection) -> Result<Option<u64>, String> {
+    let value: Option<String> = sql(conn
+        .query_row(
+            "SELECT value FROM native_settings WHERE key=?1",
+            [BACKFILL_KEY],
+            |row| row.get(0),
+        )
+        .optional())?;
+    value
+        .map(|at| at.parse::<u64>().map_err(|error| error.to_string()))
+        .transpose()
+}
+
+fn install_activity_recovery(tx: &Transaction<'_>, existed: bool) -> Result<(), String> {
+    // Keep one authoritative recovery row per session. A live repair must
+    // retain the owner, read watermarks and summaries the Shell already uses.
+    // Triggers keep the copy atomic with all ordinary writes and deletion.
+    if !existed {
+        sql(tx.execute_batch(&format!(
+            "CREATE TABLE session_activity_recovery {ACTIVITY_SCHEMA};
+             INSERT INTO session_activity_recovery ({ACTIVITY_COLUMNS})
+             SELECT {ACTIVITY_COLUMNS} FROM session_activity;"
+        )))?;
+    }
+    for (name, event) in [("insert", "INSERT"), ("update", "UPDATE")] {
+        sql(tx.execute_batch(&format!(
+            "CREATE TRIGGER IF NOT EXISTS session_activity_recovery_{name} AFTER {event} ON session_activity
+             BEGIN
+                DELETE FROM session_activity_recovery WHERE session_id=NEW.session_id;
+                INSERT INTO session_activity_recovery ({ACTIVITY_COLUMNS})
+                SELECT {ACTIVITY_COLUMNS} FROM session_activity WHERE session_id=NEW.session_id;
+             END;"
+        )))?;
+    }
+    sql(tx.execute_batch(
+        "CREATE TRIGGER IF NOT EXISTS session_activity_recovery_delete AFTER DELETE ON session_activity
+         BEGIN DELETE FROM session_activity_recovery WHERE session_id=OLD.session_id; END;",
+    ))
 }
 
 fn sql<T>(result: rusqlite::Result<T>) -> Result<T, String> {
