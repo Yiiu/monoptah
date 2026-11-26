@@ -8,6 +8,7 @@ use monocode_core::{
     worktree_management,
 };
 use std::{
+    collections::VecDeque,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -19,8 +20,42 @@ use std::{
 const GENERATION_LIMIT: usize = 4;
 const GENERATION_TIME: Duration = Duration::from_secs(20);
 
-pub(super) struct Job {
+struct Job {
     cancel: Arc<AtomicBool>,
+}
+
+#[derive(Default)]
+pub(super) struct Jobs {
+    running: HashMap<i64, Job>,
+    pending: VecDeque<PendingSummary>,
+}
+
+impl Jobs {
+    pub(super) fn cancel(&mut self, id: i64) {
+        self.pending.retain(|job| job.id != id);
+        if let Some(job) = self.running.get(&id) {
+            // A cancelled worker keeps its slot until it actually exits.
+            job.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn next(&mut self) -> Option<PendingSummary> {
+        if self.running.len() >= GENERATION_LIMIT
+            || self
+                .pending
+                .front()
+                .is_some_and(|job| self.running.contains_key(&job.id))
+        {
+            return None;
+        }
+        self.pending.pop_front()
+    }
+}
+
+struct PendingSummary {
+    id: i64,
+    ended_at: u64,
+    request: SummaryRequest,
 }
 
 impl Drop for Job {
@@ -33,10 +68,19 @@ pub(super) struct SummaryRequest {
     input: String,
     model: TextModel,
     cwd: PathBuf,
+    #[cfg(test)]
+    test_summary: Option<String>,
 }
 
 impl SummaryRequest {
     fn generate(self, cancel: Arc<AtomicBool>) -> Option<String> {
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        #[cfg(test)]
+        if let Some(summary) = self.test_summary {
+            return Some(summary);
+        }
         let binary = provider::resolve(self.model.kind)?;
         let prompt = format!(
             "Write one short progress line for a session sidebar. Describe the concrete outcome \
@@ -100,6 +144,8 @@ pub(super) fn completed_progress(
                 input: input.chars().take(2_000).collect(),
                 model,
                 cwd: chat.execution_cwd().into(),
+                #[cfg(test)]
+                test_summary: None,
             }
         });
     (fallback, request)
@@ -119,43 +165,67 @@ impl Shell {
         request: SummaryRequest,
         cx: &mut Context<Self>,
     ) {
-        if self.progress_summary_jobs.len() >= GENERATION_LIMIT {
-            return;
+        self.progress_summary_jobs.cancel(id);
+        self.progress_summary_jobs
+            .pending
+            .push_back(PendingSummary {
+                id,
+                ended_at,
+                request,
+            });
+        self.start_progress_summaries(cx);
+    }
+
+    fn start_progress_summaries(&mut self, cx: &mut Context<Self>) {
+        while let Some(pending) = self.progress_summary_jobs.next() {
+            if self
+                .session_activity
+                .get(&pending.id)
+                .is_some_and(|receipt| {
+                    receipt
+                        .last_turn
+                        .is_some_and(|turn| turn.at == pending.ended_at)
+                })
+            {
+                self.start_progress_summary(pending, cx);
+            }
         }
+    }
+
+    fn start_progress_summary(
+        &mut self,
+        PendingSummary {
+            id,
+            ended_at,
+            request,
+        }: PendingSummary,
+        cx: &mut Context<Self>,
+    ) {
         let cancel = Arc::new(AtomicBool::new(false));
-        self.progress_summary_jobs.insert(
+        self.progress_summary_jobs.running.insert(
             id,
             Job {
                 cancel: cancel.clone(),
             },
         );
-        let (output, receive) = async_channel::bounded(1);
         let worker_cancel = cancel.clone();
-        let worker = {
-            let output = output.clone();
-            cx.background_executor().spawn(async move {
-                let _ = output.try_send(request.generate(worker_cancel));
-            })
-        };
+        let worker = cx
+            .background_executor()
+            .spawn(async move { request.generate(worker_cancel) });
         let timeout = cx.background_executor().timer(GENERATION_TIME);
+        let timeout_cancel = cancel.clone();
         let deadline = cx.background_executor().spawn(async move {
             timeout.await;
-            let _ = output.try_send(None);
+            timeout_cancel.store(true, Ordering::Relaxed);
         });
         cx.spawn(async move |shell, cx| {
-            let generated = receive.recv().await.ok().flatten();
+            let generated = worker.await;
             drop(deadline);
-            drop(worker);
             let _ = shell.update(cx, |this, cx| {
-                if !this
-                    .progress_summary_jobs
-                    .get(&id)
-                    .is_some_and(|job| Arc::ptr_eq(&cancel, &job.cancel))
-                {
-                    return;
-                }
-                this.progress_summary_jobs.remove(&id);
-                if let Some(summary) = generated
+                let accepted = !cancel.load(Ordering::Relaxed);
+                this.progress_summary_jobs.running.remove(&id);
+                if accepted
+                    && let Some(summary) = generated
                     && let Some(receipt) = this.session_activity.get_mut(&id)
                     && receipt.last_turn.is_some_and(|turn| turn.at == ended_at)
                 {
@@ -166,9 +236,96 @@ impl Shell {
                     this.notify_sidebar(cx);
                     cx.notify();
                 }
+                this.start_progress_summaries(cx);
             });
         })
         .detach();
+    }
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+    use gpui::TestAppContext;
+    use monocode_core::agent_status::TurnEnd;
+
+    #[gpui::test]
+    fn all_six_completed_turns_get_a_model_summary_at_a_limit_of_four(cx: &mut TestAppContext) {
+        let (window, _, _) = crate::shell::tests::window(cx);
+        let ids = window
+            .update(cx, |shell, _, cx| {
+                let mut ids = Vec::new();
+                for item in 0..6 {
+                    let end = TurnEnd {
+                        at: 1_000 + item,
+                        outcome: Outcome::Completed,
+                    };
+                    let summary = "Fallback";
+                    let id = {
+                        let store = locked(&shell.store).unwrap();
+                        let id = store.create("claude", "/repo").unwrap().id;
+                        store
+                            .finish_session_turn_with_summary(id, end.at - 1, end, Some(summary))
+                            .unwrap();
+                        id
+                    };
+                    shell.session_activity.insert(
+                        id,
+                        monocode_core::store::SessionActivity {
+                            last_turn: Some(end),
+                            progress_summary: Some(summary.into()),
+                            ..Default::default()
+                        },
+                    );
+                    shell.queue_progress_summary(
+                        id,
+                        end.at,
+                        SummaryRequest {
+                            input: summary.into(),
+                            model: TextModel::automatic(provider::Kind::Claude, Default::default()),
+                            cwd: "/repo".into(),
+                            test_summary: Some(format!("Generated {item}")),
+                        },
+                        cx,
+                    );
+                    ids.push(id);
+                }
+                assert!(
+                    ids.iter()
+                        .all(|&id| shell.progress_summary(id) == Some("Fallback"))
+                );
+                assert_eq!(shell.progress_summary_jobs.running.len(), 4);
+                assert_eq!(
+                    shell
+                        .progress_summary_jobs
+                        .pending
+                        .iter()
+                        .map(|job| job.id)
+                        .collect::<Vec<_>>(),
+                    ids[4..]
+                );
+                ids
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, _| {
+                let saved = locked(&shell.store)
+                    .unwrap()
+                    .restore_session_activity(2_000)
+                    .unwrap();
+                for (index, id) in ids.into_iter().enumerate() {
+                    let expected = format!("Generated {index}");
+                    assert_eq!(shell.progress_summary(id), Some(expected.as_str()));
+                    assert_eq!(
+                        saved[&id].progress_summary.as_deref(),
+                        Some(expected.as_str())
+                    );
+                }
+                assert!(shell.progress_summary_jobs.running.is_empty());
+                assert!(shell.progress_summary_jobs.pending.is_empty());
+            })
+            .unwrap();
     }
 }
 

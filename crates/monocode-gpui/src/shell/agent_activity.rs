@@ -119,7 +119,7 @@ impl Shell {
         self.status_timing.remove(&id);
         self.session_activity.remove(&id);
         self.busy_sessions.remove(&id);
-        self.progress_summary_jobs.remove(&id);
+        self.progress_summary_jobs.cancel(id);
     }
 
     pub(super) fn status_tick_delay(&self, now: u64) -> Option<std::time::Duration> {
@@ -231,7 +231,7 @@ impl Shell {
                     .last_turn
                     .map_or(now, |end| now.max(end.at.saturating_add(1)));
                 timing.active_turn = Some(at);
-                self.progress_summary_jobs.remove(&id);
+                self.progress_summary_jobs.cancel(id);
                 if local {
                     let _ = self.activity_writes.try_send(Write::Begin(id, at));
                 }
