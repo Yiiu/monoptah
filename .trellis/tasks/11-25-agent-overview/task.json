@@ -1,0 +1,32 @@
+{
+  "id": "agent-overview",
+  "name": "agent-overview",
+  "title": "多任务总览：agent 状态与项目树侧边栏",
+  "description": "统一 agent 状态，提供项目树侧边栏，显示 Mono 派出的会话、计划和巡检结果。Windows 系统提醒另行安排。",
+  "status": "in_progress",
+  "dev_type": null,
+  "scope": null,
+  "package": null,
+  "priority": "P2",
+  "creator": "Yiiu",
+  "assignee": "Yiiu",
+  "createdAt": "2026-11-25",
+  "completedAt": null,
+  "branch": "fix/agent-status-core",
+  "base_branch": "main",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [
+    "11-25-agent-status-core",
+    "11-25-project-tree-sidebar",
+    "11-25-mono-dispatch-visibility",
+    "11-25-mono-patrol",
+    "11-25-progress-summary"
+  ],
+  "parent": null,
+  "relatedFiles": [],
+  "notes": "",
+  "meta": {}
+}

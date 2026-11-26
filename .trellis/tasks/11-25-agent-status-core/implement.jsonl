@@ -1,0 +1,12 @@
+{"file":".trellis/tasks/11-25-agent-status-core/research/state-plumbing.md","reason":"Every status consumer with file:line, Claude task frames, persistence, pinned tests"}
+{"file":".trellis/tasks/11-25-agent-status-core/research/windows-attention.md","reason":"Windows toast/badge/flash/sound approach and GPUI APIs"}
+{"file":".trellis/tasks/11-25-agent-status-core/research/orca-status.md","reason":"Reference behaviour for seen rule, stale guards, aggregation"}
+{"file":".trellis/spec/native/index.md","reason":"Native crate rules and quality commands"}
+{"file":".trellis/spec/native/state-and-async.md","reason":"State, persisted values, background work in GPUI"}
+{"file":".trellis/spec/native/directory-structure.md","reason":"Core vs GPUI placement"}
+{"file":".trellis/spec/native/component-guidelines.md","reason":"Sidebar row text, chips, marks"}
+{"file":".trellis/spec/native/testing.md","reason":"Test conventions, Linux portability, macOS gating"}
+{"file":".trellis/spec/core/index.md","reason":"monocode-core rules"}
+{"file":".trellis/spec/core/persistence-and-compat.md","reason":"New table + migration compatibility"}
+{"file":".trellis/spec/core/processes-and-platforms.md","reason":"Provider process handling, platform cfg code"}
+{"file":".trellis/spec/core/testing.md","reason":"Core test conventions"}
