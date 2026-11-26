@@ -137,6 +137,19 @@
 | `11-25-mono-dispatch-visibility` | 第3期：Mono 决策卡 + 派活可见 + 计划清单 | 第1期；派活入树依赖第2期 |
 | `11-25-mono-patrol` | 第4期：Mono 巡检汇总 | 第2b、3期 |
 
+### 后续任务（2026-11-26，PR #22 之后）
+
+审计结果见 `research/audit-tree-summary.md` 和 `research/audit-status-mono.md`。剩下的工作拆成下面 6 个子任务，都在同一分支、同一 PR（#22）里完成，顺序和协作方式见 `handoff.md`。
+
+| 子任务 | 内容 | 依赖 |
+|---|---|---|
+| `11-26-overview-pre-merge-review` | 合并前独立复核：迁移、数据丢失、定时器开销、Mono 部分 | 无，可以最先做 |
+| `11-26-status-perf-correctness` | 状态刷新节流、计时器、终端误报、旧选项卡、迁移重跑、增长上限、摘要排队 | 无 |
+| `11-26-tree-polish` | Needs you 为 0 时的样式、标题统一、分组头、单 worktree 判定、Codespace 入口、worktree「+」、peek 角标 | 无 |
+| `11-26-tree-motion-followups` | 延后收起：切换布局、打开应用页；拖拽边界情况 | tree-polish 合回之后 |
+| `11-26-windows-attention` | Windows 系统通知、角标、闪烁、提示音（原 R6） | 无 |
+| `11-26-overview-test-coverage` | 补测试，实机核对三种外观 | 最后做 |
+
 ## Acceptance Criteria (cross-child)
 
 - [ ] 只挂着 dev server 的会话不再显示 Working；后台任务从列表消失后状态不会卡住。

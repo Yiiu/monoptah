@@ -1,0 +1,8 @@
+{"file":".trellis/tasks/11-25-agent-overview/handoff.md","reason":"Shared branch, build and test rules for every follow-up"}
+{"file":".trellis/tasks/11-25-agent-overview/prd.md","reason":"Parent requirements and principles"}
+{"file":".trellis/spec/native/index.md","reason":"Native crate rules and quality commands"}
+{"file":".trellis/spec/native/testing.md","reason":"Test conventions incl. Windows gotchas"}
+{"file":".trellis/tasks/11-25-agent-overview/research/audit-tree-summary.md","reason":"Source of (a)(b)(c)"}
+{"file":".trellis/tasks/11-25-project-tree-sidebar/design.md","reason":"Tree layout and drag design"}
+{"file":".trellis/spec/native/component-guidelines.md","reason":"Disclosure and motion rules"}
+{"file":".trellis/spec/native/state-and-async.md","reason":"Frame requests and animation state"}
