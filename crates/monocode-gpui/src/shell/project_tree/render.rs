@@ -55,11 +55,7 @@ impl Shell {
             .min_h_0()
             .flex()
             .flex_col()
-            .child(
-                div()
-                    .when(self.peek_open(), |nav| nav.pr(px(34.)))
-                    .child(self.sidebar_navigation(cx)),
-            )
+            .child(self.sidebar_navigation(cx))
             .child(self.tree_request_queue(&self.tree.requests, cx))
             .child(
                 div()
@@ -1204,20 +1200,13 @@ impl Shell {
             .w(px(COLLAPSED_WIDTH))
             .h_full()
             .flex_shrink_0()
-            .bg(shell_fill())
+            // Share the expanded sidebar frame background.
             .flex()
             .flex_col()
             .items_center()
             .gap(px(2.))
             .px(px(5.))
             .pt(px(4.))
-            .border_r_1()
-            .border_color(content(0.08))
-            .child(
-                icon_button("expand-project-tree", "Expand project tree", "sidebar").on_click(
-                    cx.listener(|this, _, window, cx| this.toggle_primary_sidebar(window, cx)),
-                ),
-            )
             .children(navigation)
             .child(div().w_full().h_px().my_1().bg(content(0.08)))
             .child(

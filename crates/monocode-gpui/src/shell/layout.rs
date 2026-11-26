@@ -435,7 +435,7 @@ impl Shell {
                         .h_full()
                         .flex_shrink_0()
                         .overflow_hidden()
-                        .border_r_1()
+                        .when(!self.show_tree_status_bar(), |d| d.border_r_1())
                         .border_color(if original {
                             content(0.07)
                         } else {
@@ -1009,6 +1009,8 @@ mod tests {
         visual.refresh().unwrap();
         assert!(visual.debug_bounds("project-tree-sidebar").is_some());
         assert!(visual.debug_bounds("sidebar-project-button").is_none());
+        let navigation_rows = ["sidebar-navigation-Today", "sidebar-navigation-Inbox"];
+        let docked_widths = navigation_rows.map(|row| visual.debug_bounds(row).unwrap().size.width);
 
         visual.simulate_keystrokes("secondary-b");
         visual.run_until_parked();
@@ -1031,8 +1033,35 @@ mod tests {
             .update(visual, |shell, _, cx| shell.set_peek(true, cx))
             .unwrap();
         visual.refresh().unwrap();
+        let status = visual.debug_bounds("tree-status-bar").unwrap();
+        let peek = visual.debug_bounds("sidebar-peek").expect("open Tree peek");
+        assert_eq!(peek.left(), status.right());
+        let pin = visual.debug_bounds("tree-peek-pin").unwrap();
+        let search = visual.debug_bounds("sidebar-search-field").unwrap();
+        assert!(search.right() < pin.left());
+        assert_eq!(search.center().y, pin.center().y);
+        assert_eq!(
+            navigation_rows.map(|row| visual.debug_bounds(row).unwrap().size.width),
+            docked_widths,
+        );
+        window
+            .update(visual, |shell, _, cx| {
+                shell.workspace.sidebar_search_visible = false;
+                shell.notify_sidebar(cx);
+            })
+            .unwrap();
+        visual.refresh().unwrap();
+        assert!(visual.debug_bounds("sidebar-search-field").is_none());
+        let pin = visual.debug_bounds("tree-peek-pin").unwrap();
+        assert!(visual.debug_bounds(navigation_rows[0]).unwrap().top() >= pin.bottom());
+        assert_eq!(
+            navigation_rows.map(|row| visual.debug_bounds(row).unwrap().size.width),
+            docked_widths,
+        );
+        visual.simulate_mouse_move(status.center(), None, Default::default());
+        visual.executor().advance_clock(Duration::from_millis(500));
+        visual.run_until_parked();
         assert!(visual.debug_bounds("sidebar-peek").is_some());
-        assert!(visual.debug_bounds("tree-peek-pin").is_some());
 
         visual.simulate_keystrokes("secondary-b");
         visual.run_until_parked();

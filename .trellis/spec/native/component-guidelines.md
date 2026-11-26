@@ -93,6 +93,11 @@ fill (`modal::surface`). Do not hand-roll a card.
   footer, `tree-status-settings` in the collapsed bar; test
   `tree_layout_reaches_settings_open_collapsed_and_by_shortcut`). When adding or replacing a
   layout, list the old header/footer/menu actions and map each one before shipping.
+- The collapsed Tree is a borderless 48 px rail on the same sidebar frame background as the
+  expanded Tree. The title bar owns its expand button. Open Peek at the rail's right edge and
+  lay out its pin beside Search, or in a separate header row when Search is hidden. The
+  `tree_uses_the_layout_shortcut_and_retains_a_collapsed_status_bar` regression checks the
+  Peek edge and compares the widths of Today and Inbox with their docked widths.
 - Hover needs an element id: GPUI keeps hover state per id, so a `.hover(..)` on a div without
   `.id(..)` only repaints when something else redraws the view (hover appears "sometimes").
 

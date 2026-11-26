@@ -130,10 +130,25 @@ impl Shell {
         }));
     }
 
-    fn peek_contains(&self, position: Point<Pixels>) -> bool {
+    fn peek_left(&self) -> f32 {
+        if self.workspace.tree_layout() {
+            super::project_tree::COLLAPSED_WIDTH
+        } else {
+            PEEK_INSET
+        }
+    }
+
+    fn peek_area_contains(&self, position: Point<Pixels>) -> bool {
         let (x, y) = (position.x.as_f32(), position.y.as_f32());
-        x >= PEEK_INSET
-            && x <= PEEK_INSET + self.workspace.sidebar_width
+        let panel_left = self.peek_left();
+        // Tree's project buttons and the panel form one hover area.
+        let left = if self.workspace.tree_layout() {
+            0.
+        } else {
+            panel_left
+        };
+        x >= left
+            && x <= panel_left + self.workspace.sidebar_width
             && y >= TITLE_BAR_HEIGHT
             && y <= self.viewport_height - PEEK_INSET
     }
@@ -144,7 +159,7 @@ impl Shell {
         self.peek_toggle_bounds
             .get()
             .is_some_and(|bounds| bounds.contains(&position))
-            || self.peek_contains(position)
+            || self.peek_area_contains(position)
             || self.menu.is_some()
             || self.session_preview.as_ref().is_some_and(|preview| {
                 preview
@@ -242,7 +257,7 @@ impl Shell {
                 .size_full()
                 .child(watch)
                 .child(self.peek_backdrop(progress, cx))
-                .child(self.peek_panel(progress, window, cx))
+                .child(self.peek_panel(progress, window))
                 .into_any_element(),
         )
     }
@@ -259,18 +274,21 @@ impl Shell {
                 ));
         let mut dim: gpui::Hsla = rgba(0x000000ff).into();
         dim.a = if light { 0.18 } else { 0.4 } * progress;
-        div().absolute().top_0().left_0().size_full().bg(dim)
+        let backdrop = div().absolute().right_0().bottom_0().bg(dim);
+        if self.workspace.tree_layout() {
+            backdrop
+                .left(px(self.peek_left()))
+                .top(px(TITLE_BAR_HEIGHT))
+        } else {
+            backdrop.left_0().top_0()
+        }
     }
 
-    fn peek_panel(
-        &self,
-        progress: f32,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> gpui::Stateful<gpui::Div> {
+    fn peek_panel(&self, progress: f32, window: &mut Window) -> gpui::Stateful<gpui::Div> {
         // Tree uses its floating surface in every appearance, including when
         // the rest of the window is glass. The badge rim takes this same fill.
         let tree = self.workspace.tree_layout();
+        let drift = if tree { PEEK_DRIFT } else { -PEEK_DRIFT };
         let glass = !tree && self.window_glass == Some(true) && !is_light();
         // The blur marker carries no alpha for opacity to fade, so the blur
         // itself eases with the panel; at full strength to the last frame it
@@ -294,7 +312,7 @@ impl Shell {
             // Closing, it lets the pointer through to the workspace.
             .when(self.peek_open(), |d| d.occlude())
             .absolute()
-            .left(px(PEEK_INSET - PEEK_DRIFT * (1. - progress)))
+            .left(px(self.peek_left() + drift * (1. - progress)))
             .top(px(TITLE_BAR_HEIGHT))
             .bottom(px(PEEK_INSET))
             .w(px(self.workspace.sidebar_width))
@@ -331,18 +349,6 @@ impl Shell {
                 )
             })
             .child(sidebar)
-            .when(self.workspace.tree_layout() && self.peek_open(), |d| {
-                d.child(
-                    icon_button("tree-peek-pin", "Keep sidebar open", "pin")
-                        .debug_selector(|| "tree-peek-pin".into())
-                        .absolute()
-                        .top(px(8.))
-                        .right(px(8.))
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.toggle_primary_sidebar(window, cx)
-                        })),
-                )
-            })
             // The border rides above the contents, inside the rounding.
             .child(
                 div()
