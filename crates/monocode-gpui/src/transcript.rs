@@ -731,6 +731,9 @@ pub(crate) struct TranscriptView {
     /// The last page read failed; only a scroll retries it.
     history_failed: bool,
     history_search: Option<(usize, String)>,
+    history_prompt: Option<usize>,
+    // A temporary history window should hand off only deliberate user scrolling.
+    history_preview_scrolled: Option<bool>,
     prepared_parsers: HashMap<usize, MarkdownParser>,
     mono: bool,
     /// The Mono's emoji library, for `:emo[..]` tokens in its replies.
@@ -950,6 +953,8 @@ impl TranscriptView {
         self.rebuild(0, cx);
     }
     pub(crate) fn reveal_search(&mut self, row: usize, query: &str, cx: &mut Context<Self>) {
+        self.history_search = None;
+        self.history_prompt = None;
         if row < self.history_start {
             self.history_search = Some((row, query.into()));
             self.list.pause_following_tail();
@@ -2715,6 +2720,8 @@ impl TranscriptView {
             history_pager: None,
             history_failed: false,
             history_search: None,
+            history_prompt: None,
+            history_preview_scrolled: None,
             prepared_parsers: HashMap::new(),
             mono: false,
             emoji: None,
@@ -6186,8 +6193,9 @@ impl TranscriptView {
             .into_any_element()
     }
     fn update_jump(&mut self, cx: &mut Context<Self>) {
-        let show =
-            !self.list.is_following_tail() && self.list.max_offset_for_scrollbar().y > px(1.);
+        let show = self.history_preview_scrolled.is_none()
+            && !self.list.is_following_tail()
+            && self.list.max_offset_for_scrollbar().y > px(1.);
         if self.show_jump != show {
             self.show_jump = show;
             cx.notify();
@@ -6293,6 +6301,9 @@ impl Render for TranscriptView {
                 // Read the final scroll geometry in our trailing layout probe.
                 .set_scroll_handler(cx.listener(|this, _, _, cx| {
                     this.selection.clear();
+                    if let Some(scrolled) = &mut this.history_preview_scrolled {
+                        *scrolled = true;
+                    }
                     this.history_requested =
                         this.history_start > 0 || this.history_before.is_some();
                     cx.notify()
