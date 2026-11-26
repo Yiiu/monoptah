@@ -17,6 +17,8 @@ use gpui::{
 use std::collections::HashMap;
 
 const CARD_RADIUS: f32 = 10.;
+const INSET_PANE_GUTTER: f32 = 6.;
+const TREE_RAIL_FADE_START: f32 = 0.25;
 
 // GPUI overflow clips rectangles. Capture outside the bordered frame so the
 // final mask includes its background, border and children at the outer radius.
@@ -149,7 +151,7 @@ fn panel_button(enabled: bool, dot: bool) -> gpui::Stateful<gpui::Div> {
 
 impl Shell {
     pub(super) fn session_sidebar_width(&self) -> f32 {
-        let collapsed = if self.workspace.tree_layout() && self.settings.is_none() {
+        let collapsed = if self.tree_sidebar_has_rail() {
             super::project_tree::COLLAPSED_WIDTH
         } else {
             0.
@@ -157,8 +159,31 @@ impl Shell {
         collapsed + (self.workspace.sidebar_width - collapsed) * self.sidebar_fraction
     }
 
-    fn show_tree_status_bar(&self) -> bool {
-        self.workspace.tree_layout() && self.settings.is_none() && self.sidebar_fraction == 0.
+    fn tree_sidebar_has_rail(&self) -> bool {
+        self.workspace.tree_layout() && self.settings.is_none()
+    }
+
+    fn tree_rail_layer(&mut self, cx: &mut Context<Self>) -> Option<gpui::Div> {
+        if !self.tree_sidebar_has_rail() || self.sidebar_fraction >= TREE_RAIL_FADE_START {
+            return None;
+        }
+        // Fade in the fixed-width rail while the full-width tree slides behind the clip.
+        let opacity = 1. - self.sidebar_fraction / TREE_RAIL_FADE_START;
+        Some(
+            div()
+                .absolute()
+                .left_0()
+                .top_0()
+                .w(px(super::project_tree::COLLAPSED_WIDTH))
+                .h_full()
+                .flex()
+                .flex_col()
+                .opacity(opacity)
+                .when(self.workspace.boxy_layout(), |d| {
+                    d.child(titlebar_drag_area().h(px(TITLE_BAR_HEIGHT)).flex_shrink_0())
+                })
+                .child(div().flex_1().min_h_0().child(self.tree_status_bar(cx))),
+        )
     }
 
     pub(super) fn classic_titlebar_spans_window(&self, cx: &gpui::App) -> bool {
@@ -264,6 +289,12 @@ impl Shell {
                 cx,
             )];
         }
+        let tree_sidebar = self.tree_sidebar_has_rail();
+        let gutter = if tree_sidebar {
+            INSET_PANE_GUTTER
+        } else {
+            INSET_PANE_GUTTER * (1. - self.sidebar_fraction)
+        };
         let card = self.workspace_content(right_shown, right_width, full, window, cx);
         let card = div()
             .id("rounded-main-pane")
@@ -284,8 +315,7 @@ impl Shell {
                     .overflow_hidden()
                     .bg(inset_pane_fill())
                     .rounded(px(CARD_RADIUS))
-                    .border_1()
-                    .border_color(content(0.08))
+                    .when(!tree_sidebar, |d| d.border_1().border_color(content(0.08)))
                     .child(card),
             )
             .child(card_corner_mask(false));
@@ -317,10 +347,7 @@ impl Shell {
                             .h_full()
                             .overflow_hidden()
                             .bg(inset_chrome_wash())
-                            .when(self.show_tree_status_bar(), |d| {
-                                d.child(self.tree_status_bar(cx))
-                            })
-                            .when(!self.show_tree_status_bar(), |d| {
+                            .when(!tree_sidebar || self.sidebar_fraction > 0., |d| {
                                 d.child(
                                     div()
                                         .absolute()
@@ -331,7 +358,8 @@ impl Shell {
                                         .opacity(self.sidebar_fraction)
                                         .child(self.sidebar_contents()),
                                 )
-                            }),
+                            })
+                            .children(self.tree_rail_layer(cx)),
                     )
                 })
                 .child(div().w(px(sidebar_width)).h_full().flex_shrink_0())
@@ -346,7 +374,7 @@ impl Shell {
                         .flex()
                         .flex_col()
                         .pr_1p5()
-                        .pl(px(6. * (1. - self.sidebar_fraction)))
+                        .pl(px(gutter))
                         .child(
                             div()
                                 .absolute()
@@ -356,14 +384,14 @@ impl Shell {
                                 .w(px(6.))
                                 .bg(inset_chrome_wash()),
                         )
-                        .when(self.sidebar_fraction < 1., |d| {
+                        .when(gutter > 0., |d| {
                             d.child(
                                 div()
                                     .absolute()
                                     .left_0()
                                     .top_0()
                                     .bottom_0()
-                                    .w(px(6. * (1. - self.sidebar_fraction)))
+                                    .w(px(gutter))
                                     .bg(inset_chrome_wash()),
                             )
                         })
@@ -417,6 +445,7 @@ impl Shell {
         let show_navigation = !spans_window;
         let navigation = show_navigation.then(|| self.navigation(cx));
         let corner = (self.settings.is_none() && !original).then(|| self.panel_toggle(window, cx));
+        let tree_sidebar = self.tree_sidebar_has_rail();
         let body = div()
             .flex_1()
             .min_h_0()
@@ -435,30 +464,14 @@ impl Shell {
                         .h_full()
                         .flex_shrink_0()
                         .overflow_hidden()
-                        .when(!self.show_tree_status_bar(), |d| d.border_r_1())
+                        .when(!tree_sidebar, |d| d.border_r_1())
                         .border_color(if original {
                             content(0.07)
                         } else {
                             crate::right_panel::stroke()
                         })
                         .when(original, |d| d.bg(pane_fill()))
-                        .when(self.show_tree_status_bar(), |d| {
-                            d.child(
-                                div()
-                                    .size_full()
-                                    .flex()
-                                    .flex_col()
-                                    .child(
-                                        titlebar_drag_area()
-                                            .h(px(TITLE_BAR_HEIGHT))
-                                            .flex_shrink_0(),
-                                    )
-                                    .child(
-                                        div().flex_1().min_h_0().child(self.tree_status_bar(cx)),
-                                    ),
-                            )
-                        })
-                        .when(!self.show_tree_status_bar(), |d| {
+                        .when(!tree_sidebar || self.sidebar_fraction > 0., |d| {
                             d.child(
                                 // Full width while it slides; the frame clips it.
                                 div()
@@ -483,7 +496,8 @@ impl Shell {
                                     })
                                     .child(div().flex_1().min_h_0().child(self.sidebar_contents())),
                             )
-                        }),
+                        })
+                        .children(self.tree_rail_layer(cx)),
                 )
             })
             .child(
@@ -733,12 +747,13 @@ impl Shell {
             && self.workspace.sidebar_visible
             && self.sidebar_slide.is_none())
         .then(|| {
-            // The classic sidebar owns its right rule; the inset workspace
-            // owns the rule just beyond the sidebar's edge.
+            // Aim at the drawn split, including the middle of Tree's inset gutter.
             let border = self.project_rail_drawn_width()
                 + self.workspace.sidebar_width
                 + if self.workspace.boxy_layout() {
                     -0.5
+                } else if self.tree_sidebar_has_rail() {
+                    INSET_PANE_GUTTER / 2.
                 } else {
                     0.5
                 };
@@ -993,6 +1008,74 @@ mod tests {
     use crate::{monos::Monos, shell::tests::window};
     use gpui::{TestAppContext, WindowHandle};
     use std::time::{Duration, Instant};
+
+    #[gpui::test]
+    fn tree_sidebar_handoff_keeps_the_content_gutter_and_settings_aligned(cx: &mut TestAppContext) {
+        let (window, _, _) = window(cx);
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.simulate_resize(gpui::size(px(1450.), px(900.)));
+        window
+            .update(visual, |shell, _, cx| {
+                shell.workspace.new_layout_boxy = false;
+                shell.set_navigation_layout(NavigationLayout::Tree, cx);
+            })
+            .unwrap();
+        let gutter = |visual: &mut gpui::VisualTestContext| {
+            visual.debug_bounds("rounded-main-pane").unwrap().left()
+                - visual.debug_bounds("sidebar-frame").unwrap().right()
+        };
+        visual.refresh().unwrap();
+        assert_eq!(gutter(visual), px(6.));
+        let settings = visual.debug_bounds("tree-settings").unwrap().center();
+        for (row, hint) in [
+            ("sidebar-search-field", "sidebar-search-hint"),
+            ("sidebar-navigation-New", "sidebar-navigation-trailing-New"),
+        ] {
+            assert_eq!(
+                visual.debug_bounds(row).unwrap().right()
+                    - visual.debug_bounds(hint).unwrap().right(),
+                px(8.),
+            );
+        }
+
+        window
+            .update(visual, |shell, _, cx| {
+                shell.workspace.sidebar_visible = false;
+                let slide =
+                    crate::pane_motion::PaneSlide::new(0.1, 0., shell.workspace.sidebar_width);
+                slide.freeze_elapsed(Duration::ZERO);
+                shell.sidebar_slide = Some(slide);
+                cx.notify();
+            })
+            .unwrap();
+        visual.refresh().unwrap();
+        assert_eq!(gutter(visual), px(6.));
+        assert_eq!(
+            visual
+                .debug_bounds("tree-status-settings")
+                .unwrap()
+                .center(),
+            settings,
+        );
+
+        window
+            .update(visual, |shell, _, cx| {
+                cx.set_reduce_motion(true);
+                cx.notify();
+                assert!(!shell.workspace.sidebar_visible);
+            })
+            .unwrap();
+        visual.refresh().unwrap();
+        assert_eq!(gutter(visual), px(6.));
+        assert_eq!(
+            visual
+                .debug_bounds("tree-status-settings")
+                .unwrap()
+                .center(),
+            settings,
+        );
+        assert!(visual.debug_bounds("project-tree-sidebar").is_none());
+    }
 
     #[gpui::test]
     fn tree_uses_the_layout_shortcut_and_retains_a_collapsed_status_bar(cx: &mut TestAppContext) {

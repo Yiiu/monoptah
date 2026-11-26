@@ -99,17 +99,16 @@ impl Shell {
         div()
             .flex_shrink_0()
             .h(px(36.))
-            .px(px(6.))
             .flex()
             .items_center()
-            .border_t_1()
-            .border_color(content(0.04))
             .child(
-                icon_button("tree-settings", "Settings", "settings")
-                    .debug_selector(|| "tree-settings".into())
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.open_settings(crate::settings::Section::General, window, cx)
-                    })),
+                div().w(px(COLLAPSED_WIDTH)).flex().justify_center().child(
+                    icon_button("tree-settings", "Settings", "settings")
+                        .debug_selector(|| "tree-settings".into())
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_settings(crate::settings::Section::General, window, cx)
+                        })),
+                ),
             )
             .into_any()
     }
