@@ -478,13 +478,47 @@ impl Shell {
         let action = call.action.clone();
         let result: Result<Value, String> = match action.as_str() {
             "sessions.list" => {
-                let entries: Vec<_> = self.order.iter().filter_map(|id|{
-                    let metadata=self.session_metadata(*id,cx);
-                    let remote=metadata.summary.cwd.starts_with("remote://");
-                    if (metadata.summary.cwd!=project && !remote) || self.monos.as_ref().is_some_and(|m|m.read(cx).hidden_session(*id)) || self.orchestration_worker(*id){return None;}
-                    let live=self.sessions.get(id).map(|v|v.read(cx));
-                    Some((metadata.summary.clone(),json!({"id":id,"sessionId":id,"title":metadata.summary.title,"harness":metadata.summary.provider,"model":live.and_then(|v|v.settings.model.clone()).or_else(||self.session_details.get(id).and_then(|m|m.model.clone())),"busy":metadata.busy,"hasDraft":live.is_some_and(|v|v.has_saved_draft() || !v.input.read(cx).content.is_empty()) || self.draft_sessions.contains(id),"archived":metadata.summary.archived})))
-                }).collect();
+                let entries: Vec<_> = self
+                    .order
+                    .iter()
+                    .filter_map(|id| {
+                        let metadata = self.session_metadata(*id, cx);
+                        let remote = metadata.summary.cwd.starts_with("remote://");
+                        if (metadata.summary.cwd != project && !remote)
+                            || self
+                                .monos
+                                .as_ref()
+                                .is_some_and(|m| m.read(cx).hidden_session(*id))
+                            || self.orchestration_worker(*id)
+                        {
+                            return None;
+                        }
+                        let live = self.sessions.get(id).map(|view| view.read(cx));
+                        let model =
+                            live.and_then(|view| view.settings.model.clone())
+                                .or_else(|| {
+                                    self.session_details
+                                        .get(id)
+                                        .and_then(|details| details.model.clone())
+                                });
+                        let has_draft = live.is_some_and(|view| {
+                            view.has_saved_draft() || !view.input.read(cx).content.is_empty()
+                        }) || self.draft_sessions.contains(id);
+                        Some((
+                            metadata.summary.clone(),
+                            json!({
+                                "id": id,
+                                "sessionId": id,
+                                "title": metadata.summary.title,
+                                "harness": metadata.summary.provider,
+                                "model": model,
+                                "busy": self.agent_status(*id).is_busy(),
+                                "hasDraft": has_draft,
+                                "archived": metadata.summary.archived
+                            }),
+                        ))
+                    })
+                    .collect();
                 self.app_background(
                     call,
                     move |store| {

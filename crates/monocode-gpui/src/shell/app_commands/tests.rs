@@ -69,6 +69,42 @@ fn launch(
 }
 
 #[gpui::test]
+fn sessions_list_marks_a_dev_server_only_session_idle(cx: &mut TestAppContext) {
+    use monocode_core::agent_status::{ShellTask, StatusInput, derive};
+    let (window, other, caller) = setup(cx);
+    window
+        .update(cx, |shell, _, cx| {
+            // The provider is still open for the background shell. The session
+            // has no running turn and appears idle in the sidebar.
+            let project = shell.sessions[&caller].read(cx).summary.cwd.clone();
+            shell.sessions[&other].update(cx, |chat, _| {
+                chat.summary.cwd = project;
+                chat.busy = true;
+            });
+            assert!(shell.session_metadata(other, cx).busy);
+            shell.agent_statuses.insert(
+                other,
+                derive(&StatusInput {
+                    shells: vec![ShellTask {
+                        id: "dev".into(),
+                        command: "npm run dev".into(),
+                    }],
+                    ..Default::default()
+                }),
+            );
+        })
+        .unwrap();
+    let output = call(window, caller, "dev-list", "sessions.list", json!({}), cx).unwrap();
+    let listed = output["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["sessionId"] == other)
+        .unwrap();
+    assert_eq!(listed["busy"], false);
+}
+
+#[gpui::test]
 fn submitted_operator_access_survives_the_composer_reset(cx: &mut TestAppContext) {
     let (window, _, caller) = crate::shell::tests::window(cx);
     window
