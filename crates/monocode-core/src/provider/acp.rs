@@ -1486,6 +1486,93 @@ mod tests {
         }
     }
     #[test]
+    fn hermes_waits_for_background_work_resumes_and_finishes_the_turn() {
+        let temporary = tempfile::tempdir().unwrap();
+        let transcript = temporary.path().join("delegated.jsonl");
+        std::fs::write(&transcript, "The delegated check passed.").unwrap();
+        let manifest = temporary.path().join("manifest.json");
+        std::fs::write(
+            &manifest,
+            json!({"completed":true,"tasks":[{"status":"finalizing"}]}).to_string(),
+        )
+        .unwrap();
+        let mut p = protocol(Kind::Hermes);
+        let mut out = Vec::new();
+        p.acp_session(&mut out).unwrap();
+        let new = last(&mut out);
+        p.frame(
+            json!({"id":new["id"],"result":{"sessionId":"hermes-session"}}),
+            &mut out,
+        )
+        .unwrap();
+        let mode = last(&mut out);
+        assert_eq!(mode["method"], "session/set_mode");
+        assert_eq!(mode["params"]["sessionId"], "hermes-session");
+        p.frame(json!({"id":mode["id"],"result":{}}), &mut out)
+            .unwrap();
+        let first = last(&mut out);
+        assert_eq!(first["method"], "session/prompt");
+
+        let dispatch = p
+            .frame(
+                json!({
+                    "method":"session/update",
+                    "params":{"sessionId":"hermes-session","update":{
+                        "sessionUpdate":"tool_call_update","toolCallId":"delegate","status":"completed",
+                        "rawOutput":{
+                            "status":"dispatched","mode":"background","delegation_id":"checks",
+                            "live_transcripts":[transcript]
+                        }
+                    }}
+                }),
+                &mut out,
+            )
+            .unwrap();
+        assert!(dispatch
+            .iter()
+            .any(|e| matches!(e, Event::Tool(tool) if tool.state == ToolState::Running)));
+        assert_eq!(
+            p.frame(
+                json!({"id":first["id"],"result":{"stopReason":"end_turn"}}),
+                &mut out
+            )
+            .unwrap(),
+            [Event::TurnActivity(TurnActivity::Yielded { wake_tasks: 1 })],
+        );
+        assert!(!p.done);
+        assert!(p.acp_background(&mut out).unwrap().is_empty());
+        assert!(out.is_empty(), "finalizing work must not wake Hermes");
+
+        std::fs::write(
+            &manifest,
+            json!({"completed":true,"tasks":[{"status":"completed"}]}).to_string(),
+        )
+        .unwrap();
+        let resumed = p.acp_tick(&mut out).unwrap();
+        assert!(matches!(
+            resumed.as_slice(),
+            [Event::Tool(tool), Event::TurnActivity(TurnActivity::Running), Event::BeginAssistant]
+                if tool.state == ToolState::Completed
+        ));
+        let continuation = last(&mut out);
+        assert_eq!(continuation["method"], "session/prompt");
+        assert_eq!(continuation["params"]["sessionId"], "hermes-session");
+        assert!(continuation["params"]["prompt"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("The delegated check passed."));
+        assert_eq!(
+            p.frame(
+                json!({"id":continuation["id"],"result":{"stopReason":"end_turn"}}),
+                &mut out
+            )
+            .unwrap(),
+            [Event::Done],
+        );
+        assert!(p.done);
+    }
+
+    #[test]
     fn hermes_sends_only_an_advertised_reasoning_effort() {
         let mut p = protocol(Kind::Hermes);
         p.request.settings.effort = Some("high".into());

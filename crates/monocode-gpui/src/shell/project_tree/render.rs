@@ -1015,7 +1015,15 @@ impl Shell {
             .monos
             .as_ref()
             .and_then(|m| m.read(cx).tree_launch_mono(id))
-            .map(|m| crate::monos::avatar::avatar(&m.mascot, m.color, "idle", 10., true));
+            .map(|m| {
+                let mono_id = m.id.clone();
+                div()
+                    .debug_selector(move || format!("tree-session-mono-{id}-{mono_id}"))
+                    .flex_shrink_0()
+                    .child(crate::monos::avatar::avatar(
+                        &m.mascot, m.color, "idle", 10., true,
+                    ))
+            });
         let title = meta.display_title();
         let expanded = self.tree.sessions.contains(&id);
         let compact = !needs_you && !unread;

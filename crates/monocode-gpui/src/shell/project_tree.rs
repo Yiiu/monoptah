@@ -1788,6 +1788,75 @@ mod tests {
     }
 
     #[gpui::test]
+    fn a_hidden_mono_launch_appears_in_its_worktree_with_the_mascot(cx: &mut TestAppContext) {
+        let (window, mut visual, ordinary, launched) = tree_window(cx);
+        let project = "/work/another-project";
+        let copy = "/work/another-project-review";
+        let mono_id = window
+            .update(&mut visual, |shell, _, cx| {
+                let summary = shell.session_summaries.get_mut(&launched).unwrap();
+                summary.cwd = project.into();
+                summary.has_messages = true;
+                shell.sessions[&launched].clone().update(cx, |chat, _| {
+                    chat.summary.cwd = project.into();
+                    chat.summary.has_messages = true;
+                });
+                shell.session_worktrees.insert(launched, Some(copy.into()));
+                shell.sidebar_hidden_sessions.insert(launched);
+                let mono_id = shell.mono_manager().update(cx, |monos, cx| {
+                    let id = monos.roster.create(vec![project.into()]).id.clone();
+                    let mono = monos.roster.get_mut(&id).unwrap();
+                    mono.show_started_sessions_in_sidebar = false;
+                    mono.launches.push(monocode_core::mono::Launch {
+                        session_id: launched,
+                        cwd: copy.into(),
+                        title: "Review the release".into(),
+                        harness: "claude".into(),
+                        model: None,
+                        origin_turn: 1,
+                        notify_on_complete: false,
+                        completed: false,
+                        dismissed: false,
+                        each: false,
+                        visible: false,
+                    });
+                    cx.notify();
+                    id
+                });
+                let rows = shell.tree_rows(&shell.tree_catalog(cx), cx);
+                let worktree = rows
+                    .iter()
+                    .position(|row| matches!(row, TreeRow::Worktree { path, .. } if path == copy))
+                    .expect("launch worktree row");
+                assert!(matches!(
+                    &rows[worktree + 1],
+                    TreeRow::Session { id, depth: 2, .. } if *id == launched
+                ));
+                assert_eq!(
+                    rows.iter()
+                        .filter(|row| matches!(row, TreeRow::Session { id, .. } if *id == launched))
+                        .count(),
+                    1,
+                );
+                shell.notify_sidebar(cx);
+                mono_id
+            })
+            .unwrap();
+        visual.refresh().unwrap();
+        let worktree = visual
+            .debug_bounds("tree-worktree-/work/another-project-review")
+            .unwrap();
+        let row = format!("sidebar-session-{launched}").leak();
+        let row = visual.debug_bounds(row).expect("rendered launch row");
+        let mascot = format!("tree-session-mono-{launched}-{mono_id}").leak();
+        let mascot = visual.debug_bounds(mascot).expect("rendered mascot");
+        assert!(worktree.bottom() <= row.top());
+        assert!(mascot.left() >= row.left() && mascot.right() <= row.right());
+        let other = format!("tree-session-mono-{ordinary}-{mono_id}").leak();
+        assert!(visual.debug_bounds(other).is_none());
+    }
+
+    #[gpui::test]
     fn collapsed_projects_still_count_waiting_work_but_exclude_archive(cx: &mut TestAppContext) {
         use monocode_core::agent_status::{Outcome, Wait};
         let (window, archived, running) = crate::shell::tests::window(cx);

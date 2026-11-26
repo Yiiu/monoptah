@@ -750,7 +750,7 @@ impl Shell {
                     matches!(status.activity, Activity::Running { stale: false, .. }),
                     |d| d.children(self.session_marks.get(&id).cloned()),
                 )
-                .child(div().min_w_0().truncate().child(label))
+                .child(Self::session_activity_caption(id, label))
         } else if session.has_saved_draft() && matches!(status.activity, Activity::Idle) {
             div()
                 .flex()
@@ -1148,7 +1148,143 @@ impl Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workspace::NavigationLayout;
     use gpui::{TestAppContext, VisualTestContext, WindowHandle};
+    use monocode_core::agent_status::{AgentStatus, Outcome, ShellTask, Wait};
+
+    fn in_both_session_rails(
+        cx: &mut TestAppContext,
+        status: AgentStatus,
+        assert_row: impl Fn(&mut VisualTestContext, i64, NavigationLayout),
+    ) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (window, id, _) = crate::shell::tests::window(cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        visual.simulate_resize(gpui::size(px(1400.), px(900.)));
+        window
+            .update(visual, |shell, window, cx| {
+                shell.open(id, window, cx);
+                shell.workspace.compact_session_cards = false;
+                shell.workspace.project_rail_open = true;
+                shell.workspace.sidebar_visible = true;
+            })
+            .unwrap();
+        visual.run_until_parked();
+        for layout in [NavigationLayout::Classic, NavigationLayout::Focused] {
+            window
+                .update(visual, |shell, _, cx| {
+                    shell.set_navigation_layout(layout, cx);
+                    shell.agent_statuses.insert(id, status.clone());
+                    shell.invalidate_chrome(cx);
+                    cx.notify();
+                })
+                .unwrap();
+            visual.refresh().unwrap();
+            assert_row(visual, id, layout);
+        }
+    }
+
+    fn assert_status_text(cx: &mut TestAppContext, activity: Activity, text: &str) {
+        in_both_session_rails(
+            cx,
+            AgentStatus {
+                activity,
+                ..Default::default()
+            },
+            |visual, id, layout| {
+                let selector = format!("session-status-text-{id}-{text}").leak();
+                assert!(
+                    visual
+                        .debug_bounds(selector)
+                        .is_some_and(|bounds| bounds.size.width > px(0.)),
+                    "{layout:?} should display {text:?}",
+                );
+            },
+        );
+    }
+
+    #[gpui::test]
+    fn classic_and_focused_show_failed_turns(cx: &mut TestAppContext) {
+        assert_status_text(
+            cx,
+            Activity::Done {
+                outcome: Outcome::Failed,
+                at: 1,
+                unread: true,
+            },
+            "Failed",
+        );
+    }
+
+    #[gpui::test]
+    fn classic_and_focused_show_stopped_turns(cx: &mut TestAppContext) {
+        assert_status_text(
+            cx,
+            Activity::Done {
+                outcome: Outcome::Interrupted,
+                at: 1,
+                unread: true,
+            },
+            "Stopped",
+        );
+    }
+
+    #[gpui::test]
+    fn classic_and_focused_show_the_subtask_count(cx: &mut TestAppContext) {
+        assert_status_text(
+            cx,
+            Activity::BackgroundWait {
+                reason: Wait::Subtasks(3),
+                since: 1,
+            },
+            "Waiting on 3 subtasks",
+        );
+    }
+
+    #[gpui::test]
+    fn classic_and_focused_show_usage_limit_waits(cx: &mut TestAppContext) {
+        assert_status_text(
+            cx,
+            Activity::BackgroundWait {
+                reason: Wait::UsageLimit { resume_at: 1 },
+                since: 1,
+            },
+            "Usage limit · resuming",
+        );
+    }
+
+    #[gpui::test]
+    fn classic_and_focused_show_stale_turns(cx: &mut TestAppContext) {
+        assert_status_text(
+            cx,
+            Activity::Running {
+                step: Some("Build".into()),
+                since: 1,
+                stale: true,
+            },
+            "No update in 30m",
+        );
+    }
+
+    #[gpui::test]
+    fn classic_and_focused_show_a_chip_for_background_shells(cx: &mut TestAppContext) {
+        let status = AgentStatus {
+            activity: Activity::Idle,
+            shells: vec![ShellTask {
+                id: "dev".into(),
+                command: "npm run dev".into(),
+            }],
+        };
+        in_both_session_rails(cx, status, |visual, id, layout| {
+            let chip = format!("session-shell-tasks-{id}").leak();
+            assert!(
+                visual
+                    .debug_bounds(chip)
+                    .is_some_and(|bounds| bounds.size.width > px(0.)),
+                "{layout:?} should show the detached dev server chip",
+            );
+        });
+    }
 
     fn bounds(cx: &mut VisualTestContext, selector: String) -> Option<gpui::Bounds<Pixels>> {
         cx.debug_bounds(Box::leak(selector.into_boxed_str()))

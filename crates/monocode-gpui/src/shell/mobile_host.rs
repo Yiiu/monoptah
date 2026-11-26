@@ -4434,6 +4434,115 @@ mod tests {
     }
 
     #[gpui::test]
+    fn mobile_catalog_snapshots_busy_and_waiting_for_open_and_saved_sessions(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use monocode_core::agent_status::{Activity, AgentStatus, Ask, Outcome, Wait};
+
+        let (window, id, _) = super::super::tests::window(cx);
+        window
+            .update(cx, |shell, _, cx| {
+                let saved_id = locked(&shell.store)
+                    .unwrap()
+                    .persisted_session_id(id)
+                    .unwrap();
+                let view = shell.sessions.remove(&id).unwrap();
+                let set_summary = |summary: &mut Session| {
+                    summary.title = "Verify catalog status".into();
+                    summary.updated_at = 4_200;
+                };
+                set_summary(shell.session_summaries.get_mut(&id).unwrap());
+                view.update(cx, |chat, _| set_summary(&mut chat.summary));
+                let cases = [
+                    (
+                        Activity::Running {
+                            step: None,
+                            since: 1,
+                            stale: false,
+                        },
+                        true,
+                        None,
+                    ),
+                    (
+                        Activity::BackgroundWait {
+                            reason: Wait::Subtasks(2),
+                            since: 1,
+                        },
+                        true,
+                        None,
+                    ),
+                    (
+                        Activity::NeedsYou {
+                            kind: Ask::Approval,
+                        },
+                        false,
+                        Some("approval"),
+                    ),
+                    (
+                        Activity::NeedsYou {
+                            kind: Ask::Question,
+                        },
+                        false,
+                        Some("question"),
+                    ),
+                    (
+                        Activity::Done {
+                            outcome: Outcome::Completed,
+                            at: 2,
+                            unread: true,
+                        },
+                        false,
+                        None,
+                    ),
+                    (Activity::Idle, false, None),
+                ];
+
+                for live in [false, true] {
+                    if live {
+                        shell.sessions.insert(id, view.clone());
+                    }
+                    for (activity, busy, waiting) in &cases {
+                        shell.agent_statuses.insert(
+                            id,
+                            AgentStatus {
+                                activity: activity.clone(),
+                                ..Default::default()
+                            },
+                        );
+                        let work = shell.mobile_catalog_work(cx);
+                        let (catalog, _, _) = cx
+                            .foreground_executor()
+                            .block_test(work)
+                            .expect("the catalog builds");
+                        let mut expected = json!({
+                            "id": saved_id,
+                            "projectId": project_id("/work/another-project"),
+                            "title": "Verify catalog status",
+                            "harness": "codex",
+                            "model": "codex:default",
+                            "modelName": "Codex",
+                            "branch": "",
+                            "runtimeMode": "supervised",
+                            "updatedAt": 4_200,
+                            "busy": busy,
+                            "live": live,
+                            "target": {"kind": "local"}
+                        });
+                        if let Some(waiting) = waiting {
+                            expected["waiting"] = json!(waiting);
+                        }
+                        assert_eq!(
+                            catalog["sessions"],
+                            json!([expected]),
+                            "{activity:?}, live={live}"
+                        );
+                    }
+                }
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
     fn mobile_catalog_matches_sidebar_visibility_for_saved_and_open_sessions(
         cx: &mut gpui::TestAppContext,
     ) {
