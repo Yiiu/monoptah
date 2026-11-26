@@ -5,6 +5,7 @@ use monocode_core::mono::{Message, Mono};
 use std::path::PathBuf;
 #[derive(Default)]
 pub(super) struct ChatState {
+    decision_release_at: Option<Option<u64>>,
     pub(super) pending: Vec<Message>,
     queue_scroll: gpui::ScrollHandle,
     queue_ids: Vec<String>,
@@ -204,9 +205,15 @@ impl Conversation {
         self.input
             .update(cx, |input, cx| input.mono_composer(&mono.label(), cx));
         let name = mono.label();
+        let release_at = *self.mono_ui.decision_release_at.get_or_insert_with(|| {
+            locked(&self.store)
+                .and_then(|store| store.session_activity_backfilled_at())
+                .ok()
+                .flatten()
+        });
         let decision_changed = self.transcript.update(cx, |t, cx| {
             t.mono_mode(&mono.mascot, mono.color, &name);
-            t.set_mono_decisions(mono.decision_cards.clone(), cx)
+            t.set_mono_decisions(mono.decision_cards.clone(), release_at, cx)
         });
         self.settings.environment = environment;
         self.mono_ui.pending = mono.outbox.clone();

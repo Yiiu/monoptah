@@ -486,7 +486,8 @@ impl Conversation {
         let auto_resume = self.auto_resume_state(now as i64);
         StatusInput {
             approvals: !self.approvals.is_empty(),
-            questions: !self.questions.is_empty() || !self.pending_mono_decisions(cx).is_empty(),
+            questions: !self.questions.is_empty()
+                || self.transcript.read(cx).mono_decisions_need_attention(),
             streaming,
             wake_tasks,
             usage_limit_resume_at: match auto_resume {
