@@ -7004,7 +7004,9 @@ impl Shell {
             mark.update(cx, |mark, cx| mark.set_size(side, cx));
         }
         let work_item = self.work_item_badge(id, compact, cx);
+        let shell_chip = self.shell_task_chip(id);
         let has_badges = work_item.is_some()
+            || shell_chip.is_some()
             || mode.is_some()
             || self.automation_state.session_automations.contains_key(&id);
         let session = self.session_metadata(id, cx);
@@ -7166,7 +7168,7 @@ impl Shell {
             .gap_1()
             .flex_shrink_0()
             .children(work_item)
-            .children(self.shell_task_chip(id))
+            .children(shell_chip)
             .when(
                 self.automation_state.session_automations.contains_key(&id),
                 |row| row.child(icon("zap", 12.).text_color(content(0.35))),
@@ -7447,7 +7449,9 @@ impl Shell {
                         .gap_1()
                         .text_color(crate::session_mark::activity_color(activity))
                         .children(glyph)
-                        .when(detailed, |row| row.child(label))
+                        .when(detailed, |row| {
+                            row.child(Self::session_activity_caption(id, label))
+                        })
                         .into_any()
                 } else if session.has_saved_draft()
                     && matches!(
@@ -7486,6 +7490,17 @@ impl Shell {
             )
             .into_any()
     }
+    fn session_activity_caption(id: i64, label: String) -> gpui::Div {
+        div()
+            .debug_selector({
+                let label = label.clone();
+                move || format!("session-status-text-{id}-{label}")
+            })
+            .min_w_0()
+            .truncate()
+            .child(label)
+    }
+
     pub(super) fn auto_resume_activity_badge(
         &self,
         id: i64,
@@ -7526,7 +7541,13 @@ impl Shell {
                 .text_size(px(11.))
                 .text_color(crate::session_mark::activity_color(&status.activity))
                 .child(icon("clock", icon_size))
-                .when(detailed, |d| d.children(status.label(now)))
+                .when(detailed, |d| {
+                    d.children(
+                        status
+                            .label(now)
+                            .map(|label| Self::session_activity_caption(id, label)),
+                    )
+                })
                 .tooltip(move |_, cx| cx.new(|_| project_rail::ProjectTooltip(tip.clone())).into())
                 .into_any(),
         )

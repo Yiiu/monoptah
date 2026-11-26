@@ -303,6 +303,7 @@ fn plan(
     }
     let total = rows.len() as f32;
     let now = now_ms();
+    let counts = format!("{done} done · {running} running · {waiting} needs you");
     Some(
         div()
             .w_full()
@@ -329,11 +330,13 @@ fn plan(
                     )
                     .child(
                         div()
+                            .debug_selector({
+                                let counts = counts.clone();
+                                move || format!("mono-plan-{counts}")
+                            })
                             .text_size(px(11.))
                             .text_color(content(0.5))
-                            .child(format!(
-                                "{done} done · {running} running · {waiting} needs you"
-                            )),
+                            .child(counts),
                     ),
             )
             .child(
@@ -1006,6 +1009,102 @@ mod tests {
     use super::*;
     use crate::visuals::calendar::levels;
     use chrono::Datelike;
+
+    #[gpui::test]
+    fn plan_counts_follow_launched_session_status_changes(cx: &mut gpui::TestAppContext) {
+        use crate::shell::monos::MonoSession;
+        use monocode_core::agent_status::{Activity, Ask, Outcome, Wait};
+
+        struct PlanFixture {
+            manager: Entity<Monos>,
+            mono: Mono,
+            sessions: Vec<MonoSession>,
+        }
+
+        impl Render for PlanFixture {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let sessions = self.sessions.iter().collect::<Vec<_>>();
+                self.manager
+                    .update(cx, |_, cx| plan(&self.mono, &sessions, cx).unwrap())
+            }
+        }
+
+        let setup = super::super::tests::setup(cx);
+        let mut mono = Mono::default();
+        mono.launches
+            .extend((1..=3).map(|id| super::super::tests::launch_of(id, "/fixture")));
+        mono.launches[2].dismissed = true;
+        let launch = |id, activity| MonoSession {
+            id,
+            title: format!("Sample {id}"),
+            cwd: "/fixture".into(),
+            project: "/fixture".into(),
+            busy: false,
+            unsettled: false,
+            activity,
+            has_messages: true,
+            archived: false,
+            updated_at: 1,
+            needs_input: false,
+            start_failed: false,
+            branch: None,
+            worktree: None,
+            model: "Default".into(),
+            cloud: false,
+        };
+        let waiting = Activity::NeedsYou {
+            kind: Ask::Question,
+        };
+        let running = Activity::Running {
+            step: None,
+            since: 1,
+            stale: false,
+        };
+        let done = Activity::Done {
+            outcome: Outcome::Completed,
+            at: 2,
+            unread: false,
+        };
+        let window = cx.add_window(|_, _| PlanFixture {
+            manager: setup.manager,
+            mono,
+            sessions: vec![
+                launch(1, running),
+                launch(2, waiting.clone()),
+                launch(3, waiting),
+                launch(4, done.clone()),
+            ],
+        });
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.refresh().unwrap();
+        assert!(
+            visual
+                .debug_bounds("mono-plan-0 done · 1 running · 1 needs you")
+                .is_some()
+        );
+
+        window
+            .update(visual, |fixture, _, cx| {
+                fixture.sessions[0].activity = done;
+                fixture.sessions[1].activity = Activity::BackgroundWait {
+                    reason: Wait::Subtasks(2),
+                    since: 2,
+                };
+                cx.notify();
+            })
+            .unwrap();
+        visual.refresh().unwrap();
+        assert!(
+            visual
+                .debug_bounds("mono-plan-0 done · 1 running · 1 needs you")
+                .is_none()
+        );
+        assert!(
+            visual
+                .debug_bounds("mono-plan-1 done · 1 running · 0 needs you")
+                .is_some()
+        );
+    }
 
     fn day(count: u32) -> Day {
         Day {

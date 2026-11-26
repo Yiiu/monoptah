@@ -1413,7 +1413,91 @@ impl Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workspace::NavigationLayout;
     use gpui::{TestAppContext, VisualTestContext};
+
+    #[gpui::test]
+    fn opening_a_system_notification_persists_seen_and_demotes_the_tree_row(
+        cx: &mut TestAppContext,
+    ) {
+        use monocode_core::agent_status::{Outcome, TurnEnd};
+
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (window, id, previous) = crate::shell::tests::window(cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        visual.simulate_resize(gpui::size(px(1400.), px(900.)));
+        let at = monocode_core::time::now_ms() + 1_000;
+        let row = format!("sidebar-session-{id}").leak();
+        let summary = format!("tree-session-summary-{id}").leak();
+
+        window
+            .update(visual, |shell, _, cx| {
+                assert_eq!(shell.workspace.active, Some(previous));
+                shell.set_navigation_layout(NavigationLayout::Tree, cx);
+                shell.session_activity = {
+                    let store = locked(&shell.store).unwrap();
+                    store
+                        .finish_session_turn_with_summary(
+                            id,
+                            at - 1,
+                            TurnEnd {
+                                at,
+                                outcome: Outcome::Completed,
+                            },
+                            Some("Verified the sample output."),
+                        )
+                        .unwrap();
+                    store.restore_session_activity(at).unwrap()
+                };
+                shell.update_agent_status(id, None, cx);
+                assert!(shell.agent_status(id).unread_done());
+            })
+            .unwrap();
+        visual.refresh().unwrap();
+        let project = visual
+            .debug_bounds("tree-project-/work/another-project")
+            .expect("project with the unread session");
+        visual.simulate_click(project.center(), Default::default());
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        let unread_height = visual
+            .debug_bounds(row)
+            .expect("unread session row")
+            .size
+            .height;
+        assert!(visual.debug_bounds(summary).is_some());
+
+        window
+            .update(visual, |shell, _, cx| {
+                shell.open_notice_target(Target::Session(id), cx)
+            })
+            .unwrap();
+        visual.run_until_parked();
+        window
+            .update(visual, |shell, window, cx| {
+                assert_eq!(shell.workspace.active, Some(id));
+                assert!(!shell.agent_status(id).unread_done());
+                assert_eq!(shell.session_activity[&id].seen_at, Some(at));
+                let saved = locked(&shell.store)
+                    .unwrap()
+                    .restore_session_activity(at)
+                    .unwrap();
+                assert_eq!(saved[&id].seen_at, Some(at), "seen survives a reload");
+                shell.open(previous, window, cx);
+            })
+            .unwrap();
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        assert!(visual.debug_bounds(summary).is_none());
+        assert!(
+            visual
+                .debug_bounds(row)
+                .expect("read session row")
+                .size
+                .height
+                < unread_height
+        );
+    }
 
     #[gpui::test]
     fn error_cards_share_top_right_stack_and_dismiss_independently(cx: &mut TestAppContext) {
