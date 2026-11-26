@@ -7,8 +7,14 @@ pub(crate) enum Cue {
     LinkedActivity,
 }
 pub(crate) fn play(cue: Cue) {
-    #[cfg(all(target_os = "macos", not(test)))]
+    #[cfg(all(any(target_os = "macos", windows), not(test)))]
     std::thread::spawn(move || {
+        // Keep concurrent requests from starting playback during a first write.
+        #[cfg(windows)]
+        let _writer = {
+            static CUES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            CUES.lock().unwrap_or_else(|error| error.into_inner())
+        };
         let directory = crate::data_dir().join("sounds");
         if std::fs::create_dir_all(&directory).is_err() {
             return;
@@ -21,19 +27,40 @@ pub(crate) fn play(cue: Cue) {
         if !path.exists() && std::fs::write(&path, wave(cue)).is_err() {
             return;
         }
-        let mut command = std::process::Command::new("/usr/bin/afplay");
-        command
-            .arg(path)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        monocode_core::process::configure_child(&mut command);
-        let _ = command.status();
+        play_file(&path);
     });
-    #[cfg(any(not(target_os = "macos"), test))]
+    #[cfg(any(not(any(target_os = "macos", windows)), test))]
     let _ = cue;
 }
-#[cfg(any(target_os = "macos", test))]
+
+#[cfg(all(target_os = "macos", not(test)))]
+fn play_file(path: &std::path::Path) {
+    let mut command = std::process::Command::new("/usr/bin/afplay");
+    command
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    monocode_core::process::configure_child(&mut command);
+    let _ = command.status();
+}
+
+#[cfg(all(windows, not(test)))]
+fn play_file(path: &std::path::Path) {
+    use windows::{
+        Win32::Media::Audio::{PlaySoundW, SND_ASYNC, SND_FILENAME, SND_NODEFAULT},
+        core::HSTRING,
+    };
+
+    let path = HSTRING::from(path.as_os_str());
+    // SAFETY: The NUL-terminated filename lives through the call. Async
+    // playback from a file does not borrow the caller's buffer.
+    if !unsafe { PlaySoundW(&path, None, SND_FILENAME | SND_ASYNC | SND_NODEFAULT) }.as_bool() {
+        log::debug!("Could not play Windows notification cue: {path}");
+    }
+}
+
+#[cfg(any(target_os = "macos", windows, test))]
 fn wave(cue: Cue) -> Vec<u8> {
     type Layer = (f32, f32, f32, f32, f32, f32);
     type Recipe = (f32, &'static [Layer], f32, f32, f32);
