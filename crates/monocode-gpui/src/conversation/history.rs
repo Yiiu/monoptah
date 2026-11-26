@@ -102,6 +102,75 @@ impl Conversation {
     pub(crate) fn history_weight(&self, cx: &gpui::App) -> usize {
         self.transcript.read(cx).history_weight()
     }
+
+    pub(super) fn history_preparation_anchor(&self, cx: &gpui::App) -> Option<usize> {
+        self.pending_search
+            .as_ref()
+            .map(|(row, _)| *row)
+            .or_else(|| self.transcript.read(cx).saved_history_anchor())
+    }
+
+    /// Paint a saved window while the authoritative history and write guard load.
+    /// The window never becomes the Conversation's source or receives its actions.
+    pub(super) fn load_history_preview(&self, cx: &mut Context<Self>) -> gpui::Task<()> {
+        if self.settings.mono.is_some()
+            || !self.summary.has_messages
+            || self.pending_search.is_some()
+        {
+            return gpui::Task::ready(());
+        }
+        let store = self.store.clone();
+        let id = self.summary.id;
+        let anchor = self.transcript.read(cx).saved_history_anchor();
+        let work = cx.background_executor().spawn(async move {
+            let page = locked(&store).and_then(|db| {
+                db.chunked_history_window(id, anchor, monocode_core::store::PAGE_TURNS)
+            });
+            page.ok().flatten().and_then(|(first, rows)| {
+                (!rows.is_empty() && (first > 0 || anchor.is_some()))
+                    .then(|| (first, crate::transcript::PreparedHistory::full(rows)))
+            })
+        });
+        cx.spawn(async move |this, cx| {
+            let Some((first, history)) = work.await else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| {
+                if !this.loading
+                    || this.pending_search.is_some()
+                    || !this.transcript.read(cx).source_rows().is_empty()
+                {
+                    return;
+                }
+                let preview = this.transcript.read(cx).loading_preview(first);
+                this.history_preview = Some((
+                    first,
+                    cx.new(|cx| {
+                        let mut preview = preview;
+                        preview.install_prepared_history(history, cx);
+                        preview
+                    }),
+                ));
+                cx.notify();
+            });
+        })
+    }
+
+    pub(super) fn finish_history_preview(
+        &mut self,
+        history: Option<&crate::transcript::PreparedHistory>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((first, preview)) = self.history_preview.take() {
+            if let Some(position) =
+                history.and_then(|history| preview.read(cx).preview_position(first, history))
+            {
+                self.transcript
+                    .update(cx, |view, _| view.set_history_position(position));
+            }
+            cx.notify();
+        }
+    }
     /// Only a settled, saved conversation can lose its reconstructible payload.
     /// Keep drafts, queued messages and their edits in the live entity, and pin
     /// their history so row positions remain valid during background saves.
@@ -166,7 +235,10 @@ impl Conversation {
         let id = self.summary.id;
         let store = self.store.clone();
         let mono = self.settings.mono.is_some();
+        let anchor = self.history_preparation_anchor(cx);
+        let preview = self.load_history_preview(cx);
         let work = cx.background_executor().spawn(async move {
+            preview.await;
             let (history, turns, before) = {
                 let store = locked(&store)?;
                 (
@@ -176,7 +248,7 @@ impl Conversation {
                 )
             };
             Ok::<_, String>((
-                crate::transcript::PreparedHistory::new(history.rows, mono),
+                crate::transcript::PreparedHistory::at(history.rows, mono, anchor),
                 turns,
                 before,
             ))
@@ -184,6 +256,10 @@ impl Conversation {
         cx.spawn(async move |this, cx| {
             let result = work.await;
             let _ = this.update(cx, |this, cx| {
+                this.finish_history_preview(
+                    result.as_ref().ok().map(|(history, _, _)| history),
+                    cx,
+                );
                 this.loading = false;
                 match result {
                     Ok((history, turns, before)) => {

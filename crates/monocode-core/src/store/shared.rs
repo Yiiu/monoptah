@@ -180,53 +180,77 @@ pub(super) fn project_turns(
     let mut root_turn = None;
     for block in blocks {
         let rows = blocks::project(std::slice::from_ref(block))?;
-        if let Some(prompt) = rows.iter().rposition(Row::is_prompt) {
-            let model = &block["turnModel"];
-            let duration = block["durationMs"].as_u64();
-            let started_at = turn_start(block);
-            let stopped = block["nativeStopped"] == true;
-            let turn = offset + prompt + 1;
-            if started_at.is_some() {
-                root_turn = Some(turn);
-            }
-            let joined_turn =
-                (block["role"] == "user" && block["sentAt"].is_number() && started_at.is_none())
-                    .then_some(root_turn)
-                    .flatten();
-            let metrics = block
-                .get("turnMetrics")
-                .filter(|value| value.is_object())
-                .and_then(|value| serde_json::from_value(value.clone()).ok());
-            if model.is_object()
-                || duration.is_some()
-                || started_at.is_some()
-                || metrics.is_some()
-                || block["providerTurnId"].is_string()
-                || joined_turn.is_some()
-                || stopped
-            {
-                turns.insert(
-                    offset + prompt + 1,
-                    crate::agent::TurnInfo {
-                        joined_turn,
-                        provider_turn_id: block["providerTurnId"].as_str().map(str::to_owned),
-                        provider: model["harness"].as_str().unwrap_or("").into(),
-                        model: model["name"].as_str().unwrap_or("").into(),
-                        model_id: model["id"].as_str().map(str::to_owned),
-                        duration_ms: duration.unwrap_or(0),
-                        duration_known: duration.is_some(),
-                        started_at,
-                        completed_at: started_at
-                            .and_then(|at| at.checked_add(duration.unwrap_or(0))),
-                        metrics,
-                        stopped,
-                    },
-                );
-            }
-        }
+        record_turn(block, &rows, offset, &mut root_turn, &mut turns);
         offset += rows.len();
     }
     Ok(turns)
+}
+
+fn record_turn(
+    block: &Value,
+    rows: &[Row],
+    offset: usize,
+    root_turn: &mut Option<usize>,
+    turns: &mut HashMap<usize, crate::agent::TurnInfo>,
+) {
+    let Some(prompt) = rows.iter().rposition(Row::is_prompt) else {
+        return;
+    };
+    let turn = offset + prompt + 1;
+    let model = &block["turnModel"];
+    let duration = block["durationMs"].as_u64();
+    let started_at = turn_start(block);
+    let stopped = block["nativeStopped"] == true;
+    if started_at.is_some() {
+        *root_turn = Some(turn);
+    }
+    let joined_turn =
+        (block["role"] == "user" && block["sentAt"].is_number() && started_at.is_none())
+            .then_some(*root_turn)
+            .flatten();
+    let metrics = block
+        .get("turnMetrics")
+        .filter(|value| value.is_object())
+        .and_then(|value| serde_json::from_value(value.clone()).ok());
+    if model.is_object()
+        || duration.is_some()
+        || started_at.is_some()
+        || metrics.is_some()
+        || block["providerTurnId"].is_string()
+        || joined_turn.is_some()
+        || stopped
+    {
+        turns.insert(
+            turn,
+            crate::agent::TurnInfo {
+                joined_turn,
+                provider_turn_id: block["providerTurnId"].as_str().map(str::to_owned),
+                provider: model["harness"].as_str().unwrap_or("").into(),
+                model: model["name"].as_str().unwrap_or("").into(),
+                model_id: model["id"].as_str().map(str::to_owned),
+                duration_ms: duration.unwrap_or(0),
+                duration_known: duration.is_some(),
+                started_at,
+                completed_at: started_at.and_then(|at| at.checked_add(duration.unwrap_or(0))),
+                metrics,
+                stopped,
+            },
+        );
+    }
+}
+
+fn operator_prompt(block: &Value) -> bool {
+    block["role"] == "user"
+        && block["draft"] != true
+        && block["internal"] != true
+        && (block["monocode"] == true
+            || ["mono", "monocode"].into_iter().any(|command| {
+                crate::composer::consume_command(
+                    block["text"].as_str().unwrap_or_default(),
+                    command,
+                )
+                .is_some()
+            }))
 }
 
 impl Store {
@@ -804,6 +828,7 @@ impl Store {
         desktop
     }
     pub(super) fn shared_agent(&self, id: i64) -> Result<Option<Settings>, String> {
+        let original = self.persisted_session_id(id)?;
         let fields = ["harness", "model", "model_settings", "runtime_mode"]
             .into_iter()
             .map(str::to_owned)
@@ -826,7 +851,7 @@ impl Store {
             .conn
             .query_row(
                 &format!("SELECT {fields} FROM sessions WHERE id=?1"),
-                [self.persisted_session_id(id)?],
+                [&original],
                 |r| {
                     Ok((
                         r.get::<_, String>(0)?,
@@ -901,21 +926,9 @@ impl Store {
         settings.account.id = account.unwrap_or_else(|| crate::accounts::DEFAULT.into());
         // Desktop blocks are authoritative. Native-only legacy metadata remains
         // available, but cannot override a saved desktop turn's identity/time.
-        let blocks = self.shared_blocks(id)?;
-        settings.operator_enabled |= blocks.iter().any(|block| {
-            block["role"] == "user"
-                && block["draft"] != true
-                && block["internal"] != true
-                && (block["monocode"] == true
-                    || ["mono", "monocode"].into_iter().any(|command| {
-                        crate::composer::consume_command(
-                            block["text"].as_str().unwrap_or_default(),
-                            command,
-                        )
-                        .is_some()
-                    }))
-        });
-        for (turn, source) in project_turns(&blocks)? {
+        let (operator_enabled, turns) = self.shared_history_metadata(id, &original)?;
+        settings.operator_enabled |= operator_enabled;
+        for (turn, source) in turns {
             let info = settings.turns.entry(turn).or_default();
             if !source.provider.is_empty() {
                 info.provider = source.provider;
@@ -946,6 +959,40 @@ impl Store {
             info.stopped |= source.stopped;
         }
         Ok(Some(settings))
+    }
+    fn shared_history_metadata(
+        &self,
+        id: i64,
+        original: &str,
+    ) -> Result<(bool, HashMap<usize, crate::agent::TurnInfo>), String> {
+        let tx = if self.conn.is_autocommit() {
+            Some(sql(self.conn.unchecked_transaction())?)
+        } else {
+            None
+        };
+        let metadata = if self.shared_indexed(original)?
+            || matches!(
+                sql(native_chunks::session_storage_mode(&self.conn, original))?,
+                native_chunks::StorageMode::Blob
+            ) {
+            let blocks = self.shared_blocks(id)?;
+            (blocks.iter().any(operator_prompt), project_turns(&blocks)?)
+        } else {
+            let mut operator_enabled = false;
+            let mut root_turn = None;
+            let mut turns = HashMap::new();
+            for source in native_chunks::reader::prompt_sources(&self.conn, original)? {
+                let (offset, block) = source?;
+                operator_enabled |= operator_prompt(&block);
+                let rows = blocks::project(std::slice::from_ref(&block))?;
+                record_turn(&block, &rows, offset, &mut root_turn, &mut turns);
+            }
+            (operator_enabled, turns)
+        };
+        if let Some(tx) = tx {
+            sql(tx.commit())?;
+        }
+        Ok(metadata)
     }
     pub(super) fn shared_save_agent(&self, id: i64, settings: &Settings) -> Result<(), String> {
         self.shared_save_turns(id, &settings.turns)?;

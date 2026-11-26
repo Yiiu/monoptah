@@ -1022,6 +1022,21 @@ impl Store {
         }
         self.shared_load_before(session, before, all)
     }
+    /// A display-only window of a local chunked conversation. The returned
+    /// offset is absolute. Without an anchor, open at the tail. An unavailable
+    /// window returns None so the caller can fall back to its full reader.
+    /// This never changes the revisions or row origin used by a subsequent save.
+    pub fn chunked_history_window(
+        &self,
+        session: i64,
+        anchor: Option<usize>,
+        turns: usize,
+    ) -> Result<Option<(usize, Vec<Row>)>, String> {
+        if self.shared.is_none() || self.remote_session(session)?.is_some() {
+            return Ok(None);
+        }
+        self.shared_chunked_history_window(session, anchor, turns)
+    }
     /// Up to `limit` transcript rows from absolute row `first_row` on, for UI
     /// pagination. The chunked backend reads only the blocks covering the
     /// window; everything else projects its whole history. Paging never

@@ -65,6 +65,17 @@ fn publish(
     cancel: &AtomicBool,
     mut update: Update,
 ) -> Result<(), String> {
+    static PROFILE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *PROFILE.get_or_init(|| std::env::var_os("MONOCODE_PERF_TRANSCRIPT").is_some())
+        && !update.rows.is_empty()
+    {
+        eprintln!(
+            "transcript-send start={} rows={} bytes={}",
+            update.start,
+            update.rows.len(),
+            update.rows.iter().map(|row| row.text.len()).sum::<usize>()
+        );
+    }
     loop {
         if cancel.load(Ordering::Relaxed) {
             return Err("Stopped".into());

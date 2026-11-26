@@ -225,6 +225,7 @@ pub(crate) struct Conversation {
     remote_plans: remote_plans::State,
     store: Database,
     pub(crate) transcript: Entity<TranscriptView>,
+    history_preview: Option<(usize, Entity<TranscriptView>)>,
     pub(crate) review: Entity<crate::session_review::SessionReview>,
     _review_events: Subscription,
     _review_observation: Subscription,
@@ -791,6 +792,7 @@ impl Conversation {
             submission_generation: 0,
             mono_ui: mono::ChatState::default(),
             transcript,
+            history_preview: None,
             review,
             _review_events: review_events,
             _review_observation: review_observation,
@@ -942,6 +944,9 @@ impl Conversation {
     pub(crate) fn reveal_search(&mut self, row: usize, query: String, cx: &mut Context<Self>) {
         if !self.loaded || self.history_unloaded {
             self.pending_search = Some((row, query));
+            if self.history_preview.take().is_some() {
+                cx.notify();
+            }
             self.load(cx);
             return;
         }
@@ -975,6 +980,8 @@ impl Conversation {
         let id = self.summary.id;
         let mono = self.settings.mono.is_some();
         let summary = self.summary.clone();
+        let anchor = self.history_preparation_anchor(cx);
+        let preview = self.load_history_preview(cx);
         let recover_goal = (summary.provider == Kind::Claude.id() && !self.busy)
             .then(|| {
                 let session = summary.provider_id.clone()?;
@@ -983,6 +990,7 @@ impl Conversation {
             })
             .flatten();
         let work = cx.background_executor().spawn(async move {
+            preview.await;
             let settings = locked(&store).and_then(|s| s.agent_settings(id));
             let context = crate::runtime::restored_context(
                 &store,
@@ -1038,7 +1046,7 @@ impl Conversation {
                 })()
                 .map(|(history, edits)| {
                     (
-                        crate::transcript::PreparedHistory::new(history.rows, mono),
+                        crate::transcript::PreparedHistory::at(history.rows, mono, anchor),
                         edits,
                     )
                 }),
@@ -1051,6 +1059,7 @@ impl Conversation {
         cx.spawn(async move |this, cx| {
             let (result, settings, context, follow_ups, before) = work.await;
             let _ = this.update(cx, |this, cx| {
+                this.finish_history_preview(result.as_ref().ok().map(|(history, _)| history), cx);
                 this.loading = false;
                 this.context = context.ok().flatten();
                 match follow_ups {
@@ -4564,7 +4573,9 @@ impl Render for Conversation {
                     .flex_1()
                     .min_h_0()
                     .child(
-                        self.transcript
+                        self.history_preview
+                            .as_ref()
+                            .map_or(&self.transcript, |(_, preview)| preview)
                             .clone()
                             .cached(StyleRefinement::default().size_full()),
                     )

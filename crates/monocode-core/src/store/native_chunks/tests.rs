@@ -49,6 +49,214 @@ fn strip_rows_member(raw: &str) -> Value {
 }
 
 #[test]
+fn reading_agent_settings_does_not_reconstruct_ordinary_history_blocks() {
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+
+    let store = Store::open_monocode(Path::new(":memory:")).unwrap();
+    seed_native_session(
+        &store.conn,
+        "metadata-only",
+        &[json!({
+            "id":"output", "role":"tool", "text":"Command output",
+            "tool":{"kind":"execute", "nativeInput":"synthetic argument".repeat(10_000)},
+        })],
+    );
+    let id = store.resolve_session_id("metadata-only").unwrap();
+    store
+        .conn
+        .authorizer(Some(|context: AuthContext<'_>| match context.action {
+            AuthAction::Read {
+                table_name: "native_blocks",
+                column_name: "skeleton_json",
+            } => Authorization::Deny,
+            _ => Authorization::Allow,
+        }))
+        .unwrap();
+
+    let settings = store.agent_settings(id).unwrap().unwrap();
+    assert!(settings.turns.is_empty());
+    assert!(!settings.operator_enabled);
+}
+
+#[test]
+fn chunked_agent_settings_match_blob_turns_and_operator_history() {
+    let store = Store::open_monocode(Path::new(":memory:")).unwrap();
+    let blocks = [
+        json!({"id":"lead", "role":"assistant", "text":"Earlier reply"}),
+        json!({
+            "id":"prompt", "role":"user", "text":"多行🙂 ".repeat(350),
+            "attachments":[{"id":"file", "path":"synthetic/example.txt", "kind":"file"}],
+            "startedAt":FIXED_TIME, "durationMs":850, "providerTurnId":"historical-turn",
+            "turnModel":{"harness":"codex","id":"codex:old","name":"Old model"},
+            "turnMetrics":{"input_tokens":500,"output_tokens":22},
+        }),
+        json!({"id":"draft", "role":"user", "text":"/mono", "draft":true}),
+        json!({"id":"tool", "role":"tool", "text":"Tool detail","tool":{"kind":"read"}}),
+        json!({"id":"steer", "role":"user", "text":"Continue", "sentAt":FIXED_TIME + 900}),
+        json!({
+            "id":"operator", "role":"user", "text":"Operator notice", "monocode":true,
+            "interjection":{"customType":"custom"},
+        }),
+        json!({
+            "id":"internal", "role":"user", "text":"Monitor finished", "internal":true,
+            "nativeStopped":true,
+        }),
+    ];
+    insert_session(&store.conn, "legacy-settings-blob", &blocks);
+    let blob_id = store.resolve_session_id("legacy-settings-blob").unwrap();
+    let expected = store.agent_settings(blob_id).unwrap().unwrap();
+    assert!(expected.operator_enabled);
+    assert_eq!(expected.turns.len(), 3);
+    assert!(expected
+        .turns
+        .values()
+        .any(|turn| turn.joined_turn.is_some()));
+    for (name, version) in [("legacy-settings-chunks", 1), ("settings-chunks", 2)] {
+        seed_native_session(&store.conn, name, &blocks);
+        store
+            .conn
+            .execute(
+                "UPDATE native_sessions SET mode_version=?1 WHERE session_id=?2",
+                params![version, name],
+            )
+            .unwrap();
+        // Row role is still correct with a noncanonical prefix.
+        store
+            .conn
+            .execute(
+                "UPDATE native_chunks SET rows_json=' ' || rows_json, byte_len=byte_len+1
+                 WHERE session_id=?1 AND block_seq=4 AND chunk_ord=0",
+                [name],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                r#"UPDATE native_chunks
+                   SET rows_json=replace(rows_json, '"role":"user"', ?2),
+                       byte_len=length(CAST(replace(rows_json, '"role":"user"', ?2) AS BLOB))
+                   WHERE session_id=?1 AND block_seq=1 AND chunk_ord=0"#,
+                params![name, r#""role":"\u0075ser""#],
+            )
+            .unwrap();
+        let chunked_id = store.resolve_session_id(name).unwrap();
+        let actual = store.agent_settings(chunked_id).unwrap().unwrap();
+        assert_eq!(actual.operator_enabled, expected.operator_enabled);
+        assert_eq!(
+            serde_json::to_value(actual.turns).unwrap(),
+            serde_json::to_value(&expected.turns).unwrap(),
+        );
+    }
+}
+
+#[test]
+fn metadata_only_user_blocks_still_record_operator_usage() {
+    let store = Store::open_monocode(Path::new(":memory:")).unwrap();
+    seed_native_session(
+        &store.conn,
+        "metadata-operator",
+        &[json!({
+            "id":"operator-card", "role":"user", "text":"", "monocode":true,
+            "monoCard":{"type":"document","documentId":"synthetic-doc","title":"Synthetic card"},
+        })],
+    );
+    let id = store.resolve_session_id("metadata-operator").unwrap();
+    assert!(store.agent_settings(id).unwrap().unwrap().operator_enabled);
+}
+
+#[test]
+fn chunked_preview_uses_absolute_turn_boundaries_and_keeps_full_history() {
+    let store = Store::open_monocode(Path::new(":memory:")).unwrap();
+    let mut blocks = vec![json!({"id":"notice","role":"system","text":"Preamble"})];
+    for turn in 0..5 {
+        blocks.extend([
+            json!({"id":format!("prompt-{turn}"),"role":"user","text":format!("Prompt {turn}")}),
+            json!({"id":format!("reply-{turn}"),"role":"assistant","text":format!("Reply {turn}")}),
+        ]);
+    }
+    seed_native_session(&store.conn, "preview-chunks", &blocks);
+    let id = store.resolve_session_id("preview-chunks").unwrap();
+    let all = blocks::project(&blocks).unwrap();
+
+    let tail = store.chunked_history_window(id, None, 2).unwrap().unwrap();
+    assert_eq!(tail, (7, all[7..].to_vec()));
+    let anchored = store
+        .chunked_history_window(id, Some(6), 2)
+        .unwrap()
+        .unwrap();
+    assert_eq!(anchored, (3, all[3..7].to_vec()));
+    let preamble = store
+        .chunked_history_window(id, Some(0), 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(preamble, (0, all[..3].to_vec()));
+    let anchored_tail = store
+        .chunked_history_window(id, Some(10), 3)
+        .unwrap()
+        .unwrap();
+    assert_eq!(anchored_tail, (5, all[5..].to_vec()));
+    assert!(store
+        .chunked_history_window(id, Some(all.len()), 2)
+        .unwrap()
+        .is_none());
+    assert_eq!(store.load(id).unwrap().rows, all);
+    assert_eq!(
+        session_revision(&store.conn, "preview-chunks").unwrap(),
+        Some(0)
+    );
+    for table in ["native_blocks", "native_chunks"] {
+        store
+            .conn
+            .execute(
+                &format!("UPDATE {table} SET block_seq=block_seq*100+50 WHERE session_id=?1"),
+                ["preview-chunks"],
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        store.chunked_history_window(id, Some(6), 2).unwrap(),
+        Some(anchored)
+    );
+
+    insert_session(&store.conn, "preview-blob", &blocks);
+    let blob_id = store.resolve_session_id("preview-blob").unwrap();
+    assert!(store
+        .chunked_history_window(blob_id, None, 2)
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn reading_an_early_anchor_skips_unrelated_later_chunk_payloads() {
+    let store = Store::open_monocode(Path::new(":memory:")).unwrap();
+    let mut blocks = Vec::new();
+    for turn in 0..200 {
+        blocks.extend([
+            json!({"id":format!("prompt-{turn}"),"role":"user","text":format!("Prompt {turn}")}),
+            json!({"id":format!("reply-{turn}"),"role":"assistant","text":format!("Reply {turn}")}),
+        ]);
+    }
+    let all = blocks::project(&blocks).unwrap();
+    seed_native_session(&store.conn, "early-anchor", &blocks);
+    let id = store.resolve_session_id("early-anchor").unwrap();
+    // A whole-history or newest-first payload scan would hit this malformed
+    // chunk long before reaching the saved reading position.
+    store
+        .conn
+        .execute(
+            "UPDATE native_chunks SET rows_json='invalid', byte_len=7
+             WHERE session_id=?1 AND block_seq=300 AND chunk_ord=0",
+            ["early-anchor"],
+        )
+        .unwrap();
+    assert_eq!(
+        store.chunked_history_window(id, Some(7), 2).unwrap(),
+        Some((4, all[4..8].to_vec()))
+    );
+    assert!(store.page_rows(id, 300, 1).is_err());
+}
+
+#[test]
 fn goal_rows_keep_their_role_when_loading_old_native_chunks() {
     let mut store = Store::open_monocode(Path::new(":memory:")).unwrap();
     // Legacy goals can have pretty-printed JSON and arbitrary field ordering.
