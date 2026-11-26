@@ -470,7 +470,6 @@ impl Conversation {
     pub(crate) fn agent_status_input(
         &self,
         now: u64,
-        step: bool,
         cx: &gpui::App,
     ) -> monocode_core::agent_status::StatusInput {
         use monocode_core::{
@@ -506,9 +505,6 @@ impl Conversation {
                     command: task.command.as_ref().unwrap_or(&task.description).clone(),
                 })
                 .collect(),
-            step: (streaming && step && !self.is_remote())
-                .then(|| self.transcript.read(cx).live_turn(self.execution_cwd()).0)
-                .flatten(),
             last_event_at: self.agent_event_at,
             now,
             ..Default::default()

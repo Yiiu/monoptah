@@ -16,6 +16,7 @@ static IDLE: AgentStatus = AgentStatus {
 pub(super) struct Timing {
     since: u64,
     active_turn: Option<u64>,
+    step: crate::transcript::LiveStep,
 }
 
 pub(super) enum Write {
@@ -195,8 +196,9 @@ impl Shell {
                 now,
                 ..Default::default()
             },
-            |chat| chat.agent_status_input(now, true, cx),
+            |chat| chat.agent_status_input(now, cx),
         );
+        let local_stream = input.streaming && chat.is_some_and(|chat| !chat.is_remote());
         input.remote_waiting = remote_waiting;
         input.streaming |= remote_running || terminal_running;
         let active = input.streaming || input.remote_waiting || input.wake_tasks > 0;
@@ -217,8 +219,16 @@ impl Shell {
         let old_activity = std::mem::discriminant(&self.agent_status(id).activity);
         let timing = self.status_timing.entry(id).or_insert_with(|| Timing {
             since: now,
-            active_turn: None,
+            ..Default::default()
         });
+        if local_stream && let Some(chat) = chat {
+            input.step =
+                chat.transcript
+                    .read(cx)
+                    .live_turn(chat.execution_cwd(), now, &mut timing.step);
+        } else if !input.streaming {
+            timing.step = Default::default();
+        }
         let record = self.session_activity.entry(id).or_default();
 
         if active {

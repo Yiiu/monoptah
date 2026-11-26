@@ -52,13 +52,9 @@ impl Shell {
                     return None;
                 }
                 let duration_ms = if status.unread_done() {
-                    self.sessions.get(id).and_then(|view| {
-                        view.read(cx)
-                            .transcript
-                            .read(cx)
-                            .live_turn(&meta.summary.cwd)
-                            .2
-                    })
+                    self.sessions
+                        .get(id)
+                        .and_then(|view| view.read(cx).transcript.read(cx).live_turn_duration())
                 } else {
                     None
                 };
