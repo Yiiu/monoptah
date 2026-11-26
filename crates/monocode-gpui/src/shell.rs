@@ -6489,15 +6489,7 @@ impl Shell {
                                 .into(),
                         ];
                         if self.offers_codespace() {
-                            items.insert(
-                                items.len() - 1,
-                                MenuAction::new(
-                                    "new-codespace-session",
-                                    "New session in Codespace…",
-                                )
-                                .icon("cloud-upload")
-                                .into(),
-                            );
+                            items.insert(items.len() - 1, Self::new_codespace_menu_item());
                         }
                         items
                     },
@@ -6547,6 +6539,9 @@ impl Shell {
                                 .icon("folder-tree")
                                 .into(),
                         );
+                    }
+                    if self.offers_codespace_for(path) {
+                        create.push(Self::new_codespace_menu_item());
                     }
                     create.push(MenuItem::Separator);
                     items.splice(0..0, create);
@@ -6650,6 +6645,12 @@ impl Shell {
             }
         }
     }
+    fn new_codespace_menu_item() -> MenuItem {
+        MenuAction::new("new-codespace-session", "New session in Codespace…")
+            .icon("cloud-upload")
+            .into()
+    }
+
     fn run_menu(
         &mut self,
         target: MenuTarget,
@@ -6735,6 +6736,8 @@ impl Shell {
                     self.tree_new_session(path, window, cx);
                 } else if action == "tree-new-worktree" {
                     self.compose_in_new_worktree(path, window, cx);
+                } else if action == "new-codespace-session" {
+                    self.open_codespace_picker_for(path, window, cx);
                 } else if action == "pin" {
                     self.toggle_project_rail_pin(&path, cx);
                 } else if action == "project-group:new" {

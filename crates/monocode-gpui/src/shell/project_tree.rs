@@ -1496,6 +1496,40 @@ mod tests {
             .unwrap();
     }
 
+    #[gpui::test]
+    fn tree_project_menus_offer_codespaces_for_the_clicked_project(cx: &mut TestAppContext) {
+        let (window, _, _) = crate::shell::tests::window(cx);
+        window
+            .update(cx, |shell, window, cx| {
+                shell.workspace.set_navigation_layout(NavigationLayout::Tree);
+                let github = "/work/another-project";
+                shell.github_projects.insert(github.into(), true);
+                shell.github_projects.insert("remote://example/project".into(), true);
+                assert_ne!(shell.workspace.project, github);
+                for (path, rail, offered) in [
+                    (github, true, true),
+                    (github, false, false),
+                    ("/work/monocode", true, false),
+                    ("remote://example/project", true, false),
+                ] {
+                    let (_, items, _, _) = shell.menu_items(
+                        &MenuTarget::Project { path: path.into(), rail },
+                        &mut Vec::new(),
+                        window,
+                        cx,
+                    );
+                    assert_eq!(
+                        items.iter().any(|item| matches!(
+                            item, MenuItem::Action(action) if action.id.as_ref() == "new-codespace-session"
+                        )),
+                        offered,
+                        "{path}, rail={rail}",
+                    );
+                }
+            })
+            .unwrap();
+    }
+
     /// A project row's hover "+" starts a session there without the context menu.
     #[gpui::test]
     fn a_project_row_starts_a_session_from_its_hover_button(cx: &mut TestAppContext) {
