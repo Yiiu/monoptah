@@ -161,7 +161,8 @@
 
 ## 实现与验证
 
-- 五个子任务的代码保存在 `.worktrees/agent-status-core` 的 `fix/agent-status-core` 分支工作树中。
+- 五个子任务的代码位于 `feat/agent-overview-tree` 分支（PR #22）。
 - Windows `native-dev` 下通过 46 项 Core 定向回归和 32 项 GPUI 定向回归。通过全目标类型检查和 Clippy。Clippy 仍报告原有 Windows 代码的告警。
 - 自动化覆盖回合完成与唤醒、已读和摘要的存储、Git 合并证据、布局兼容和三种外观下的收起栏、跨项目和工作树切换、云会话的本地标签页范围、决策卡兼容及巡检分批。
-- 真实提供商、云端联调、桌面目测和 Linux CI 尚未验证。Windows 系统提醒按原安排延期。
+- PR #22 的 `4c3603c1` 已通过 Linux Core、GPUI 格式检查、Clippy 和测试，以及 Windows GPUI 类型检查和 Core 测试。[CI 记录](https://github.com/Yiiu/monoptah/actions/runs/45747487531)
+- 真实提供商、云端联调和桌面目测仍待验证。Windows 系统提醒由 `11-26-windows-attention` 交付。

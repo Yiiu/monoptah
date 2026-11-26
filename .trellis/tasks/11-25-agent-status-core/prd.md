@@ -79,9 +79,9 @@ Parent: `11-25-agent-overview`（共同原则和完整需求见父任务 `prd.md
 - [ ] 窗口在前台但用户离开超过 3 分钟时，新完成的会话保持未读。
 - [ ] 重启后，原来在跑、但进程已经不在的会话显示 Stopped，不显示 Working。
 - [ ] 没有新增设置项；macOS 现有的通知行为不变。
-- [ ] Linux CI（fmt、clippy `-D warnings`、GPUI 测试）和 Windows `cargo check` 全部通过。
+- [x] PR #22 的 `4c3603c1` 通过 Linux CI（fmt、clippy `-D warnings`、GPUI 测试）和 Windows `cargo check`。[CI 记录](https://github.com/Yiiu/monoptah/actions/runs/45747487531)
 
-本期只交付 R1–R5（PR-A）。R6 暂缓。
+本期 R1–R5 由 `feat/agent-overview-tree` 分支（PR #22）交付。R6 由 `11-26-windows-attention` 跟进。
 
 ## Out of scope
 
