@@ -1,0 +1,3 @@
+{"file": ".trellis/spec/core/persistence-and-compat.md", "reason": "共享存储兼容、分块模式和版本保护"}
+{"file": ".trellis/spec/native/state-and-async.md", "reason": "会话后台加载、快照与过期结果处理"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "校验存储、会话状态与 UI 行号的跨层契约"}

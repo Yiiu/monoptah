@@ -40,6 +40,31 @@
   after the others, and a file that is not a JSON list is never overwritten"
   (`LoadedWorkflows::unreadable`). Apply the same rule to any list file shared with another app.
 
+## Native conversation history previews
+
+- **Scope.** Use `Store::chunked_history_window(session, anchor, turns)` for the first
+  paint of ordinary local conversations stored in Native chunks. Indexed Mono, remote, and
+  legacy blob histories use their existing readers.
+- **Signature.** The method returns `Result<Option<(usize, Vec<Row>)>, String>`.
+  The tuple contains the absolute index of its first row and the rows in display order.
+- **Contract.** `None` as the anchor requests the latest turns. An absolute row anchor
+  requests a window around that row. Prompt boundaries and rows come from one read snapshot.
+  Keep the absolute origin when mapping a displayed row to search or scroll positions.
+- **Fallback.** `Ok(None)` means a preview is unavailable, including when a saved anchor
+  is outside the current history. `Err` reports a failed read. Conversation loading still runs
+  the authoritative reader in either case.
+- **Examples.** A new view shows the latest turns, an evicted view opens around its saved
+  row, and an invalid anchor falls back to the authoritative history. The preview's lifetime
+  is limited to loading. Sends, edits, and retries depend on the loaded history and its
+  revision check.
+- **Tests.** `chunked_preview_uses_absolute_turn_boundaries_and_keeps_full_history` asserts
+  absolute offsets, legacy fallback and unchanged revisions.
+  `reading_an_early_anchor_skips_unrelated_later_chunk_payloads` guards payload reads.
+  `an_evicted_local_chat_opens_on_its_old_reading_position` verifies scroll restoration.
+- **Read path.** Keep `agent_settings` on the prompt-source metadata path for ordinary
+  Native chunks. Reconstructing all history blocks there repeats payload work before
+  `Store::load`. The full reader supplies the history and write revision.
+
 ## Writing files and databases
 
 - Atomic file writes: write a sibling temp file and `rename` over the target

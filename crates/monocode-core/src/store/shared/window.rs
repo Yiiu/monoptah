@@ -130,6 +130,32 @@ impl Store {
             before: more.then_some(start),
         })
     }
+    pub(in crate::store) fn shared_chunked_history_window(
+        &self,
+        id: i64,
+        anchor: Option<usize>,
+        turns: usize,
+    ) -> Result<Option<(usize, Vec<Row>)>, String> {
+        let tx = if self.conn.is_autocommit() {
+            Some(sql(self.conn.unchecked_transaction())?)
+        } else {
+            None
+        };
+        let original = self.persisted_session_id(id)?;
+        let window = if self.shared_indexed(&original)?
+            || matches!(
+                sql(native_chunks::session_storage_mode(&self.conn, &original))?,
+                native_chunks::StorageMode::Blob
+            ) {
+            None
+        } else {
+            native_chunks::reader::history_window(&self.conn, &original, anchor, turns)?
+        };
+        if let Some(tx) = tx {
+            sql(tx.commit())?;
+        }
+        Ok(window)
+    }
     /// Whether any block of the whole history, not only the window, records
     /// this accepted message.
     pub(super) fn shared_delivered(&self, id: i64, message: &str) -> Result<bool, String> {

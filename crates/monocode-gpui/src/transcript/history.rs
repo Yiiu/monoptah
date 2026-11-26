@@ -12,17 +12,31 @@ pub(crate) type HistoryPager = Arc<dyn Fn(i64, bool) -> Result<HistoryPage, Stri
 pub(crate) struct PreparedHistory {
     rows: Vec<Row>,
     parsers: HashMap<usize, MarkdownParser>,
+    start: usize,
 }
 impl PreparedHistory {
     /// Run on the history loader, before handing its result to the UI.
     pub(crate) fn new(rows: Vec<Row>, mono: bool) -> Self {
-        let start = if mono {
-            page_start(&rows, rows.len())
-        } else {
-            0
-        };
+        Self::at(rows, mono, None)
+    }
+
+    pub(crate) fn at(rows: Vec<Row>, mono: bool, anchor: Option<usize>) -> Self {
+        let before = anchor.map_or(rows.len(), |at| at.saturating_add(1));
+        let start = page_start(&rows, before);
+        Self::from_start(rows, mono, start)
+    }
+
+    pub(crate) fn full(rows: Vec<Row>) -> Self {
+        Self::from_start(rows, false, 0)
+    }
+
+    fn from_start(rows: Vec<Row>, mono: bool, start: usize) -> Self {
         let parsers = prepare_parsers(&rows[start..], start, mono);
-        Self { rows, parsers }
+        Self {
+            rows,
+            parsers,
+            start,
+        }
     }
 }
 
@@ -37,29 +51,117 @@ pub(super) fn page_start(rows: &[Row], before: usize) -> usize {
 }
 
 fn prepare_parsers(rows: &[Row], offset: usize, mono: bool) -> HashMap<usize, MarkdownParser> {
-    let mut parsers = HashMap::new();
-    let mut at = 0;
-    while at < rows.len() {
-        let end = (at + 1..rows.len())
-            .find(|&ix| rows[ix].first)
-            .unwrap_or(rows.len());
-        if rows[at].role == "assistant" || (!mono && rows[at].role == "reasoning") {
-            let text: String = rows[at..end].iter().map(|row| row.text.as_str()).collect();
-            let mut parser = MarkdownParser::new();
-            parser.set_text(&text);
-            parsers.insert(offset + at, parser);
-        }
-        at = end;
-    }
-    parsers
+    parse_history_markdown(markdown_inputs(rows, offset, mono))
 }
 
-pub(super) struct HistoryPosition {
+fn markdown_inputs(
+    rows: &[Row],
+    offset: usize,
+    mono: bool,
+) -> impl Iterator<Item = (usize, String)> + '_ {
+    let mut at = 0;
+    std::iter::from_fn(move || {
+        while at < rows.len() {
+            let start = at;
+            at = (start + 1..rows.len())
+                .find(|&ix| rows[ix].first)
+                .unwrap_or(rows.len());
+            if rows[start].role == "assistant" || (!mono && rows[start].role == "reasoning") {
+                let text = rows[start..at]
+                    .iter()
+                    .map(|row| row.text.as_str())
+                    .collect();
+                return Some((offset + start, text));
+            }
+        }
+        None
+    })
+}
+
+fn parse_history_markdown(
+    inputs: impl IntoIterator<Item = (usize, String)>,
+) -> HashMap<usize, MarkdownParser> {
+    inputs
+        .into_iter()
+        .map(|(at, text)| {
+            let mut parser = MarkdownParser::new();
+            parser.set_text(&text);
+            (at, parser)
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct HistoryPosition {
     key: Option<(usize, usize)>,
     offset: ListOffset,
     following: bool,
 }
 impl TranscriptView {
+    pub(crate) fn loading_preview(&self, first: usize) -> Self {
+        let mut preview = Self::new();
+        preview.chat_layout = self.chat_layout;
+        preview.collapse_groups = self.collapse_groups;
+        preview.fold_work = self.fold_work;
+        preview.file_link_base = self.file_link_base.clone();
+        preview.identity(&self.provider, &self.model);
+        preview.history_preview_scrolled = Some(false);
+        if self.saved_history_anchor().is_some() {
+            // The end of a window centered on an old turn is not the end of
+            // the conversation, even if GPUI can fit the whole window.
+            preview.list.set_follow_mode(FollowMode::Normal);
+        }
+        preview.history_position = self.history_position.map(|mut position| {
+            position.key = position
+                .key
+                .and_then(|(row, part)| Some((row.checked_sub(first)?, part)));
+            position
+        });
+        preview
+    }
+
+    pub(crate) fn preview_position(
+        &self,
+        first: usize,
+        history: &PreparedHistory,
+    ) -> Option<HistoryPosition> {
+        if self.history_preview_scrolled != Some(true) {
+            return None;
+        }
+        let offset = self.list.logical_scroll_top();
+        let following = self.list.is_following_tail();
+        let (row, part) = if following {
+            (self.source.len().checked_sub(1)?, 0)
+        } else {
+            self.rows.get(offset.item_ix)?.key
+        };
+        let absolute = first.checked_add(row)?;
+        let source = self.source.get(row)?;
+        // A save or an edit can land between the preview read and the full
+        // read. A reused row number does not identify the original message.
+        if history.rows.get(absolute) != Some(source)
+            || (following && absolute + 1 != history.rows.len())
+        {
+            return None;
+        }
+        Some(HistoryPosition {
+            key: Some((absolute, part)),
+            offset,
+            following,
+        })
+    }
+
+    pub(crate) fn set_history_position(&mut self, position: HistoryPosition) {
+        self.history_position = Some(position);
+    }
+
+    pub(crate) fn saved_history_anchor(&self) -> Option<usize> {
+        self.history_position
+            .as_ref()
+            .filter(|position| !position.following)
+            .and_then(|position| position.key.map(|key| key.0))
+    }
+
     pub(crate) fn install_prepared_history(
         &mut self,
         history: PreparedHistory,
@@ -70,6 +172,7 @@ impl TranscriptView {
             self.restore_prepared_history(history, cx);
             return;
         }
+        self.history_start = history.start;
         self.prepared_parsers = history.parsers;
         self.patch(0, history.rows, cx);
     }
@@ -107,6 +210,7 @@ impl TranscriptView {
     pub(crate) fn reveal_saved_search(&mut self, row: usize, query: &str, cx: &mut Context<Self>) {
         if self.history_before.is_some() {
             self.history_search = Some((row, query.into()));
+            self.history_prompt = None;
             self.list.pause_following_tail();
             if !self.history_loading {
                 self.load_older_page(true, cx);
@@ -130,16 +234,18 @@ impl TranscriptView {
         let before = self
             .history_search
             .as_ref()
-            .map_or(previous, |(row, _)| row.saturating_add(1).min(previous));
+            .map(|(row, _)| *row)
+            .or(self.history_prompt)
+            .map_or(previous, |row| row.saturating_add(1).min(previous));
         let start = page_start(&self.source, before);
-        // Snapshot only this page. A render/scroll callback must never copy
-        // the long-lived conversation or parse its Markdown synchronously.
-        let rows = self.source[start..previous].to_vec();
+        // A deep jump can span many turns. Copy only the Markdown inputs so
+        // large tool results do not pass through the UI thread for parsing.
+        let inputs =
+            markdown_inputs(&self.source[start..previous], start, self.mono).collect::<Vec<_>>();
         let epoch = self.highlight_epoch;
-        let mono = self.mono;
         let work = cx
             .background_executor()
-            .spawn(async move { prepare_parsers(&rows, start, mono) });
+            .spawn(async move { parse_history_markdown(inputs) });
         cx.spawn(async move |this, cx| {
             let parsers = work.await;
             let _ = this.update(cx, |this, cx| {
@@ -152,6 +258,8 @@ impl TranscriptView {
                 this.rebuild(start, cx);
                 if let Some((row, query)) = this.history_search.take() {
                     this.reveal_search(row, &query, cx);
+                } else if let Some(prompt) = this.history_prompt.take() {
+                    this.jump_to_prompt(prompt, cx);
                 }
             });
         })
@@ -334,6 +442,7 @@ impl TranscriptView {
         self.history_loading = false;
         self.history_requested = false;
         self.history_search = None;
+        self.history_prompt = None;
         self.prepared_parsers.clear();
         self.mono_groups.get_mut().clear();
         self.active_provider_turn_id = None;
@@ -418,6 +527,7 @@ impl TranscriptView {
         self.history_loading = false;
         self.history_requested = false;
         self.history_search = None;
+        self.history_prompt = None;
         self.prepared_parsers = HashMap::new();
         self.mono_groups = Default::default();
         self.attachment_images = HashMap::new();
@@ -453,7 +563,12 @@ impl TranscriptView {
         true
     }
     pub(crate) fn restore_history(&mut self, rows: Vec<Row>, cx: &mut Context<Self>) {
-        self.restore_prepared_history(PreparedHistory::new(rows, self.mono), cx);
+        let history = if self.mono {
+            PreparedHistory::new(rows, true)
+        } else {
+            PreparedHistory::full(rows)
+        };
+        self.restore_prepared_history(history, cx);
     }
     pub(crate) fn restore_prepared_history(
         &mut self,
@@ -483,7 +598,15 @@ impl TranscriptView {
                 self.list.pause_following_tail();
                 let item_ix = position
                     .key
-                    .and_then(|key| self.rows.iter().position(|row| row.key == key))
+                    .and_then(|key| {
+                        self.rows.iter().position(|row| row.key == key).or_else(|| {
+                            self.rows
+                                .iter()
+                                .enumerate()
+                                .min_by_key(|(_, row)| row.key.0.abs_diff(key.0))
+                                .map(|(index, _)| index)
+                        })
+                    })
                     .unwrap_or(position.offset.item_ix.min(self.rows.len()));
                 self.list.scroll_to(ListOffset {
                     item_ix,
@@ -505,6 +628,103 @@ mod tests {
             Row { role: "user".into(), text: format!("Question {turn}"), first: true, sent_at: Some(turn as u64) },
             Row { role: "assistant".into(), text: format!("Answer **{turn}**.\n\nA second paragraph with [a link](https://example.com)."), first: true, sent_at: None },
         ]).collect()
+    }
+
+    #[gpui::test]
+    fn local_chat_prepares_the_recent_turns_without_renumbering_history(cx: &mut TestAppContext) {
+        let rows = long_mono(50);
+        let prepared = PreparedHistory::new(rows.clone(), false);
+        assert_eq!(prepared.parsers.len(), PAGE_TURNS);
+        let view = cx.new(|_| TranscriptView::new());
+        view.update(cx, |view, cx| {
+            view.install_prepared_history(prepared, cx);
+            assert_eq!(view.source_rows(), rows);
+            assert_eq!(view.messages[0].start, 80);
+            view.list.pause_following_tail();
+            view.list.scroll_to(ListOffset {
+                item_ix: 2,
+                offset_in_item: px(5.),
+            });
+            view.load_older_history(cx);
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, _| {
+            let offset = view.list.logical_scroll_top();
+            assert_eq!(view.messages[0].start, 60);
+            assert!(view.rows[offset.item_ix].key.0 >= 80);
+            assert_eq!(offset.offset_in_item, px(5.));
+        });
+    }
+
+    #[gpui::test]
+    fn an_evicted_local_chat_opens_on_its_old_reading_position(cx: &mut TestAppContext) {
+        let rows = long_mono(80);
+        let view = cx.new(|_| TranscriptView::new());
+        view.update(cx, |view, cx| {
+            view.install_prepared_history(PreparedHistory::full(rows.clone()), cx);
+            let item_ix = view.rows.iter().position(|row| row.key.0 == 30).unwrap();
+            let key = view.rows[item_ix].key;
+            view.list.pause_following_tail();
+            view.list.scroll_to(ListOffset {
+                item_ix,
+                offset_in_item: px(5.),
+            });
+            view.visible(false, cx);
+            assert!(view.suspend_history(cx));
+            let anchor = view.saved_history_anchor();
+            assert_eq!(anchor, Some(30));
+            view.restore_prepared_history(PreparedHistory::at(rows, false, anchor), cx);
+            let restored = view.list.logical_scroll_top();
+            assert_eq!(view.rows[restored.item_ix].key, key);
+            assert_eq!(restored.offset_in_item, px(5.));
+        });
+    }
+
+    #[gpui::test]
+    fn a_new_search_selection_supersedes_an_older_page_request(cx: &mut TestAppContext) {
+        let view = cx.new(|_| TranscriptView::new());
+        view.update(cx, |view, cx| {
+            view.install_prepared_history(PreparedHistory::new(long_mono(50), false), cx);
+            view.reveal_search(4, "Question 2", cx);
+            assert!(view.history_loading);
+            view.reveal_search(96, "Question 48", cx);
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, _| {
+            assert_eq!(view.search_match, Some((96, "Question 48".into())));
+        });
+    }
+
+    #[gpui::test]
+    fn an_anchored_preview_keeps_its_position_until_the_reader_scrolls(cx: &mut TestAppContext) {
+        let rows = long_mono(50);
+        let history = PreparedHistory::full(rows.clone());
+        let view = cx.new(|_| {
+            let mut view = TranscriptView::new();
+            view.history_position = Some(HistoryPosition {
+                key: Some((20, 0)),
+                offset: ListOffset {
+                    item_ix: 0,
+                    offset_in_item: px(0.),
+                },
+                following: false,
+            });
+            view.loading_preview(18)
+        });
+        view.update(cx, |view, cx| {
+            view.install_prepared_history(PreparedHistory::full(rows[18..26].to_vec()), cx);
+            assert!(!view.list.is_following_tail());
+            assert!(view.preview_position(18, &history).is_none());
+            view.history_preview_scrolled = Some(true);
+            let position = view.preview_position(18, &history).unwrap();
+            assert_eq!(position.key.unwrap().0, 20);
+            let mut rewritten = rows;
+            rewritten[20].text = "Different saved message".into();
+            assert!(
+                view.preview_position(18, &PreparedHistory::full(rewritten))
+                    .is_none()
+            );
+        });
     }
 
     #[gpui::test]

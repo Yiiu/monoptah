@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/core/persistence-and-compat.md", "reason": "复核旧数据读写与并发保护"}
+{"file": ".trellis/spec/native/testing.md", "reason": "复核分页、滚动位置和冷切换回归覆盖"}
