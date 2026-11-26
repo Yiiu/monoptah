@@ -115,6 +115,88 @@ fn migration_marks_existing_history_read_once_and_leaves_drafts_idle() {
 }
 
 #[test]
+fn table_recreation_restores_unread_receipts_after_restart_without_backfilling() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("monocode.db");
+    let store = Store::open_monocode(&path).unwrap();
+    let unread = store.create("claude", CWD).unwrap().id;
+    let read = store.create("claude", CWD).unwrap().id;
+    store.restore_session_activity(100).unwrap();
+    store
+        .finish_session_turn_with_summary(unread, 110, completed(120), Some("Keep me"))
+        .unwrap();
+    store
+        .finish_session_turn(read, 110, completed(130))
+        .unwrap();
+    store.see_session_turn(read, 130, 140).unwrap();
+    let untouched = store.create("claude", CWD).unwrap().id;
+    store
+        .native_db()
+        .unwrap()
+        .execute_batch("DROP TABLE session_activity")
+        .unwrap();
+    drop(store);
+
+    let reopened = Store::open_monocode(&path).unwrap();
+    let migrated = reopened.restore_session_activity(200).unwrap();
+    assert_eq!(migrated[&unread].last_turn, Some(completed(120)));
+    assert_eq!(migrated[&unread].seen_at, Some(100));
+    assert_eq!(
+        migrated[&unread].progress_summary.as_deref(),
+        Some("Keep me")
+    );
+    assert_eq!(migrated[&read].last_turn, Some(completed(130)));
+    assert_eq!(migrated[&read].seen_at, Some(130));
+    assert!(
+        !migrated.contains_key(&untouched),
+        "repair does not backfill new sessions"
+    );
+}
+
+#[test]
+fn live_repair_retains_active_owners_read_summaries_and_unread_status() {
+    let store = Store::open(Path::new(":memory:")).unwrap();
+    let unread = store.create("claude", CWD).unwrap().id;
+    let read = store.create("claude", CWD).unwrap().id;
+    let active = store.create("claude", CWD).unwrap().id;
+    store.restore_session_activity(100).unwrap();
+    store
+        .finish_session_turn(unread, 110, completed(120))
+        .unwrap();
+    store
+        .finish_session_turn_with_summary(read, 110, completed(130), Some("Reviewed"))
+        .unwrap();
+    store.see_session_turn(read, 130, 140).unwrap();
+    store.begin_session_turn(active, 130).unwrap();
+    let before = store.restore_session_activity(140).unwrap();
+    store.conn.execute_batch("DROP TABLE session_activity; CREATE TABLE session_activity (session_id TEXT PRIMARY KEY)").unwrap();
+
+    assert!(store.see_session_turn(unread, 120, 150).is_err());
+    assert!(store.repair_session_activity(140).unwrap());
+    assert!(!store.repair_session_activity(150).unwrap());
+    assert_eq!(store.restore_session_activity(150).unwrap(), before);
+    store
+        .finish_session_turn(active, 125, completed(150))
+        .unwrap();
+    assert_eq!(
+        store.restore_session_activity(150).unwrap()[&active].last_turn,
+        None
+    );
+    store
+        .finish_session_turn(active, 130, completed(150))
+        .unwrap();
+    store.see_session_turn(unread, 120, 150).unwrap();
+    store
+        .conn
+        .execute_batch("DROP TABLE session_activity")
+        .unwrap();
+    let saved = store.restore_session_activity(160).unwrap();
+    assert_eq!(saved[&unread].seen_at, Some(120));
+    assert_eq!(saved[&read], before[&read]);
+    assert_eq!(saved[&active].last_turn, Some(completed(150)));
+}
+
+#[test]
 fn out_of_order_turn_writes_and_acknowledgements_keep_the_latest_completion_unread() {
     let store = Store::open(Path::new(":memory:")).unwrap();
     let id = store.create("claude", CWD).unwrap().id;

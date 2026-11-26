@@ -225,6 +225,10 @@ impl TranscriptView {
         let mut source = page.rows;
         source.append(&mut self.source);
         self.source = source;
+        self.live_turn_rows.reset();
+        for (at, row) in self.source.iter().enumerate() {
+            self.live_turn_rows.update(at, row);
+        }
         for (turn, info) in page.turns {
             self.turns.entry(turn).or_insert(info);
         }
@@ -413,6 +417,7 @@ impl TranscriptView {
             following: self.list.is_following_tail(),
         });
         self.source = Vec::new();
+        self.live_turn_rows.reset();
         self.source_bytes = 0;
         self.history_start = 0;
         self.history_loading = false;
@@ -464,6 +469,7 @@ impl TranscriptView {
         self.drop_older_history();
         // Reopening also handles a source that became empty in another window.
         self.source = Vec::new();
+        self.live_turn_rows.reset();
         self.source_bytes = 0;
         self.yielded = 0;
         self.yield_mark = 0;

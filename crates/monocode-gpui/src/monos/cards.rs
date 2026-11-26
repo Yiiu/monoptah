@@ -306,7 +306,6 @@ pub(crate) fn launch_views(
     cx: &App,
 ) -> HashMap<i64, crate::transcript::LaunchView> {
     // Saved summaries keep cards current without opening their providers.
-    let summaries = owner.mono_session_views(cx);
     // LaunchedSessionCard: each launch's live state, for the chat's cards.
     mono.launches
         .iter()
@@ -327,21 +326,20 @@ pub(crate) fn launch_views(
                     }
                 }
                 None => {
-                    let summary = summaries.iter().find(|s| s.id == launch.session_id);
+                    let summary = owner.mono_session_view(launch.session_id, cx);
                     crate::transcript::LaunchView {
                         title: summary
+                            .as_ref()
                             .map(|s| s.title.clone())
                             .unwrap_or_else(|| launch.title.clone()),
-                        state: summary.map_or("unavailable", |s| {
+                        state: summary.as_ref().map_or("unavailable", |s| {
                             launched_state(
                                 &owner.agent_status(launch.session_id).activity,
                                 s.has_messages,
                             )
                         }),
                         harness: launch.harness.clone(),
-                        cwd: summary
-                            .map(|s| s.cwd.clone())
-                            .unwrap_or_else(|| launch.cwd.clone()),
+                        cwd: summary.map(|s| s.cwd).unwrap_or_else(|| launch.cwd.clone()),
                         cloud: owner.cloud_badge_of(launch.session_id),
                     }
                 }
@@ -472,20 +470,56 @@ impl Monos {
         let record = mono.decision_cards.entry(id.to_owned()).or_insert_with(|| {
             mono::cards::DecisionRecord {
                 question: question.clone(),
-                answers: Vec::new(),
+                ..Default::default()
             }
         });
         if !record.answers.is_empty() {
             return Ok(());
         }
-        record.answers = answers;
+        record.answers.clone_from(&answers);
+        let now = monocode_core::time::now_ms();
+        record.updated_at = Some(now);
+        mono.prune_decisions(now);
         let mono_id = mono.id.clone();
         // The same roster save holds the answer and its queued user message.
-        self.enqueue(&mono_id, text, Vec::new(), false, cx);
+        if let Some(saved) = self.enqueue_reporting(&mono_id, text, Vec::new(), false, cx) {
+            let id = id.to_owned();
+            cx.spawn(async move |this, cx| {
+                if !matches!(saved.recv().await, Ok(Ok(()))) {
+                    return;
+                }
+                let _ =
+                    this.update(cx, |this, cx| {
+                        if let Some(chat) = this.chats.get(&mono_id) {
+                            chat.update(cx, |chat, cx| {
+                                let card = chat.mono_rows(cx).iter().enumerate().find_map(
+                                    |(index, row)| {
+                                        if row.role != "mono-card" {
+                                            return None;
+                                        }
+                                        let card = serde_json::from_str::<Value>(&row.text).ok()?;
+                                        (card["id"] == id.as_str()).then_some((index, card))
+                                    },
+                                );
+                                if let Some((index, mut card)) = card {
+                                    card["decisionAnswers"] = json!(answers);
+                                    if let Err(error) = chat.mono_patch_card(index, &id, card, cx) {
+                                        eprintln!("Cannot attach a saved decision reply: {error}");
+                                    }
+                                }
+                            });
+                        }
+                    });
+            })
+            .detach();
+        }
         Ok(())
     }
 
-    pub(super) fn hold_card(&mut self, session: i64, mono: &str, value: Value) {
+    pub(super) fn hold_card(&mut self, session: i64, mono: &str, mut value: Value) {
+        if value["type"] == "choices" {
+            value["decisionVersion"] = json!(1);
+        }
         if let Some(run) = self.running.get_mut(&session) {
             run.cards.push(value);
         } else if let Some(mono) = self.roster.get_mut(mono) {

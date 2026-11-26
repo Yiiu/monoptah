@@ -723,7 +723,7 @@ pub(crate) struct Shell {
     classic_worktree_picker: Option<classic_sidebar::WorktreePicker>,
     sidebar_list: sidebar_list::SidebarList,
     tree: project_tree::TreeState,
-    progress_summary_jobs: HashMap<i64, progress_summary::Job>,
+    progress_summary_jobs: progress_summary::Jobs,
     worktree_archive: progress_summary::WorktreeArchive,
     sidebar_slide: Option<PaneSlide>,
     sidebar_fraction: f32,
@@ -865,7 +865,7 @@ pub(crate) struct Shell {
     live_marks: HashMap<i64, Entity<SessionMark>>,
     live_agents_expanded: bool,
     /// Repaints the live agents card when one of its elapsed times changes.
-    live_tick: Option<gpui::Task<()>>,
+    live_tick: Option<(std::time::Instant, gpui::Task<()>)>,
     busy_sessions: HashSet<i64>,
     notification_state: notifications::State,
     github_star: github_star::State,
@@ -1323,7 +1323,7 @@ impl Shell {
             classic_worktree_picker: None,
             sidebar_list: sidebar_list::SidebarList::new(cx),
             tree: project_tree::TreeState::new(cx),
-            progress_summary_jobs: HashMap::new(),
+            progress_summary_jobs: Default::default(),
             worktree_archive: Default::default(),
             sidebar_slide: None,
             sidebar_fraction: if workspace.sidebar_visible { 1. } else { 0. },
@@ -1669,7 +1669,6 @@ impl Shell {
             }));
         this.monos = Some(monos);
         this.bind_notices(cx);
-        this.start_worktree_archive_watch(cx);
         this.init_app_bridge(cx);
         let telegram_dir = locked(&this.store)
             .ok()
@@ -9782,6 +9781,7 @@ impl Render for Shell {
                     window.focus(&target, cx);
                 }));
             self.window_active = window.is_window_active();
+            self.sync_worktree_archive_watch(cx);
             self.sync_cloud_chip_window(cx);
             let chip = self.usage_footer.read(cx).cloud_chip().clone();
             // The chip is an item of the footer's terminal controls group, which the shell lays
@@ -9807,6 +9807,7 @@ impl Render for Shell {
             self.observations
                 .push(cx.observe_window_activation(window, |this, window, cx| {
                     this.window_active = window.is_window_active();
+                    this.sync_worktree_archive_watch(cx);
                     this.sync_cloud_chip_window(cx);
                     if this.window_active {
                         this.refresh_visible_seen(cx);

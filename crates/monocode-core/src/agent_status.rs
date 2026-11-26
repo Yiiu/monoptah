@@ -62,7 +62,6 @@ pub struct AgentStatus {
     pub shells: Vec<ShellTask>,
 }
 
-#[derive(Default)]
 pub struct StatusInput {
     pub approvals: bool,
     pub questions: bool,
@@ -75,9 +74,33 @@ pub struct StatusInput {
     pub step: Option<String>,
     pub state_since: u64,
     pub last_event_at: u64,
+    /// A TUI without an observable terminal grid cannot diagnose silence.
+    pub stale_applicable: bool,
     pub last_turn: Option<TurnEnd>,
     pub seen_at: Option<u64>,
     pub now: u64,
+}
+
+impl Default for StatusInput {
+    fn default() -> Self {
+        Self {
+            approvals: false,
+            questions: false,
+            remote_waiting: false,
+            streaming: false,
+            wake_tasks: 0,
+            usage_limit_resume_at: None,
+            usage_limit_pending: false,
+            shells: Vec::new(),
+            step: None,
+            state_since: 0,
+            last_event_at: 0,
+            stale_applicable: true,
+            last_turn: None,
+            seen_at: None,
+            now: 0,
+        }
+    }
 }
 
 const STALE_AFTER_MS: u64 = 30 * 60 * 1000;
@@ -98,7 +121,8 @@ pub fn derive(input: &StatusInput) -> AgentStatus {
         Activity::Running {
             step: input.step.clone(),
             since: input.state_since,
-            stale: input.now.saturating_sub(input.last_event_at) >= STALE_AFTER_MS,
+            stale: input.stale_applicable
+                && input.now.saturating_sub(input.last_event_at) >= STALE_AFTER_MS,
         }
     } else if input.wake_tasks > 0 {
         Activity::BackgroundWait {
@@ -342,5 +366,19 @@ mod tests {
             derive(&input).label(input.now).as_deref(),
             Some("No update in 30m")
         );
+    }
+
+    #[test]
+    fn running_without_an_event_source_is_never_stale() {
+        let input = StatusInput {
+            streaming: true,
+            stale_applicable: false,
+            now: STALE_AFTER_MS * 2,
+            ..Default::default()
+        };
+        assert!(matches!(
+            derive(&input).activity,
+            Activity::Running { stale: false, .. }
+        ));
     }
 }

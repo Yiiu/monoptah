@@ -58,6 +58,19 @@ fn decision_cards_keep_independent_durable_answers(cx: &mut TestAppContext) {
     cx.run_until_parked();
     let (roster, summaries) = {
         let db = locked(&s.store).unwrap();
+        let later = db
+            .load(s.session)
+            .unwrap()
+            .rows
+            .into_iter()
+            .filter(|row| row.role == "mono-card")
+            .filter_map(|row| serde_json::from_str::<Value>(&row.text).ok())
+            .find(|card| card["id"] == "later")
+            .unwrap();
+        assert_eq!(
+            later["decisionAnswers"],
+            json!(["Two", "Five", "Another check"])
+        );
         (Roster::load(&db).unwrap(), db.sessions().unwrap())
     };
     let decision_cards = &roster.get(&s.id).unwrap().decision_cards;

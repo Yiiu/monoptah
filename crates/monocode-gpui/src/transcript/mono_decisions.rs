@@ -12,8 +12,16 @@ use std::collections::BTreeMap;
 #[derive(Default)]
 pub(super) struct Decisions {
     records: BTreeMap<String, DecisionRecord>,
-    legacy: BTreeMap<String, DecisionRecord>,
+    restored: TranscriptDecisions,
+    release_at: Option<u64>,
     cards: HashMap<String, (Entity<QuestionCard>, gpui::Subscription)>,
+}
+
+#[derive(Default)]
+struct TranscriptDecisions {
+    records: BTreeMap<String, DecisionRecord>,
+    legacy: HashSet<String>,
+    replied: HashSet<String>,
 }
 
 // Before answers carried card ids, clicking a choice queued its exact label.
@@ -22,7 +30,8 @@ fn legacy_records(
     rows: &[Row],
     existing: &BTreeMap<String, DecisionRecord>,
     queued_reply: Option<&str>,
-) -> BTreeMap<String, DecisionRecord> {
+    release_at: Option<u64>,
+) -> TranscriptDecisions {
     use monocode_core::mono::cards::question;
 
     fn record_reply(
@@ -44,36 +53,70 @@ fn legacy_records(
         offers.clear();
     }
 
-    let mut records = BTreeMap::new();
+    let mut out = TranscriptDecisions::default();
     let mut offers = Vec::new();
+    let mut legacy_pending = Vec::new();
     for (ix, row) in rows.iter().enumerate() {
         if row.role == "mono-card"
-            && let Ok(card) = serde_json::from_str::<Value>(&row.text)
-            && let Some(card) = question(&card)
-            && !existing.contains_key(&card.id)
+            && let Ok(value) = serde_json::from_str::<Value>(&row.text)
+            && let Some(card) = question(&value)
         {
-            records
-                .entry(card.id.clone())
-                .or_insert_with(|| DecisionRecord {
-                    question: card.title.clone(),
-                    answers: Vec::new(),
-                });
-            offers.push(card);
-        } else if row.is_prompt() && row.first && !offers.is_empty() {
-            let reply = rows[ix + 1..].iter().take_while(|row| !row.first).fold(
-                row.text.clone(),
-                |mut text, row| {
-                    text.push_str(&row.text);
-                    text
-                },
-            );
-            record_reply(&mut offers, &mut records, &reply);
+            let modern = value["decisionVersion"] == 1
+                || row
+                    .sent_at
+                    .zip(release_at)
+                    .is_some_and(|(sent, release)| sent >= release);
+            if !modern {
+                out.legacy.insert(card.id.clone());
+                legacy_pending.push(card.id.clone());
+            }
+            if existing
+                .get(&card.id)
+                .is_some_and(|record| !record.answers.is_empty())
+            {
+                continue;
+            }
+            if let Some(answers) = value["decisionAnswers"].as_array()
+                && let Ok(answers) = monocode_core::mono::cards::decision_answers(answers)
+            {
+                out.records.insert(
+                    card.id.clone(),
+                    DecisionRecord {
+                        question: card.title,
+                        answers,
+                        updated_at: row.sent_at,
+                    },
+                );
+            } else if !existing.contains_key(&card.id) {
+                out.records
+                    .entry(card.id.clone())
+                    .or_insert_with(|| DecisionRecord {
+                        question: card.title.clone(),
+                        updated_at: modern.then_some(row.sent_at.unwrap_or_default()),
+                        ..Default::default()
+                    });
+                if !modern {
+                    offers.push(card);
+                }
+            }
+        } else if row.role == "user" && row.first && !legacy_pending.is_empty() {
+            out.replied.extend(legacy_pending.drain(..));
+            if !offers.is_empty() {
+                let reply = rows[ix + 1..].iter().take_while(|row| !row.first).fold(
+                    row.text.clone(),
+                    |mut text, row| {
+                        text.push_str(&row.text);
+                        text
+                    },
+                );
+                record_reply(&mut offers, &mut out.records, &reply);
+            }
         }
     }
     if let Some(reply) = queued_reply {
-        record_reply(&mut offers, &mut records, reply);
+        record_reply(&mut offers, &mut out.records, reply);
     }
-    records
+    out
 }
 
 impl TranscriptView {
@@ -81,9 +124,10 @@ impl TranscriptView {
     pub(crate) fn set_mono_decisions(
         &mut self,
         records: BTreeMap<String, DecisionRecord>,
+        release_at: Option<u64>,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.mono_decisions.records == records {
+        if self.mono_decisions.records == records && self.mono_decisions.release_at == release_at {
             return false;
         }
         self.mono_decisions.cards.retain(|id, _| {
@@ -92,6 +136,7 @@ impl TranscriptView {
                 .is_none_or(|record| record.answers.is_empty())
         });
         self.mono_decisions.records = records;
+        self.mono_decisions.release_at = release_at;
         self.refresh_legacy_mono_decisions();
         cx.notify();
         true
@@ -99,28 +144,46 @@ impl TranscriptView {
 
     pub(super) fn refresh_legacy_mono_decisions(&mut self) {
         if self.mono {
-            self.mono_decisions.legacy = legacy_records(
+            self.mono_decisions.restored = legacy_records(
                 &self.source,
                 &self.mono_decisions.records,
                 self.pending
                     .first()
                     .filter(|reply| reply.error.is_none())
                     .map(|reply| reply.text.as_ref()),
+                self.mono_decisions.release_at,
             );
         }
     }
 
     pub(crate) fn pending_mono_decisions(&self) -> BTreeMap<String, String> {
-        if !self.mono {
-            return BTreeMap::new();
-        }
+        self.pending_decisions()
+            .map(|(id, record)| (id.clone(), record.question.clone()))
+            .collect()
+    }
+
+    pub(crate) fn mono_decisions_need_attention(&self) -> bool {
+        self.mono_attention_decisions().next().is_some()
+    }
+
+    pub(crate) fn mono_attention_decisions(
+        &self,
+    ) -> impl Iterator<Item = (&String, &DecisionRecord)> {
+        self.pending_decisions().filter(|(id, record)| {
+            record.updated_at.is_some() && !self.mono_decisions.restored.legacy.contains(*id)
+        })
+    }
+
+    fn pending_decisions(&self) -> impl Iterator<Item = (&String, &DecisionRecord)> {
+        let restored = &self.mono_decisions.restored;
         self.mono_decisions
             .records
             .iter()
-            .chain(self.mono_decisions.legacy.iter())
-            .filter(|(_, record)| record.answers.is_empty())
-            .map(|(id, record)| (id.clone(), record.question.clone()))
-            .collect()
+            .filter(|(id, _)| !restored.records.contains_key(*id))
+            .chain(restored.records.iter())
+            .filter(|(id, record)| {
+                self.mono && record.answers.is_empty() && !restored.replied.contains(*id)
+            })
     }
 
     pub(super) fn mono_decision(&mut self, value: &Value, cx: &mut Context<Self>) -> AnyElement {
@@ -134,13 +197,27 @@ impl TranscriptView {
             .debug_selector(move || selector.clone())
             .w_full()
             .max_w(px(480.));
-        if let Some(record) = self
+        let answer = self
             .mono_decisions
             .records
             .get(&id)
-            .or_else(|| self.mono_decisions.legacy.get(&id))
             .filter(|r| !r.answers.is_empty())
-        {
+            .or_else(|| {
+                self.mono_decisions
+                    .restored
+                    .records
+                    .get(&id)
+                    .filter(|r| !r.answers.is_empty())
+            })
+            .map(|record| format!("You chose: {}", record.answers.join(" · ")))
+            .or_else(|| {
+                self.mono_decisions
+                    .restored
+                    .replied
+                    .contains(&id)
+                    .then(|| "Answered in chat".into())
+            });
+        if let Some(answer) = answer {
             row = row.child(
                 div()
                     .p_3()
@@ -160,7 +237,7 @@ impl TranscriptView {
                             .text_size(px(12.))
                             .text_color(content(0.65))
                             .child(icon("check", 14.).text_color(success_color()))
-                            .child(format!("You chose: {}", record.answers.join(" · "))),
+                            .child(answer),
                     ),
             );
         } else {
@@ -218,10 +295,57 @@ mod tests {
             row("user", "Unrelated message".into()),
             offer("fourth"),
         ];
-        let records = legacy_records(&rows, &BTreeMap::new(), Some("Skip"));
+        let resolved = legacy_records(&rows, &BTreeMap::new(), Some("Skip"), None);
+        let records = resolved.records;
         assert!(records["first"].answers.is_empty());
         assert_eq!(records["second"].answers, ["Run tests"]);
         assert!(records["third"].answers.is_empty());
         assert_eq!(records["fourth"].answers, ["Skip"]);
+        assert!(resolved.replied.contains("first"));
+        assert!(resolved.replied.contains("second"));
+        assert!(resolved.replied.contains("third"));
+        assert!(!resolved.replied.contains("fourth"));
+    }
+
+    #[test]
+    fn a_typed_reply_resolves_old_cards_without_clearing_new_attention() {
+        let offer = |id: &str, at| Row {
+            role: "mono-card".into(),
+            text: json!({"type":"choices","id":id,"options":["Run", "Skip"]}).to_string(),
+            first: true,
+            sent_at: Some(at),
+        };
+        let rows = [
+            offer("legacy", 10),
+            offer("modern", 25),
+            Row {
+                role: "user".into(),
+                text: "Use the safe defaults".into(),
+                first: true,
+                sent_at: Some(30),
+            },
+        ];
+        let mut view = TranscriptView::new();
+        view.mono = true;
+        view.mono_decisions.restored = legacy_records(&rows, &BTreeMap::new(), None, Some(20));
+        assert!(!view.pending_mono_decisions().contains_key("legacy"));
+        assert_eq!(
+            view.mono_attention_decisions()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            ["modern"]
+        );
+    }
+
+    #[test]
+    fn a_pruned_modern_card_keeps_its_attached_answer() {
+        let rows = [Row {
+            role: "mono-card".into(),
+            text: json!({"type":"choices","id":"resolved","options":["Run"],"decisionVersion":1,"decisionAnswers":["Run"]}).to_string(),
+            first: true,
+            sent_at: Some(25),
+        }];
+        let restored = legacy_records(&rows, &BTreeMap::new(), None, Some(20));
+        assert_eq!(restored.records["resolved"].answers, ["Run"]);
     }
 }

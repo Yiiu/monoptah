@@ -2028,11 +2028,19 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.set_enabled
             .collect()
     }
     pub(super) fn check_completions(&mut self, cx: &mut Context<Self>) {
-        let views = self
-            .owner
-            .upgrade()
-            .map(|o| o.read(cx).mono_session_views(cx))
-            .unwrap_or_default();
+        let owner = self.owner.upgrade();
+        let shell = owner.as_ref().map(|owner| owner.read(cx));
+        let views: HashMap<_, _> = self
+            .roster
+            .monos
+            .iter()
+            .flat_map(|mono| &mono.launches)
+            .filter(|launch| launch.notify_on_complete && !launch.completed && !launch.dismissed)
+            .filter_map(|launch| {
+                let id = launch.session_id;
+                Some((id, shell?.mono_session_view(id, cx)?))
+            })
+            .collect();
         let mut ready = Vec::new();
         for mono in &self.roster.monos {
             let source_busy = |source: i64| {
@@ -2043,8 +2051,7 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.set_enabled
             };
             let stopped = |id: i64| {
                 views
-                    .iter()
-                    .find(|v| v.id == id)
+                    .get(&id)
                     .is_none_or(|v| !v.unsettled && v.has_messages)
             };
             for (batch, sessions) in ready_batches(&mono.launches, source_busy, stopped) {
@@ -2062,7 +2069,7 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.set_enabled
             let generations: Vec<_> = sessions
                 .iter()
                 .map(|(id, _)| {
-                    let updated = views.iter().find(|v| v.id == *id).map(|v| v.updated_at);
+                    let updated = views.get(id).map(|v| v.updated_at);
                     (*id, updated)
                 })
                 .collect();
@@ -2090,15 +2097,11 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.set_enabled
                         return;
                     };
                     // A newer turn may have started or settled while the report was read.
-                    let views = this
-                        .owner
-                        .upgrade()
-                        .map(|o| o.read(cx).mono_session_views(cx))
-                        .unwrap_or_default();
+                    let owner = this.owner.upgrade();
+                    let shell = owner.as_ref().map(|owner| owner.read(cx));
                     if generations.iter().any(|(id, seen)| {
-                        views
-                            .iter()
-                            .find(|v| v.id == *id)
+                        shell
+                            .and_then(|shell| shell.mono_session_view(*id, cx))
                             .is_some_and(|v| v.unsettled || Some(v.updated_at) != *seen)
                     }) {
                         return;

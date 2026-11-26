@@ -16,6 +16,7 @@ static IDLE: AgentStatus = AgentStatus {
 pub(super) struct Timing {
     since: u64,
     active_turn: Option<u64>,
+    step: crate::transcript::LiveStep,
 }
 
 pub(super) enum Write {
@@ -33,32 +34,45 @@ pub(super) fn start_writer(store: Database, cx: &App) -> async_channel::Sender<W
         .spawn(async move {
             while let Ok(write) = pending.recv().await {
                 let save = || {
-                    locked(&store).and_then(|store| match &write {
-                        Write::Begin(id, at) => store.begin_session_turn(*id, *at),
-                        Write::Finish(id, started, end, summary) => store
-                            .finish_session_turn_with_summary(*id, *started, *end, Some(summary)),
-                        Write::Summary(id, end, summary) => store
-                            .update_progress_summary(*id, *end, summary)
-                            .map(|_| ()),
-                        Write::ArchivedWorktree(id, evidence) => {
-                            store.remember_worktree_archive(*id, evidence)
-                        }
-                        Write::Seen(id, end, at) => store.see_session_turn(*id, *end, *at),
-                        Write::Flush(done) => {
-                            let _ = done.try_send(());
-                            Ok(())
+                    locked(&store).and_then(|store| {
+                        let save = || match &write {
+                            Write::Begin(id, at) => store.begin_session_turn(*id, *at),
+                            Write::Finish(id, started, end, summary) => store
+                                .finish_session_turn_with_summary(
+                                    *id,
+                                    *started,
+                                    *end,
+                                    Some(summary),
+                                ),
+                            Write::Summary(id, end, summary) => store
+                                .update_progress_summary(*id, *end, summary)
+                                .map(|_| ()),
+                            Write::ArchivedWorktree(id, evidence) => {
+                                store.remember_worktree_archive(*id, evidence)
+                            }
+                            Write::Seen(id, end, at) => store.see_session_turn(*id, *end, *at),
+                            Write::Flush(done) => {
+                                let _ = done.try_send(());
+                                Ok(())
+                            }
+                        };
+                        match save() {
+                            Err(error)
+                                if error.contains("no such table: session_activity")
+                                    || error.contains("no such column")
+                                    || error.contains("table session_activity has no column") =>
+                            {
+                                if store.repair_session_activity(now_ms())? {
+                                    save()
+                                } else {
+                                    Err(error)
+                                }
+                            }
+                            result => result,
                         }
                     })
                 };
                 let mut result = save();
-                if result
-                    .as_ref()
-                    .is_err_and(|e| e.contains("no such table: session_activity"))
-                {
-                    result = locked(&store)
-                        .and_then(|store| store.restore_session_activity(now_ms()))
-                        .and_then(|_| save());
-                }
                 for delay in [50, 150, 350] {
                     if !result
                         .as_ref()
@@ -105,37 +119,23 @@ impl Shell {
         self.status_timing.remove(&id);
         self.session_activity.remove(&id);
         self.busy_sessions.remove(&id);
-        self.progress_summary_jobs.remove(&id);
+        self.progress_summary_jobs.cancel(id);
     }
 
-    pub(super) fn has_running_status(&self) -> bool {
-        self.agent_statuses.values().any(|status| {
-            matches!(
-                status.activity,
-                Activity::Running { stale: false, .. }
-                    | Activity::BackgroundWait {
-                        reason: agent_status::Wait::UsageLimit { .. },
-                        ..
-                    }
-            )
-        })
+    pub(super) fn status_tick_delay(&self, now: u64) -> Option<std::time::Duration> {
+        self.agent_statuses
+            .values()
+            .filter_map(|status| status_tick_ms(&status.activity, now))
+            .min()
+            .map(std::time::Duration::from_millis)
     }
 
     pub(super) fn refresh_status_clocks(&mut self, cx: &mut Context<Self>) {
+        let now = now_ms();
         let running: Vec<_> = self
             .agent_statuses
             .iter()
-            .filter_map(|(&id, status)| {
-                matches!(
-                    status.activity,
-                    Activity::Running { stale: false, .. }
-                        | Activity::BackgroundWait {
-                            reason: agent_status::Wait::UsageLimit { .. },
-                            ..
-                        }
-                )
-                .then_some(id)
-            })
+            .filter_map(|(&id, status)| status_tick_ms(&status.activity, now).map(|_| id))
             .collect();
         for id in running {
             self.refresh_status(id, cx);
@@ -182,10 +182,19 @@ impl Shell {
                 now,
                 ..Default::default()
             },
-            |chat| chat.agent_status_input(now, true, cx),
+            |chat| chat.agent_status_input(now, cx),
         );
+        let local_stream = input.streaming && chat.is_some_and(|chat| !chat.is_remote());
         input.remote_waiting = remote_waiting;
         input.streaming |= remote_running || terminal_running;
+        if self.is_terminal(id) {
+            let output = self
+                .tui_sessions
+                .get(&id)
+                .and_then(|tui| tui.read(cx).last_output_at());
+            input.stale_applicable = output.is_some();
+            input.last_event_at = input.last_event_at.max(output.unwrap_or_default());
+        }
         let active = input.streaming || input.remote_waiting || input.wake_tasks > 0;
         let local = chat.is_some_and(|chat| !chat.is_remote()) || terminal_running;
         let outcome = external_outcome.or_else(|| chat.and_then(|chat| chat.agent_outcome));
@@ -204,8 +213,16 @@ impl Shell {
         let old_activity = std::mem::discriminant(&self.agent_status(id).activity);
         let timing = self.status_timing.entry(id).or_insert_with(|| Timing {
             since: now,
-            active_turn: None,
+            ..Default::default()
         });
+        if local_stream && let Some(chat) = chat {
+            input.step =
+                chat.transcript
+                    .read(cx)
+                    .live_turn(chat.execution_cwd(), now, &mut timing.step);
+        } else if !input.streaming {
+            timing.step = Default::default();
+        }
         let record = self.session_activity.entry(id).or_default();
 
         if active {
@@ -214,7 +231,7 @@ impl Shell {
                     .last_turn
                     .map_or(now, |end| now.max(end.at.saturating_add(1)));
                 timing.active_turn = Some(at);
-                self.progress_summary_jobs.remove(&id);
+                self.progress_summary_jobs.cancel(id);
                 if local {
                     let _ = self.activity_writes.try_send(Write::Begin(id, at));
                 }
@@ -322,7 +339,9 @@ impl Shell {
         let was_unread = self.agent_status(id).unread_done();
         self.tree_note_unread(id, was_unread, &status.activity, cx);
         self.agent_statuses.insert(id, status);
-        self.sync_agent_status_tick(cx);
+        if changed {
+            self.sync_agent_status_tick(cx);
+        }
         if busy_changed || animation_changed {
             self.push_inbox_busy(cx);
         }
@@ -389,5 +408,46 @@ impl Shell {
             .activity_writes
             .try_send(Write::Seen(id, end.at, now_ms().max(end.at)));
         self.update_agent_status(id, None, cx);
+    }
+}
+
+fn status_tick_ms(activity: &Activity, now: u64) -> Option<u64> {
+    match activity {
+        Activity::Running { stale: false, .. } => Some(15_000),
+        Activity::BackgroundWait {
+            reason: agent_status::Wait::UsageLimit { resume_at },
+            ..
+        } => Some(match resume_at.saturating_sub(now) {
+            600_001.. => 60_000,
+            60_000..=600_000 => 15_000,
+            _ => 1_000,
+        }),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn long_usage_limits_wake_by_the_minute_until_the_reset_approaches() {
+        let resume_at = 75 * 60_000;
+        let state = Activity::BackgroundWait {
+            reason: agent_status::Wait::UsageLimit { resume_at },
+            since: 0,
+        };
+        let mut now = 0;
+        let mut long_wakes = 0;
+        while resume_at - now > 600_000 {
+            let delay = status_tick_ms(&state, now).unwrap();
+            assert_eq!(delay, 60_000);
+            now += delay;
+            long_wakes += 1;
+        }
+        assert_eq!(long_wakes, 65);
+        assert_eq!(status_tick_ms(&state, now), Some(15_000));
+        assert_eq!(status_tick_ms(&state, resume_at - 59_000), Some(1_000));
+        assert_eq!(status_tick_ms(&Activity::Idle, now), None);
     }
 }

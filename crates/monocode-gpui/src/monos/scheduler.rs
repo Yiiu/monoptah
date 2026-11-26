@@ -5,9 +5,45 @@ use monocode_core::mono::habits::{Run, Schedule};
 use monocode_core::mono::{heartbeat, patrol};
 use monocode_core::time::now_ms;
 
-enum Claimed {
-    Habit(Box<Habit>),
-    Heartbeat(String),
+enum Scheduled {
+    Habit(String, Box<Habit>),
+    Patrol(Vec<String>),
+}
+
+struct HeartbeatSchedule {
+    id: String,
+    session: Option<i64>,
+    minutes: u32,
+}
+
+fn due_heartbeats(
+    store: &Database,
+    root: &std::path::Path,
+    schedules: Vec<HeartbeatSchedule>,
+    now: u64,
+) -> Result<Vec<String>, String> {
+    let mut due = Vec::new();
+    for schedule in schedules {
+        let state = heartbeat::load(root, &schedule.id)?;
+        if state.last_run_at == 0 {
+            due.push(schedule.id);
+            continue;
+        }
+        // Skip even the stored chat timestamp before the earliest possible due
+        // time. A new chat turn can only move that bound later.
+        if now.saturating_sub(state.last_run_at) < heartbeat::interval_ms(schedule.minutes, 0) {
+            continue;
+        }
+        let activity = if let Some(id) = schedule.session {
+            locked(store)?.mono_session(id)?.map_or(0, |s| s.updated_at)
+        } else {
+            0
+        };
+        if heartbeat::due(schedule.minutes, &state, activity, now) {
+            due.push(schedule.id);
+        }
+    }
+    Ok(due)
 }
 /// What a worker needs to decide whether a Mono's heartbeat is due.
 struct HeartbeatCandidate {
@@ -1482,7 +1518,28 @@ impl Monos {
         .detach();
     }
     /// Monos whose chat is idle with nothing queued; habits run first.
-    fn heartbeat_candidates(&self, cx: &App) -> Vec<HeartbeatCandidate> {
+    fn heartbeat_monos<'a>(&'a self, cx: &'a App) -> impl Iterator<Item = &'a Mono> {
+        self.roster.monos.iter().filter(|m| {
+            m.heartbeat_minutes > 0
+                && (m.session_id.is_some() || !m.projects.is_empty())
+                && m.unavailable_session.is_none()
+                && m.outbox.is_empty()
+                && !self.chats.get(&m.id).is_some_and(|v| v.read(cx).busy)
+                && !self.inflight.contains_key(&m.id)
+        })
+    }
+
+    fn heartbeat_candidates(&self, due: &[String], cx: &App) -> Vec<HeartbeatCandidate> {
+        if due.is_empty() {
+            return Vec::new();
+        }
+        let monos: Vec<_> = self
+            .heartbeat_monos(cx)
+            .filter(|m| due.contains(&m.id))
+            .collect();
+        if monos.is_empty() {
+            return Vec::new();
+        }
         let mut skip: HashSet<i64> = self.roster.hidden_sessions.iter().copied().collect();
         for m in &self.roster.monos {
             skip.extend(m.session_id);
@@ -1493,21 +1550,14 @@ impl Monos {
         let views = shell
             .map(|shell| shell.mono_session_views(cx))
             .unwrap_or_default();
-        self.roster
-            .monos
-            .iter()
-            .filter(|m| {
-                m.heartbeat_minutes > 0
-                    && (m.session_id.is_some() || !m.projects.is_empty())
-                    && m.unavailable_session.is_none()
-                    && m.outbox.is_empty()
-            })
-            .filter(|m| !self.chats.get(&m.id).is_some_and(|v| v.read(cx).busy))
-            .filter(|m| !self.inflight.contains_key(&m.id))
+        monos
+            .into_iter()
             .map(|m| {
                 let sessions = views
                     .iter()
-                    .filter(|view| m.works_on(&view.project) && !skip.contains(&view.id))
+                    .filter(|view| {
+                        !view.archived && m.works_on(&view.project) && !skip.contains(&view.id)
+                    })
                     .map(|view| {
                         let at = match view.activity {
                             monocode_core::agent_status::Activity::Done { at, .. } => Some(at),
@@ -1582,10 +1632,10 @@ impl Monos {
             return 0;
         };
         if let Some(owner) = self.owner.upgrade() {
-            let sessions = owner.read(cx).mono_session_views(cx);
+            let shell = owner.read(cx);
             for launch in &mono.launches {
                 (launch.session_id, launch.completed, launch.dismissed).hash(&mut hasher);
-                if let Some(s) = sessions.iter().find(|s| s.id == launch.session_id) {
+                if let Some(s) = shell.mono_session_view(launch.session_id, cx) {
                     (
                         s.busy,
                         s.needs_input,
@@ -1669,7 +1719,14 @@ impl Monos {
         self.scheduling = true;
         let root = self.root.clone();
         let ids: Vec<_> = self.roster.monos.iter().map(|m| m.id.clone()).collect();
-        let beats = self.heartbeat_candidates(cx);
+        let beats = self
+            .heartbeat_monos(cx)
+            .map(|m| HeartbeatSchedule {
+                id: m.id.clone(),
+                session: m.session_id,
+                minutes: m.heartbeat_minutes,
+            })
+            .collect();
         let store = self.store.clone();
         let work = cx.background_executor().spawn(async move {
             // Whether a habits file was rewritten without claiming a run, such as
@@ -1708,39 +1765,69 @@ impl Monos {
                 })?;
                 rewritten |= wrote;
                 if let Some(h) = claimed {
-                    return Ok::<_, String>((Some((id, Claimed::Habit(Box::new(h)))), rewritten));
+                    return Ok::<_, String>((Scheduled::Habit(id, Box::new(h)), rewritten));
                 }
             }
+            Ok((
+                Scheduled::Patrol(due_heartbeats(&store, &root, beats, now)?),
+                rewritten,
+            ))
+        });
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let _ = this.update(cx, |this, cx| match result {
+                Ok((Scheduled::Habit(id, habit), _)) => {
+                    this.scheduling = false;
+                    this.start_habit(&id, *habit, cx);
+                }
+                Ok((Scheduled::Patrol(due), rewritten)) => {
+                    this.prepare_due_heartbeats(&due, now, cx);
+                    if rewritten {
+                        cx.notify();
+                    }
+                }
+                Err(e) => {
+                    this.scheduling = false;
+                    this.error = Some(e);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        changed
+    }
+
+    fn prepare_due_heartbeats(&mut self, due: &[String], now: u64, cx: &mut Context<Self>) {
+        let beats = self.heartbeat_candidates(due, cx);
+        if beats.is_empty() {
+            self.scheduling = false;
+            return;
+        }
+        let store = self.store.clone();
+        let root = self.root.clone();
+        let work = cx.background_executor().spawn(async move {
             for beat in beats {
                 if let Some(text) = prepare_heartbeat(&store, &root, &beat, now, fetch_inbox)? {
-                    return Ok((
-                        Some((beat.mono.id.clone(), Claimed::Heartbeat(text))),
-                        rewritten,
-                    ));
+                    return Ok::<_, String>(Some((beat.mono.id, text)));
                 }
             }
-            Ok((None, rewritten))
+            Ok(None)
         });
         cx.spawn(async move |this, cx| {
             let result = work.await;
             let _ = this.update(cx, |this, cx| {
                 this.scheduling = false;
                 match result {
-                    Ok((Some((id, Claimed::Habit(habit))), _)) => this.start_habit(&id, *habit, cx),
-                    Ok((Some((id, Claimed::Heartbeat(text))), _)) => {
-                        this.start_heartbeat(&id, text, cx)
-                    }
-                    Ok((None, true)) => cx.notify(),
-                    Ok((None, false)) => (),
-                    Err(e) => {
-                        this.error = Some(e);
+                    Ok(Some((id, text))) => this.start_heartbeat(&id, text, cx),
+                    Ok(None) => {}
+                    Err(error) => {
+                        this.error = Some(error);
                         cx.notify();
                     }
                 }
             });
         })
         .detach();
-        changed
     }
     fn start_habit(&mut self, id: &str, habit: Habit, cx: &mut Context<Self>) {
         let text = habit_prompt(&habit.name, &habit.instructions);
@@ -2164,10 +2251,25 @@ mod tests {
             .unwrap();
         cx.run_until_parked();
         s.manager.read_with(cx, |manager, cx| {
-            let candidates = manager.heartbeat_candidates(cx);
+            let candidates = manager.heartbeat_candidates(std::slice::from_ref(&s.id), cx);
             let beat = candidates.iter().find(|beat| beat.mono.id == s.id).unwrap();
             assert_eq!(beat.patrol.sessions[&id].project, s.project);
         });
+    }
+
+    #[gpui::test]
+    fn an_idle_clock_does_not_build_any_patrol_session_views(cx: &mut gpui::TestAppContext) {
+        let s = crate::monos::tests::setup(cx);
+        let now = now_ms();
+        heartbeat::update(&s.root, &s.id, |state| state.last_run_at = now).unwrap();
+        let tick = |cx: &mut gpui::TestAppContext| {
+            s.manager.update(cx, |monos, cx| monos.tick_at(now, cx));
+            cx.run_until_parked();
+        };
+        tick(cx);
+        let before = crate::shell::Shell::mono_session_view_build_count();
+        tick(cx);
+        assert_eq!(crate::shell::Shell::mono_session_view_build_count(), before);
     }
 
     #[test]

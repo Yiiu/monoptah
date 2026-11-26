@@ -470,7 +470,6 @@ impl Conversation {
     pub(crate) fn agent_status_input(
         &self,
         now: u64,
-        step: bool,
         cx: &gpui::App,
     ) -> monocode_core::agent_status::StatusInput {
         use monocode_core::{
@@ -487,7 +486,8 @@ impl Conversation {
         let auto_resume = self.auto_resume_state(now as i64);
         StatusInput {
             approvals: !self.approvals.is_empty(),
-            questions: !self.questions.is_empty() || !self.pending_mono_decisions(cx).is_empty(),
+            questions: !self.questions.is_empty()
+                || self.transcript.read(cx).mono_decisions_need_attention(),
             streaming,
             wake_tasks,
             usage_limit_resume_at: match auto_resume {
@@ -506,9 +506,6 @@ impl Conversation {
                     command: task.command.as_ref().unwrap_or(&task.description).clone(),
                 })
                 .collect(),
-            step: (streaming && step && !self.is_remote())
-                .then(|| self.transcript.read(cx).live_turn(self.execution_cwd()).0)
-                .flatten(),
             last_event_at: self.agent_event_at,
             now,
             ..Default::default()

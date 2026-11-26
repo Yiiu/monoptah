@@ -1188,19 +1188,30 @@ impl Monos {
         internal: bool,
         cx: &mut Context<Self>,
     ) {
-        if let Some(mono) = self.roster.get_mut(id) {
-            mono.outbox.push(Message {
-                id: mono::new_id(),
-                text,
-                sent_at: Some(monocode_core::time::now_ms()),
-                internal,
-                error: None,
-                attachments,
-            });
-            self.save(cx);
-            self.configure_chat(id, cx);
-            self.dispatch(id, cx);
-        }
+        self.enqueue_reporting(id, text, attachments, internal, cx);
+    }
+
+    fn enqueue_reporting(
+        &mut self,
+        id: &str,
+        text: String,
+        attachments: Vec<String>,
+        internal: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<async_channel::Receiver<Result<(), String>>> {
+        let mono = self.roster.get_mut(id)?;
+        mono.outbox.push(Message {
+            id: mono::new_id(),
+            text,
+            sent_at: Some(monocode_core::time::now_ms()),
+            internal,
+            error: None,
+            attachments,
+        });
+        let saved = self.save_reporting(cx);
+        self.configure_chat(id, cx);
+        self.dispatch(id, cx);
+        Some(saved)
     }
     fn dispatch(&mut self, id: &str, cx: &mut Context<Self>) {
         let delivered = self
@@ -1280,12 +1291,15 @@ impl Monos {
                     } else if let Some(decision) = decision
                         && let Some(mono) = self.roster.get_mut(id)
                     {
+                        let now = monocode_core::time::now_ms();
                         mono.decision_cards.entry(decision.id).or_insert(
                             mono::cards::DecisionRecord {
                                 question: decision.title,
                                 answers: Vec::new(),
+                                updated_at: Some(now),
                             },
                         );
+                        mono.prune_decisions(now);
                     } else if let Some(body) = body {
                         let session = view.read(cx).summary.id;
                         cx.emit(NotificationPosted { session, body });
