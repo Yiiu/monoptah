@@ -71,6 +71,8 @@ fn state_label(state: State) -> &'static str {
     match state {
         State::Idle => "Idle",
         State::Working => "Running",
+        State::Waiting => "Waiting in background",
+        State::Stale => "No update in 30m",
         State::Done => "Done",
         State::Attention => "Waiting",
     }

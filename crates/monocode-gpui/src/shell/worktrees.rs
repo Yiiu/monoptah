@@ -108,7 +108,7 @@ impl Shell {
                             tab: *tab,
                             cwd: self.session_working_copy(id, cx).to_owned(),
                             workspace: self.workspace.tab_workspaces.get(tab).cloned(),
-                            busy: session.busy,
+                            busy: self.agent_status(id).is_busy(),
                         })
                     })
             })

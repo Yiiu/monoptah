@@ -917,6 +917,9 @@ impl Protocol {
                 {
                     self.acp.stage = Stage::Background;
                     self.acp.background_poll = None;
+                    events.push(Event::TurnActivity(TurnActivity::Yielded {
+                        wake_tasks: self.acp.background.len() as u32,
+                    }));
                 } else {
                     self.done = true;
                     events.push(Event::Done);
@@ -1110,6 +1113,7 @@ impl Protocol {
         );
         self.acp.message += 1;
         self.text_key = None;
+        events.push(Event::TurnActivity(TurnActivity::Running));
         events.push(Event::BeginAssistant);
         self.acp_send(
             Stage::Prompt,

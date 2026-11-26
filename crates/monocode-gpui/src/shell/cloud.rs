@@ -1176,9 +1176,16 @@ impl Shell {
         self.cloud_origins = snapshot.origins;
         self.cloud_located = snapshot.located;
         self.cloud_gone = snapshot.gone;
-        for (id, activity) in &snapshot.activity {
+        let mut activity_changed = false;
+        for (id, activity) in snapshot.activity {
             // Host activity of the project is only polled for remote projects.
-            self.remote_marks.insert(*id, *activity);
+            if self.remote_marks.insert(id, activity) != Some(activity) {
+                self.refresh_status(id, cx);
+                activity_changed = true;
+            }
+        }
+        if activity_changed {
+            self.process_notification_inputs(cx);
         }
         self.github_projects.extend(snapshot.github);
         self.sync_codespace_offers(cx);

@@ -515,6 +515,12 @@ fn main() {
         projects.push(workspace.project);
     }
     let sidebar_metadata = db.session_sidebar_metadata(&projects);
+    let session_activity = db
+        .restore_session_activity(monocode_core::time::now_ms())
+        .unwrap_or_else(|error| {
+            eprintln!("Cannot restore agent session activity: {error}");
+            Default::default()
+        });
     let db = Arc::new(Mutex::new(db));
     // GPUI reports frame stalls through `log`; keep warnings where a Finder launch can't lose them.
     #[cfg(target_os = "macos")]
@@ -635,6 +641,7 @@ fn main() {
                             cwd,
                             saved,
                             sidebar_metadata,
+                            session_activity,
                             cx,
                         )
                     });

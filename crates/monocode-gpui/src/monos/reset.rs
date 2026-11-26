@@ -287,6 +287,7 @@ impl Monos {
         self.chats.remove(id);
         if let Some(old) = old {
             self.roster.hidden_sessions.retain(|&s| s != old);
+            self.forget_chat_activity(old, cx);
         }
         // The Mono may have been deleted while the row was going: it must not
         // come back, and there is no chat to make.
@@ -294,6 +295,7 @@ impl Monos {
             mono.session_id = None;
             mono.unavailable_session = None;
             mono.seen_rows = 0;
+            mono.decision_cards.clear();
             mono.outbox.retain(|m| !delivered.contains(&m.id));
             self.save(cx);
             self.ensure_chat(id, cx);

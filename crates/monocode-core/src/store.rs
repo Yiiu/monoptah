@@ -23,6 +23,8 @@ pub use remote::{
     RemoteUpload, CONVERTED, MISSING_HOST, SANDBOX_STOPPED_DELETE,
 };
 pub(crate) use shared::handle as desktop_session_handle;
+mod session_activity;
+pub use session_activity::SessionActivity;
 mod session_metadata;
 pub use session_metadata::{MobileSessionMetadata, SessionSidebarMetadata};
 mod session_preview;
@@ -1516,6 +1518,7 @@ impl Store {
         }
         // Resolve the folder first; the persisted id is gone after deletion.
         let dir = self.thread_dir(id).ok().flatten();
+        let activity_key = self.session_activity_key(id).ok().flatten();
         let cloud_cursor = match self.cloud_location(id) {
             Ok(SessionLocation::Cloud(l)) => Some((l.environment_id, l.host_session_id)),
             _ => None,
@@ -1537,6 +1540,9 @@ impl Store {
             .into_iter()
             .collect();
         delete_rows(self)?;
+        if let Some(key) = activity_key {
+            let _ = self.clear_session_activity(&key);
+        }
         for remote in backing {
             let _ = self.forget_cloud_session(remote);
         }

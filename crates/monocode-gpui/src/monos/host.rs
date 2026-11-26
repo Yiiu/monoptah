@@ -2045,7 +2045,7 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.set_enabled
                 views
                     .iter()
                     .find(|v| v.id == id)
-                    .is_none_or(|v| !v.busy && v.has_messages)
+                    .is_none_or(|v| !v.unsettled && v.has_messages)
             };
             for (batch, sessions) in ready_batches(&mono.launches, source_busy, stopped) {
                 if !self.completion_work.contains(&(mono.id.clone(), batch)) {
@@ -2099,7 +2099,7 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.set_enabled
                         views
                             .iter()
                             .find(|v| v.id == *id)
-                            .is_some_and(|v| v.busy || Some(v.updated_at) != *seen)
+                            .is_some_and(|v| v.unsettled || Some(v.updated_at) != *seen)
                     }) {
                         return;
                     }

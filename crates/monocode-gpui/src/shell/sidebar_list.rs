@@ -646,7 +646,8 @@ impl Shell {
 
     pub(super) fn sidebar_navigation(&mut self, cx: &mut Context<Self>) -> AnyElement {
         // The Focused layout shows Search as an icon beside Sidebar options.
-        let search_field = self.workspace.sidebar_search_visible && self.workspace.classic_layout;
+        let search_field = self.workspace.sidebar_search_visible
+            && (self.workspace.classic_layout || self.workspace.tree_layout());
         let focused = !self.workspace.classic_layout;
         let blank_session = focused && self.active_session_is_blank(cx);
         div()
@@ -1271,6 +1272,7 @@ mod tests {
             .update(cx, |shell, _, cx| {
                 for id in [a, b] {
                     shell.sessions[&id].update(cx, |session, _| session.busy = true);
+                    shell.refresh_status(id, cx);
                 }
                 shell.invalidate_chrome(cx);
             })

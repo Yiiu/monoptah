@@ -23,6 +23,15 @@ impl Conversation {
                     label: question.notification_label().to_owned(),
                 }
             }))
+            .chain(
+                self.pending_mono_decisions(cx)
+                    .into_iter()
+                    .map(|(request_id, label)| PendingInput {
+                        request_id,
+                        kind: InputKind::Question,
+                        label,
+                    }),
+            )
             .collect()
     }
 

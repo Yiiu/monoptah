@@ -63,7 +63,7 @@ impl SidebarPeek {
 }
 
 impl Shell {
-    /// Only the Focused layout's collapsed sidebar peeks, rounded or boxy.
+    /// Focused and Tree peeking work in either workspace style.
     fn peek_available(&self) -> bool {
         !self.workspace.classic_layout
             && !self.workspace.sidebar_visible
@@ -238,7 +238,7 @@ impl Shell {
                 .size_full()
                 .child(watch)
                 .child(self.peek_backdrop(progress, cx))
-                .child(self.peek_panel(progress, window))
+                .child(self.peek_panel(progress, window, cx))
                 .into_any_element(),
         )
     }
@@ -258,7 +258,12 @@ impl Shell {
         div().absolute().top_0().left_0().size_full().bg(dim)
     }
 
-    fn peek_panel(&self, progress: f32, window: &mut Window) -> gpui::Stateful<gpui::Div> {
+    fn peek_panel(
+        &self,
+        progress: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
         // Glass blurs the dimmed workspace under a faint wash; otherwise the
         // panel takes the window's own surface.
         let glass = self.window_glass == Some(true) && !is_light();
@@ -295,7 +300,13 @@ impl Shell {
                 BoxShadow::new(px(0.), px(12.), rgba(0x00000047).into()).blur_radius(px(32.)),
                 BoxShadow::new(px(0.), px(2.), rgba(0x00000029).into()).blur_radius(px(6.)),
             ])
-            .when(!glass, |d| d.bg(shell_fill()))
+            .when(!glass, |d| {
+                d.bg(if self.workspace.tree_layout() {
+                    floating_fill()
+                } else {
+                    shell_fill()
+                })
+            })
             .when(glass, |d| {
                 d.child(
                     canvas(
@@ -319,6 +330,18 @@ impl Shell {
                 )
             })
             .child(sidebar)
+            .when(self.workspace.tree_layout() && self.peek_open(), |d| {
+                d.child(
+                    icon_button("tree-peek-pin", "Keep sidebar open", "pin")
+                        .debug_selector(|| "tree-peek-pin".into())
+                        .absolute()
+                        .top(px(8.))
+                        .right(px(8.))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.toggle_primary_sidebar(window, cx)
+                        })),
+                )
+            })
             // The border rides above the contents, inside the rounding.
             .child(
                 div()

@@ -62,13 +62,6 @@ fn capped(text: &str, max: usize) -> (String, bool) {
     }
 }
 
-/// What a chat waits on the user for, so the phone can say so.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Waiting {
-    Approval,
-    Question,
-}
-
 impl Conversation {
     pub(crate) fn mobile_usage_limit(&self, cx: &gpui::App) -> serde_json::Value {
         let limit = self.settings.usage_limit.clone().or_else(|| {
@@ -471,17 +464,6 @@ impl Conversation {
             }
         }
         Ok(())
-    }
-
-    pub(crate) fn mobile_waiting(&self, cx: &gpui::App) -> Option<Waiting> {
-        let inputs = self.pending_notification_inputs(cx);
-        if inputs.iter().any(|input| input.kind == InputKind::Approval) {
-            Some(Waiting::Approval)
-        } else if inputs.iter().any(|input| input.kind == InputKind::Question) {
-            Some(Waiting::Question)
-        } else {
-            None
-        }
     }
 }
 

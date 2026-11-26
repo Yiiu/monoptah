@@ -83,11 +83,31 @@ struct MonoPreview {
     text: Value,
 }
 
+fn mobile_agent_waiting(status: &monocode_core::agent_status::AgentStatus) -> Option<&'static str> {
+    use monocode_core::agent_status::{Activity, Ask};
+    match status.activity {
+        Activity::NeedsYou {
+            kind: Ask::Question,
+        } => Some("question"),
+        Activity::NeedsYou { .. } => Some("approval"),
+        _ => None,
+    }
+}
+
+fn mobile_waiting_label(status: &monocode_core::agent_status::AgentStatus) -> Option<&'static str> {
+    mobile_agent_waiting(status).map(|kind| match kind {
+        "question" => "Waiting for answers",
+        _ => "Waiting for approval",
+    })
+}
+
 struct CatalogEntry {
     id: i64,
     project: String,
     summary: Session,
     live: Option<mobile_catalog::LiveSession>,
+    busy: bool,
+    waiting: Option<&'static str>,
     /// Where the session runs, for web devices (None when it is not known).
     cloud: Option<cloud::CardView>,
 }
@@ -741,6 +761,7 @@ impl Shell {
                 let project =
                     rail.or_else(|| cloud::catalog_project_of(self, id, summary, paths))?;
                 let cloud = cloud::card_view(self, id, web_only);
+                let status = self.agent_status(id);
                 let live = self.sessions.get(&id).map(|view| {
                     let view = view.read(cx);
                     mobile_catalog::LiveSession {
@@ -752,12 +773,8 @@ impl Shell {
                             worktree_removed: view.settings.worktree_removed,
                             access: view.settings.access,
                         },
-                        busy: view.busy,
-                        waiting: match view.mobile_waiting(cx) {
-                            Some(crate::conversation::MobileWaiting::Approval) => Some("approval"),
-                            Some(crate::conversation::MobileWaiting::Question) => Some("question"),
-                            None => None,
-                        },
+                        busy: status.is_busy(),
+                        waiting: mobile_agent_waiting(status),
                     }
                 });
                 Some(CatalogEntry {
@@ -765,6 +782,8 @@ impl Shell {
                     project,
                     summary: summary.clone(),
                     live,
+                    busy: status.is_busy(),
+                    waiting: mobile_agent_waiting(status),
                     cloud,
                 })
             })
@@ -879,7 +898,7 @@ impl Shell {
                             let last = turns::messages(rows).pop();
                             json!({
                                 "status": chat.mono_status(),
-                                "busy": chat.busy,
+                                "busy": self.agent_status(chat.summary.id).is_busy(),
                                 "harness": chat.summary.provider,
                                 "model": mobile_catalog::model_id(Kind::from_id(&chat.summary.provider), chat.mobile_model()),
                                 "lastMessage": last.map(|m| m["text"].clone()).unwrap_or(json!("")),
@@ -949,6 +968,12 @@ impl Shell {
                     mobile_catalog::checkout_branch(metadata.worktree_cwd.as_deref().unwrap_or(&entry.summary.cwd), &mut branches)
                 } else { String::new() };
                 let mut card = mobile_catalog::session(&entry.summary, id, &entry.project, &metadata, entry.live.as_ref(), &branch);
+                if entry.live.is_none() {
+                    card["busy"] = json!(entry.busy);
+                    if let Some(waiting) = entry.waiting {
+                        card["waiting"] = json!(waiting);
+                    }
+                }
                 cloud::annotate_card(&mut card, entry.cloud.as_ref());
                 sessions.push(card);
             }
@@ -1675,15 +1700,18 @@ impl Shell {
             None => {
                 let load = self.load_saved(&target, &request.device, cx);
                 cx.spawn(async move |this, cx| {
-                    match load.await.and_then(|saved| page(&saved_snapshot(&saved))) {
-                        Ok(Read::Done(value)) => request.reply(Ok(merge_fields(value, fields))),
-                        Ok(Read::Page(cursor)) => {
-                            let _ = this.update(cx, |this, cx| {
+                    let loaded = load.await;
+                    let _ = this.update(cx, |this, cx| {
+                        match loaded.and_then(|saved| {
+                            page(&saved_snapshot(&saved, this.agent_status(saved.id)))
+                        }) {
+                            Ok(Read::Done(value)) => request.reply(Ok(merge_fields(value, fields))),
+                            Ok(Read::Page(cursor)) => {
                                 this.mobile_older_page(request, &target, cursor, None, limit, cx)
-                            });
+                            }
+                            Err(error) => request.reply(Err(error.into())),
                         }
-                        Err(error) => request.reply(Err(error.into())),
-                    }
+                    });
                 })
                 .detach();
             }
@@ -1792,11 +1820,8 @@ impl Shell {
         }
         // Built for every streamed frame, so only once there's history to show.
         let launches = self.mobile_launches(target, device, cx);
-        let waiting = match chat.mobile_waiting(cx) {
-            Some(crate::conversation::MobileWaiting::Approval) => Some("Waiting for approval"),
-            Some(crate::conversation::MobileWaiting::Question) => Some("Waiting for answers"),
-            None => None,
-        };
+        let status = self.agent_status(chat.summary.id);
+        let waiting = mobile_waiting_label(status);
         let snapshot = Snapshot {
             usage_limit: chat.mobile_usage_limit(cx),
             rows: chat.transcript.read(cx).source_rows(),
@@ -1805,7 +1830,7 @@ impl Shell {
             exec_cwd: chat.execution_cwd(),
             harness: &chat.summary.provider,
             model: chat.mobile_model().map(str::to_owned),
-            busy: chat.busy,
+            busy: status.is_busy(),
             waiting,
             mono,
             pending: chat.mobile_pending(cx),
@@ -1901,7 +1926,7 @@ impl Shell {
         self.push_mobile_watches(cx);
     }
 
-    fn schedule_mobile_push(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn schedule_mobile_push(&mut self, cx: &mut Context<Self>) {
         if self.mobile.push_scheduled || self.mobile.watches.is_empty() {
             return;
         }
@@ -1975,7 +2000,7 @@ impl Shell {
             let built = match self.with_live_snapshot(&target, &device, cx, frame) {
                 Some(built) => built,
                 None => match watch.saved.clone() {
-                    Some(saved) => frame(&saved_snapshot(&saved)),
+                    Some(saved) => frame(&saved_snapshot(&saved, self.agent_status(saved.id))),
                     None => {
                         self.load_mobile_watch(&id, cx);
                         continue;
@@ -3491,7 +3516,10 @@ fn older_page(
     }
 }
 
-fn saved_snapshot(saved: &Saved) -> Snapshot<'_> {
+fn saved_snapshot<'a>(
+    saved: &'a Saved,
+    status: &monocode_core::agent_status::AgentStatus,
+) -> Snapshot<'a> {
     Snapshot {
         usage_limit: crate::conversation::mobile_usage_state(
             saved.id,
@@ -3508,8 +3536,8 @@ fn saved_snapshot(saved: &Saved) -> Snapshot<'_> {
         exec_cwd: saved.settings.execution_cwd(&saved.cwd),
         harness: &saved.harness,
         model: saved.settings.model.clone(),
-        busy: false,
-        waiting: None,
+        busy: status.is_busy(),
+        waiting: mobile_waiting_label(status),
         mono: saved.mono.clone(),
         pending: Vec::new(),
         launches: &saved.launches,
@@ -4939,7 +4967,7 @@ mod tests {
             let summary = shell.session_summaries[&id].clone();
             let saved = Saved { id, settings: store.agent_settings(id).unwrap().unwrap(), rows: store.load(id).unwrap().rows, harness: summary.provider, cwd: summary.cwd, history: None, mono: None, launches: HashMap::new() };
             drop(store);
-            let from_disk = saved_snapshot(&saved).usage_limit;
+            let from_disk = saved_snapshot(&saved, &Default::default()).usage_limit;
             let live = shell.with_live_snapshot(&Target::Session(id), &phone(), cx, |s| s.usage_limit.clone()).unwrap();
             assert_eq!(from_disk["token"], live["token"]);
             let params = json!({"conversationId":conversation, "token":from_disk["token"], "enabled":false});
@@ -4980,21 +5008,25 @@ mod tests {
             mono: None,
             launches: HashMap::new(),
         };
-        let state = saved_snapshot(&saved).usage_limit;
+        let state = saved_snapshot(&saved, &Default::default()).usage_limit;
         assert_eq!(state["resetsAt"], reset);
         assert_eq!(state["canResume"], false);
         assert_eq!(state["resumeAtReset"], true);
         saved.settings.usage_limit.as_mut().unwrap().resets_at =
             Some(monocode_core::usage::now_ms() - 1);
-        let state = saved_snapshot(&saved).usage_limit;
+        let state = saved_snapshot(&saved, &Default::default()).usage_limit;
         assert_eq!(state["canResume"], true);
         assert_eq!(state["resetLabel"], "Limit has reset");
         saved.cwd = "remote://host/fixture".into();
-        let remote = saved_snapshot(&saved).usage_limit;
+        let remote = saved_snapshot(&saved, &Default::default()).usage_limit;
         assert_eq!(remote["canResume"], false);
         assert_eq!(remote["canAutoResume"], false);
         saved.settings.usage_limit = None;
-        assert!(saved_snapshot(&saved).usage_limit.is_null());
+        assert!(
+            saved_snapshot(&saved, &Default::default())
+                .usage_limit
+                .is_null()
+        );
     }
 
     #[test]

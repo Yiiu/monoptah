@@ -804,7 +804,7 @@ fn original_layout_hides_saved_mono_tabs_until_returning_to_new_layout(cx: &mut 
                 let id = shell.mono_manager().read(cx).active.clone().unwrap();
                 let tab = shell.mono_tab(id.clone());
                 assert!(shell.visible_tabs(cx).contains(&tab));
-                shell.toggle_layout(cx);
+                shell.set_navigation_layout(crate::workspace::NavigationLayout::Classic, cx);
                 (
                     tab,
                     Box::leak(format!("mono-title-tab-{id}").into_boxed_str()) as &'static str,

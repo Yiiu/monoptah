@@ -271,6 +271,195 @@ fn section(title: &'static str) -> Div {
         )
 }
 
+fn plan(
+    mono: &Mono,
+    sessions: &[&crate::shell::monos::MonoSession],
+    cx: &Context<Monos>,
+) -> Option<AnyElement> {
+    use monocode_core::agent_status::{Activity, Outcome};
+    let rows = mono
+        .launches
+        .iter()
+        .filter(|launch| !launch.dismissed)
+        .filter_map(|launch| {
+            let session = sessions
+                .iter()
+                .find(|session| session.id == launch.session_id)?;
+            Some(*session)
+        })
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        return None;
+    }
+    let (mut done, mut running, mut waiting) = (0, 0, 0);
+    for session in &rows {
+        match session.activity {
+            Activity::NeedsYou { .. } => waiting += 1,
+            Activity::Running { .. } | Activity::BackgroundWait { .. } => running += 1,
+            Activity::Done { .. } => done += 1,
+            Activity::Idle if session.archived => done += 1,
+            Activity::Idle => (),
+        }
+    }
+    let total = rows.len() as f32;
+    let now = now_ms();
+    Some(
+        div()
+            .w_full()
+            .flex_shrink_0()
+            .p_3()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .rounded_lg()
+            .border_1()
+            .border_color(content(0.1))
+            .bg(content(0.025))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_size(px(13.))
+                            .child("Plan"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(content(0.5))
+                            .child(format!(
+                                "{done} done · {running} running · {waiting} needs you"
+                            )),
+                    ),
+            )
+            .child(
+                div()
+                    .h(px(5.))
+                    .flex()
+                    .overflow_hidden()
+                    .rounded_full()
+                    .bg(content(0.08))
+                    .children(
+                        [
+                            (done, success_color()),
+                            (running, accent_color()),
+                            (waiting, warning_color()),
+                        ]
+                        .into_iter()
+                        .filter(|(count, _)| *count > 0)
+                        .map(|(count, color)| {
+                            div()
+                                .h_full()
+                                .flex_shrink_0()
+                                .w(gpui::relative(count as f32 / total))
+                                .bg(color)
+                        }),
+                    ),
+            )
+            .children(rows.into_iter().map(|session| {
+                let id = session.id;
+                let status = &session.activity;
+                let (glyph, color, label) = if session.archived {
+                    ("archive", content(0.45), "Archived".into())
+                } else {
+                    let color = crate::session_mark::activity_color(status);
+                    match status {
+                        Activity::NeedsYou { .. } => ("circle-alert", color, "Needs you".into()),
+                        Activity::Running { .. } => {
+                            ("circle", color, status.label(now).unwrap_or_default())
+                        }
+                        Activity::BackgroundWait { .. } => {
+                            ("clock", color, status.label(now).unwrap_or_default())
+                        }
+                        Activity::Done {
+                            outcome: Outcome::Failed,
+                            ..
+                        } => ("circle-alert", danger_color(), "Failed".into()),
+                        Activity::Done {
+                            outcome: Outcome::Interrupted,
+                            ..
+                        } => ("square", content(0.5), "Stopped".into()),
+                        Activity::Done { at, .. } => ("check", success_color(), relative(*at, now)),
+                        Activity::Idle if session.start_failed => {
+                            ("circle-alert", danger_color(), "Failed to start".into())
+                        }
+                        Activity::Idle => ("circle", content(0.45), "Draft".into()),
+                    }
+                };
+                let project = crate::workspace::project_name(&session.project);
+                let checkout = session.branch.clone().or_else(|| {
+                    session
+                        .worktree
+                        .as_deref()
+                        .map(crate::workspace::project_name)
+                });
+                let place = checkout
+                    .map_or_else(|| project.clone(), |branch| format!("{project} · {branch}"));
+                div()
+                    .id(("mono-plan-session", id as usize))
+                    .role(Role::Button)
+                    .aria_label(format!("{}, {label}", session.title))
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .hover(|d| d.bg(content(0.05)))
+                    .flex()
+                    .items_start()
+                    .gap_2()
+                    .min_w_0()
+                    .child(if status.is_animating() && !session.archived {
+                        crate::session_mark::spinner(
+                            SharedString::from(format!("mono-plan-spin-{id}")),
+                            crate::pulse::Rate::Half,
+                        )
+                        .into_any_element()
+                    } else {
+                        icon(glyph, 14.).text_color(color).into_any_element()
+                    })
+                    .child(
+                        div()
+                            .flex_col()
+                            .flex()
+                            .gap_0p5()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(12.))
+                                    .child(session.title.clone()),
+                            )
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(11.))
+                                    .text_color(content(0.45))
+                                    .child(place),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(color)
+                            .max_w(px(130.))
+                            .truncate()
+                            .child(label),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.route = Some(Route::Session(id));
+                        this.show_overview(cx);
+                        this.overview_tab = OverviewTab::Sessions;
+                        cx.notify();
+                    }))
+            }))
+            .into_any_element(),
+    )
+}
+
 fn tile(value: AnyElement, label: &'static str) -> Div {
     div()
         .flex_1()
@@ -396,6 +585,7 @@ impl Monos {
             .iter()
             .filter(|v| mono.launches.iter().any(|l| l.session_id == v.id))
             .collect();
+        let session_plan = plan(mono, &mine, cx);
         let state = self
             .chats
             .get(&mono.id)
@@ -801,6 +991,7 @@ impl Monos {
                     .flex()
                     .flex_col()
                     .gap_6()
+                    .children(session_plan)
                     .child(contributions)
                     .child(today_tiles)
                     .child(up_next)

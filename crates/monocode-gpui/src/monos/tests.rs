@@ -14,6 +14,81 @@ pub(super) struct Setup {
 }
 
 #[gpui::test]
+fn decision_cards_keep_independent_durable_answers(cx: &mut TestAppContext) {
+    let _no_clis = crate::shell::surface_tests::NoClis::new();
+    let s = setup(cx);
+    s.manager.update(cx, |manager, cx| {
+        let chat = manager.chats[&s.id].clone();
+        for (id, question) in [("earlier", "Which approach?"), ("later", "Which checks?")] {
+            manager.hold_card(
+                s.session,
+                &s.id,
+                json!({
+                    "type": "choices", "id": id, "question": question,
+                    "options": ["One", "Two", "Three", "Four", "Five"]
+                }),
+            );
+        }
+        manager.dispatch(&s.id, cx);
+        chat.update(cx, |chat, cx| {
+            chat.mono_post("user", "A separate chat message".into(), cx)
+        })
+        .unwrap();
+    });
+    cx.run_until_parked();
+    assert!(
+        s.window
+            .update(cx, |shell, _, _| shell.agent_status(s.session).needs_you())
+            .unwrap()
+    );
+    s.manager.update(cx, |manager, cx| {
+        let response = json!({
+            "type": "decision-answer", "id": "later",
+            "answers": ["Two", "Five", "Another check"]
+        });
+        manager.card_action(&s.id, &response, cx);
+        manager.card_action(&s.id, &response, cx);
+        let pending = manager.chats[&s.id].read(cx).pending_mono_decisions(cx);
+        assert_eq!(
+            pending.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["earlier"]
+        );
+        assert_eq!(manager.roster.get(&s.id).unwrap().outbox.len(), 1);
+    });
+    cx.run_until_parked();
+    let (roster, summaries) = {
+        let db = locked(&s.store).unwrap();
+        (Roster::load(&db).unwrap(), db.sessions().unwrap())
+    };
+    let decision_cards = &roster.get(&s.id).unwrap().decision_cards;
+    assert_eq!(
+        decision_cards["later"].answers,
+        ["Two", "Five", "Another check"]
+    );
+    assert!(decision_cards["earlier"].answers.is_empty());
+
+    // An inactive Mono still appears in Needs You when the app restores its roster.
+    let restarted = cx.update(|cx| {
+        cx.open_window(Default::default(), |_, cx| {
+            cx.new(|cx| Shell::new(s.store.clone(), summaries, s.project.clone(), None, cx))
+        })
+        .unwrap()
+    });
+    cx.run_until_parked();
+    restarted
+        .update(cx, |shell, _, cx| {
+            assert!(shell.agent_status(s.session).needs_you());
+            let monos = shell.mono_manager();
+            let chat = monos.read(cx).chats[&s.id].read(cx);
+            let inputs = chat.pending_notification_inputs(cx);
+            assert_eq!(inputs.len(), 1);
+            assert_eq!(inputs[0].request_id, "earlier");
+            assert_eq!(inputs[0].label, "Which approach?");
+        })
+        .unwrap();
+}
+
+#[gpui::test]
 fn missing_document_uses_error_cards_without_moving_content(cx: &mut TestAppContext) {
     let s = setup(cx);
     let visual = &mut gpui::VisualTestContext::from_window(s.window.into(), cx);
@@ -643,6 +718,33 @@ pub(super) fn setup_prepared(
         root,
         store,
     }
+}
+
+#[gpui::test]
+fn heartbeat_reads_inactive_monos_saved_provider_and_permissions(cx: &mut TestAppContext) {
+    let _no_clis = crate::shell::surface_tests::NoClis::new();
+    let s = setup(cx);
+    {
+        let db = locked(&s.store).unwrap();
+        let mut settings = db.agent_settings(s.session).unwrap().unwrap_or_default();
+        settings.access = AccessMode::ReadOnly;
+        settings.usage_limit = Some(Default::default());
+        db.configure_agent(s.session, "claude", &settings).unwrap();
+    }
+    s.manager.update(cx, |m, cx| {
+        m.active = None;
+        m.chats.remove(&s.id);
+        m.start_heartbeat(&s.id, "Check for follow-ups".into(), cx);
+    });
+    cx.run_until_parked();
+    s.manager.read_with(cx, |m, cx| {
+        let view = m.running[&m.active_run.expect("heartbeat session was created")]
+            .view
+            .read(cx);
+        assert_eq!(view.summary.provider, "claude");
+        assert_eq!(view.settings.access, AccessMode::ReadOnly);
+        assert!(!view.busy, "the fixture must not start a provider");
+    });
 }
 
 #[gpui::test]

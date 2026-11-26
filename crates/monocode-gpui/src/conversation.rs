@@ -66,9 +66,7 @@ use gpui::{
 };
 #[cfg(test)]
 pub(crate) use mobile::MobileApproval;
-pub(crate) use mobile::{
-    Waiting as MobileWaiting, mobile_access_modes, usage_state as mobile_usage_state,
-};
+pub(crate) use mobile::{mobile_access_modes, usage_state as mobile_usage_state};
 pub(crate) use mono::QueueChanged as MonoQueueChanged;
 pub(crate) use mono::Submitted as MonoSubmitted;
 pub(crate) use mono::{TurnEnd, WorkflowTurn};
@@ -153,6 +151,7 @@ struct OpenMenu {
 }
 use response_menu::ResponseMenu;
 pub(crate) struct SessionChanged;
+pub(crate) struct AgentProgress;
 /// A new checkout received its generated branch name.
 pub(crate) struct WorktreeRenamed {
     pub(crate) path: String,
@@ -263,6 +262,10 @@ pub(crate) struct Conversation {
     pending_search: Option<(usize, String)>,
     loading: bool,
     pub(crate) busy: bool,
+    agent_turn: Option<monocode_core::provider::TurnActivity>,
+    agent_event_at: u64,
+    pub(crate) agent_outcome: Option<monocode_core::agent_status::Outcome>,
+    pub(crate) displayed_activity: monocode_core::agent_status::Activity,
     /// When the user last typed, sent or clicked Resume here; the cloud auto-stop policy reads it.
     last_user_input: Option<std::time::Instant>,
     /// `Input::user_edits` as of the last notify, to tell typing from other notifies.
@@ -464,11 +467,58 @@ impl Conversation {
     pub(crate) fn responding(&self) -> bool {
         self.busy && !self.stopping
     }
+    pub(crate) fn agent_status_input(
+        &self,
+        now: u64,
+        step: bool,
+        cx: &gpui::App,
+    ) -> monocode_core::agent_status::StatusInput {
+        use monocode_core::{
+            agent_status::{ShellTask, StatusInput},
+            provider::{TaskKind, TurnActivity},
+            usage::AutoResume,
+        };
+        let streaming =
+            self.responding() && matches!(self.agent_turn, None | Some(TurnActivity::Running));
+        let wake_tasks = match self.agent_turn {
+            Some(TurnActivity::Yielded { wake_tasks }) if self.responding() => wake_tasks,
+            _ => 0,
+        };
+        let auto_resume = self.auto_resume_state(now as i64);
+        StatusInput {
+            approvals: !self.approvals.is_empty(),
+            questions: !self.questions.is_empty() || !self.pending_mono_decisions(cx).is_empty(),
+            streaming,
+            wake_tasks,
+            usage_limit_resume_at: match auto_resume {
+                Some(AutoResume::At(at)) => u64::try_from(at).ok(),
+                Some(AutoResume::Due) => Some(now),
+                _ => None,
+            },
+            usage_limit_pending: auto_resume == Some(AutoResume::Unknown),
+            shells: self
+                .background
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Shell)
+                .map(|task| ShellTask {
+                    id: task.id.clone(),
+                    command: task.command.as_ref().unwrap_or(&task.description).clone(),
+                })
+                .collect(),
+            step: (streaming && step && !self.is_remote())
+                .then(|| self.transcript.read(cx).live_turn(self.execution_cwd()).0)
+                .flatten(),
+            last_event_at: self.agent_event_at,
+            now,
+            ..Default::default()
+        }
+    }
     pub(crate) fn sidebar_details(&self) -> Option<(SharedString, Option<String>)> {
         self.loaded
             .then(|| (self.model_label(), self.branch.clone()))
     }
-    pub(crate) fn preview(&self, done: bool) -> AnyElement {
+    pub(crate) fn preview(&self, status: &monocode_core::agent_status::AgentStatus) -> AnyElement {
         let kind = Kind::from_id(&self.summary.provider);
         let model = self.resolved_model.as_deref().or(self.model.as_deref());
         let name = self
@@ -540,29 +590,19 @@ impl Conversation {
                         div()
                             .flex_shrink_0()
                             .text_size(px(11.))
-                            .text_color(if self.needs_approval() {
-                                gpui::rgb(0xfbbf24).into()
-                            } else if self.responding() {
-                                accent_color()
-                            } else if done {
-                                gpui::rgb(0x34d399).into()
-                            } else {
-                                content(0.45)
-                            })
-                            .child(if self.needs_approval() {
-                                "Needs approval".to_owned()
-                            } else if self.busy {
-                                "Working…".to_owned()
-                            } else if done {
-                                "Done".to_owned()
-                            } else if self.loading {
-                                "Loading…".to_owned()
-                            } else {
-                                monocode_core::time::relative(
-                                    self.summary.updated_at,
-                                    monocode_core::time::now_ms(),
-                                )
-                            }),
+                            .text_color(crate::session_mark::activity_color(&status.activity))
+                            .child(status.label(monocode_core::time::now_ms()).unwrap_or_else(
+                                || {
+                                    if self.loading {
+                                        "Loading…".to_owned()
+                                    } else {
+                                        monocode_core::time::relative(
+                                            self.summary.updated_at,
+                                            monocode_core::time::now_ms(),
+                                        )
+                                    }
+                                },
+                            )),
                     ),
             )
             .child(
@@ -787,6 +827,10 @@ impl Conversation {
             pending_search: None,
             loading: false,
             busy: false,
+            agent_turn: None,
+            agent_event_at: 0,
+            agent_outcome: None,
+            displayed_activity: Default::default(),
             last_user_input: None,
             seen_input_edits: 0,
             auto_stopping: false,
@@ -1780,6 +1824,16 @@ impl Conversation {
                             });
                         }
                         let needed_approval = this.needs_approval();
+                        let background_changed = update.background.is_some() && !stopping;
+                        let activity_changed = update
+                            .activity
+                            .is_some_and(|activity| Some(activity) != this.agent_turn)
+                            && !stopping;
+                        let provider_progress =
+                            !stopping && (update.provider_event || !update.rows.is_empty());
+                        if provider_progress || activity_changed {
+                            this.agent_event_at = monocode_core::time::now_ms();
+                        }
                         let incoming_notification_input = !stopping
                             && (!update.approvals.is_empty() || !update.questions.is_empty());
                         let mono_queue_changed = this.settings.mono.is_some()
@@ -1787,7 +1841,15 @@ impl Conversation {
                                 || update.delivered.is_some()
                                 || !update.follow_up_delivered.is_empty()
                                 || !update.follow_up_errors.is_empty());
+                        let woke = matches!(
+                            this.agent_turn,
+                            Some(monocode_core::provider::TurnActivity::Completed)
+                        ) && update.activity
+                            == Some(monocode_core::provider::TurnActivity::Running);
                         this.transcript.update(cx, |v, cx| {
+                            if woke {
+                                v.streaming(true, cx);
+                            }
                             v.patch(update.start, update.rows, cx);
                             if stopping {
                                 v.stop_streaming(cx);
@@ -1894,9 +1956,31 @@ impl Conversation {
                             this.status = update.status;
                         }
                         if let Some(tasks) = update.background.filter(|_| !stopping) {
-                            let count = tasks.len();
-                            this.transcript.update(cx, |v, cx| v.set_yielded(count, cx));
                             this.set_background(tasks, cx);
+                        }
+                        if let Some(activity) = update.activity.filter(|_| !stopping) {
+                            use monocode_core::provider::TurnActivity;
+                            this.agent_turn = Some(activity);
+                            match activity {
+                                TurnActivity::Completed => {
+                                    this.agent_outcome =
+                                        Some(monocode_core::agent_status::Outcome::Completed);
+                                }
+                                TurnActivity::Running | TurnActivity::Yielded { .. } => {
+                                    this.agent_outcome = None;
+                                }
+                            }
+                            let count = match activity {
+                                TurnActivity::Yielded { wake_tasks } => wake_tasks as usize,
+                                _ => 0,
+                            };
+                            this.transcript.update(cx, |v, cx| {
+                                if activity == TurnActivity::Completed {
+                                    v.streaming(false, cx);
+                                } else {
+                                    v.set_yielded(count, cx);
+                                }
+                            });
                         }
                         if !stopping {
                             this.approvals.extend(update.approvals);
@@ -1914,6 +1998,15 @@ impl Conversation {
                             this.status = "Waiting for your answer".into();
                         }
                         if finished {
+                            use monocode_core::agent_status::Outcome;
+                            this.agent_outcome = Some(if stopping || this.notification_cancelled {
+                                Outcome::Interrupted
+                            } else if this.status == "Ready" {
+                                Outcome::Completed
+                            } else {
+                                Outcome::Failed
+                            });
+                            this.agent_turn = None;
                             if this.is_remote() {
                                 this.settings.remote_action = None;
                                 this.remote_state.refreshing = false;
@@ -1988,8 +2081,12 @@ impl Conversation {
                         } else if incoming_notification_input
                             || mono_queue_changed
                             || needed_approval != this.needs_approval()
+                            || activity_changed
+                            || background_changed
                         {
                             cx.emit(SessionChanged);
+                        } else if provider_progress {
+                            cx.emit(AgentProgress);
                         }
                         this.pump_follow_ups(cx);
                         cx.notify();
@@ -2010,6 +2107,9 @@ impl Conversation {
             self.composer_motion.capture(self.composer_anchor.get());
         }
         self.busy = true;
+        self.agent_turn = None;
+        self.agent_event_at = monocode_core::time::now_ms();
+        self.agent_outcome = None;
         self.stopping = false;
         self.notification_cancelled = false;
         self.review
@@ -2026,6 +2126,7 @@ impl Conversation {
 }
 
 impl EventEmitter<SessionChanged> for Conversation {}
+impl EventEmitter<AgentProgress> for Conversation {}
 impl EventEmitter<crate::cloud_start_view::CloudStartAction> for Conversation {}
 impl EventEmitter<WorktreeRenamed> for Conversation {}
 impl EventEmitter<ChooseFolder> for Conversation {}
@@ -3267,6 +3368,7 @@ impl Conversation {
             return;
         }
         self.stopping = true;
+        self.agent_outcome = Some(monocode_core::agent_status::Outcome::Interrupted);
         self.busy = false;
         self.follow_ups.resuming = false;
         self.follow_ups.continuations.clear();

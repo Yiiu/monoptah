@@ -132,7 +132,9 @@ impl Shell {
             TitleTab::Session(id) => {
                 let copy = self.tab_copy(*id, cx);
                 let (face, mark) = match copy.panes.get(copy.focus) {
-                    Some(pane) => self.pane_tile(&pane.mark, live),
+                    Some(pane) => {
+                        self.pane_tile(&pane.mark, live, shell_fill(), cx.reduce_motion())
+                    }
                     None => (Face::Neutral, div().into_any_element()),
                 };
                 (face, mark, copy.headline.clone().into())

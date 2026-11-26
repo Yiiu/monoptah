@@ -54,6 +54,33 @@ impl Shell {
     /// than dismissing it, and never raises the workspace window.
     pub(super) fn show_quick_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let choice = self.quick_choice(cx);
+        self.show_quick_choice(choice, window, cx);
+    }
+
+    pub(super) fn compose_in_new_worktree(
+        &mut self,
+        cwd: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let new = self.new_chat_choice(&cwd);
+        let mut choice = crate::quick_composer::Launch::choice(
+            cwd,
+            new.kind,
+            new.model,
+            crate::conversation::default_access(new.kind.id(), cx),
+        );
+        choice.new_worktree = true;
+        choice.foreground = true;
+        self.show_quick_choice(choice, window, cx);
+    }
+
+    fn show_quick_choice(
+        &mut self,
+        choice: crate::quick_composer::Launch,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let projects = self.workspace.projects.clone();
         let appearance = self.workspace.project_appearance.clone();
         if let Some(handle) = self.quick.window

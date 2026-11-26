@@ -410,7 +410,6 @@ impl TuiSession {
     pub(crate) fn set_initial_prompt(&mut self, prompt: String) {
         self.initial_prompt = Some(prompt).filter(|prompt| !prompt.trim().is_empty());
     }
-    #[cfg(test)]
     pub(crate) fn exit(&self) -> Option<&Exit> {
         self.exit.as_ref()
     }

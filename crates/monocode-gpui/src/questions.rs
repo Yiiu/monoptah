@@ -33,6 +33,7 @@ pub(crate) struct QuestionCard {
     fields: Vec<Entity<input::Input>>,
     focus: FocusHandle,
     focused: bool,
+    inline: bool,
     step: usize,
     reached: usize,
     highlighted: Option<usize>,
@@ -50,12 +51,20 @@ impl Focusable for QuestionCard {
 }
 impl QuestionCard {
     pub(crate) fn new(request: Question, cx: &mut Context<Self>) -> Self {
+        Self::with_mode(request, false, cx)
+    }
+    pub(crate) fn inline(request: Question, cx: &mut Context<Self>) -> Self {
+        Self::with_mode(request, true, cx)
+    }
+    fn with_mode(request: Question, inline: bool, cx: &mut Context<Self>) -> Self {
         let fields: Vec<_> = request
             .items
             .iter()
             .map(|item| {
                 let placeholder = if item.options.is_empty() {
                     "Type your answer"
+                } else if inline {
+                    "Other"
                 } else {
                     "Something else"
                 };
@@ -107,6 +116,7 @@ impl QuestionCard {
             fields,
             focus: cx.focus_handle(),
             focused: false,
+            inline,
             step: 0,
             reached: 0,
             highlighted: None,
@@ -506,12 +516,21 @@ impl QuestionCard {
                         }),
                 )
             })
-            .child(
-                footer_button("question-skip", "Skip question", false)
-                    .debug_selector(|| "question-skip".into())
-                    .child("Skip")
-                    .on_click(cx.listener(|this, _, _, cx| this.skip(cx))),
-            )
+            .when(!self.inline, |d| {
+                d.child(
+                    footer_button("question-skip", "Skip question", false)
+                        .debug_selector(|| "question-skip".into())
+                        .child("Skip")
+                        .on_click(cx.listener(|this, _, _, cx| this.skip(cx))),
+                )
+            })
+            .when(self.inline && !proceed, |d| {
+                d.child(
+                    footer_button("question-continue", "Submit answers", true)
+                        .opacity(0.4)
+                        .child("Submit"),
+                )
+            })
             .when(proceed, |d| {
                 d.child(
                     footer_button(
@@ -585,7 +604,7 @@ fn ease_out(t: f32) -> f32 {
 
 impl Render for QuestionCard {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if !self.focused {
+        if !self.inline && !self.focused {
             self.focused = true;
             let focus = self.focus.clone();
             window.defer(cx, move |window, cx| window.focus(&focus, cx));
@@ -635,6 +654,7 @@ impl Render for QuestionCard {
             .id("provider-question")
             .key_context("QuestionCard")
             .track_focus(&self.focus)
+            .when(self.inline, |d| d.tab_stop(true))
             .on_key_down(cx.listener(Self::key))
             .role(Role::Group)
             .aria_label(self.notification_label().to_owned())
@@ -686,7 +706,7 @@ impl Render for QuestionCard {
                     .children(leaving)
                     .child(page),
             )
-            .child(self.header_controls(cx))
+            .when(!self.inline, |d| d.child(self.header_controls(cx)))
             .child(self.footer(window, cx))
     }
 }

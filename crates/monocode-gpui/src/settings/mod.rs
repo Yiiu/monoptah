@@ -73,7 +73,7 @@ pub(crate) struct SettingsContext {
     /// The app data folder (`contributors-ai.json`), `None` for an in-memory store.
     pub data_dir: Option<std::path::PathBuf>,
     pub monos: Vec<MonoSetting>,
-    pub classic: bool,
+    pub layout: crate::workspace::NavigationLayout,
     pub new_layout_boxy: bool,
     /// The database cannot store a terminal session (a desktop database without
     /// a `surface` column), so every provider's sessions open as a chat.
@@ -123,7 +123,7 @@ impl PartialEq for SettingsContext {
         }
         self.data_dir == other.data_dir
             && self.monos == other.monos
-            && self.classic == other.classic
+            && self.layout == other.layout
             && self.new_layout_boxy == other.new_layout_boxy
             && self.no_terminal_sessions == other.no_terminal_sessions
             && self.cwd == other.cwd
@@ -169,8 +169,8 @@ pub(crate) enum SettingsEvent {
     /// General's Work day starts at, in minutes after midnight.
     TodayRollover(u32),
     Changed(Box<Preferences>),
-    /// The Appearance page's Layout picker: true for Focused, false for Classic.
-    NewLayout(bool),
+    /// The Appearance page's navigation layout.
+    NewLayout(crate::workspace::NavigationLayout),
     NewLayoutBoxy(bool),
     Section(Section),
     OpenSession(i64),
@@ -725,7 +725,9 @@ impl SettingsView {
         self.accent_custom_open = false;
         self.update(cx, |p| p.restore_appearance());
         // onInsetLayout(INSET_LAYOUT_DEFAULT): React's default is the classic layout.
-        cx.emit(SettingsEvent::NewLayout(false));
+        cx.emit(SettingsEvent::NewLayout(
+            crate::workspace::NavigationLayout::Classic,
+        ));
     }
     /// Jump to a search result, on this page or another.
     fn go(&mut self, result: model::SearchResult, cx: &mut Context<Self>) {

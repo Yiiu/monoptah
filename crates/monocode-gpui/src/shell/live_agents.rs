@@ -1,23 +1,20 @@
 //! LiveAgentsPreview.tsx: the sidebar's card of working and unseen finished
 //! sessions, across every project.
 use super::*;
+use monocode_core::agent_status::Activity;
 
 const LIVE_AGENT_MIN: usize = 2;
 const LIVE_AGENT_CAP: usize = 4;
-// Tailwind amber-400 and emerald-400.
-const AMBER: u32 = 0xfbbf24;
-const EMERALD: u32 = 0x34d399;
+const STATUS_TICK: std::time::Duration = std::time::Duration::from_secs(15);
 
 struct LiveAgent {
     id: i64,
     cwd: String,
     provider: String,
     title: String,
-    activity: String,
-    started_at: Option<u64>,
+    label: String,
+    activity: Activity,
     duration_ms: Option<u64>,
-    needs_approval: bool,
-    done: bool,
 }
 
 /// liveAgents.ts's formatLiveElapsed.
@@ -42,96 +39,93 @@ pub(crate) fn live_elapsed(ms: u64) -> String {
     }
 }
 
-/// Milliseconds until `live_elapsed` shows something else for a run this old:
-/// labels count seconds for the first hour and minutes after that.
-fn next_label_change(ms: u64) -> u64 {
-    // live_elapsed rounds to the nearest second.
-    let shown = ms + 500;
-    let step = if shown >= 3_600_000 { 60_000 } else { 1_000 };
-    step - shown % step
-}
-
 impl Shell {
-    fn live_agents(&self, cx: &App) -> Vec<LiveAgent> {
+    fn live_agents(&self, now: u64, cx: &App) -> Vec<LiveAgent> {
         let mut agents: Vec<_> = self
             .order
             .iter()
             .filter_map(|id| {
-                let view = self.sessions.get(id)?.read(cx);
-                let done = !view.busy && self.unseen_finished.contains(id);
-                if view.summary.archived || !(view.responding() || done) {
+                let status = self.agent_status(*id);
+                let label = status.label(now)?;
+                let meta = self.session_metadata(*id, cx);
+                if meta.summary.archived {
                     return None;
                 }
-                let (tool, started_at, duration_ms) =
-                    view.transcript.read(cx).live_turn(&view.summary.cwd);
-                let needs_approval = view.needs_approval();
+                let duration_ms = if status.unread_done() {
+                    self.sessions.get(id).and_then(|view| {
+                        view.read(cx)
+                            .transcript
+                            .read(cx)
+                            .live_turn(&meta.summary.cwd)
+                            .2
+                    })
+                } else {
+                    None
+                };
                 Some(LiveAgent {
                     id: *id,
-                    cwd: view.summary.cwd.clone(),
-                    provider: view.summary.provider.clone(),
-                    title: view.display_title(),
-                    activity: if needs_approval {
-                        "Need approval".into()
-                    } else if done {
-                        "Done".into()
-                    } else {
-                        tool.unwrap_or_else(|| "Working".into())
-                    },
-                    started_at,
-                    duration_ms: duration_ms.filter(|_| done),
-                    needs_approval,
-                    done,
+                    cwd: meta.summary.cwd.clone(),
+                    provider: meta.summary.provider.clone(),
+                    title: meta.display_title(),
+                    label,
+                    activity: status.activity.clone(),
+                    duration_ms,
                 })
             })
             .collect();
-        // compareLiveAgents: approvals first, finished last, then oldest first.
-        agents.sort_by_key(|a| (!a.needs_approval, a.done, a.started_at.unwrap_or(u64::MAX)));
+        agents.sort_by_key(|agent| match agent.activity {
+            Activity::NeedsYou { .. } => (0, 0),
+            Activity::Running { since, .. } => (1, since),
+            Activity::BackgroundWait { since, .. } => (2, since),
+            Activity::Done { at, .. } => (3, at),
+            Activity::Idle => (4, 0),
+        });
         agents
     }
 
+    pub(super) fn sync_agent_status_tick(&mut self, cx: &mut Context<Self>) {
+        if self.live_tick.is_some() || !self.has_running_status() {
+            return;
+        }
+        self.live_tick = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(STATUS_TICK).await;
+                let result = this.update(cx, |this, cx| {
+                    this.refresh_status_clocks(cx);
+                    if crate::pulse::app_active(cx) {
+                        this.invalidate_chrome(cx);
+                        cx.notify();
+                    }
+                    let ticking = this.has_running_status();
+                    if !ticking {
+                        this.live_tick = None;
+                    }
+                    ticking
+                });
+                if !matches!(result, Ok(true)) {
+                    break;
+                }
+            }
+        }));
+    }
+
     pub(super) fn live_agents_preview(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let now = monocode_core::time::now_ms();
         let agents = if self.workspace.preferences.working_agents
             && self.workspace.sidebar_activity_visible
         {
-            self.live_agents(cx)
+            self.live_agents(now, cx)
         } else {
             Vec::new()
         };
         let shown = agents.len() >= LIVE_AGENT_MIN;
-        self.live_marks
-            .retain(|id, _| shown && agents.iter().any(|a| a.id == *id && !a.done));
-        let ticking = shown && agents.iter().any(|a| !a.done && a.started_at.is_some());
-        let now = monocode_core::time::now_ms();
-        self.live_next_change = agents
-            .iter()
-            .filter(|a| !a.done)
-            .filter_map(|a| a.started_at)
-            .map(|at| next_label_change(now.saturating_sub(at)))
-            .min()
-            .unwrap_or(1000);
-        if !ticking {
-            self.live_tick = None;
-        } else if self.live_tick.is_none() {
-            self.live_tick = Some(cx.spawn(async move |this, cx| {
-                loop {
-                    let Ok(wait) = this.update(cx, |this, _| this.live_next_change) else {
-                        break;
-                    };
-                    cx.background_executor()
-                        .timer(std::time::Duration::from_millis(wait.max(50)))
-                        .await;
-                    // The card only matters while someone is looking at the app.
-                    let result = this.update(cx, |this, cx| {
-                        if crate::pulse::app_active(cx) {
-                            this.notify_sidebar(cx);
-                        }
-                    });
-                    if result.is_err() {
-                        break;
-                    }
-                }
-            }));
-        }
+        self.live_marks.retain(|id, _| {
+            shown
+                && agents.iter().any(|agent| {
+                    agent.id == *id
+                        && matches!(agent.activity, Activity::Running { stale: false, .. })
+                })
+        });
         if !shown {
             self.live_agents_expanded = false;
             return None;
@@ -139,11 +133,10 @@ impl Shell {
         let count = agents.len();
         let extra = count.saturating_sub(LIVE_AGENT_CAP);
         let expanded = self.live_agents_expanded;
-        let now = monocode_core::time::now_ms();
         let cards: Vec<_> = agents
             .into_iter()
             .take(if expanded { count } else { LIVE_AGENT_CAP })
-            .map(|agent| self.live_agent_card(agent, now, cx))
+            .map(|agent| self.live_agent_card(agent, cx))
             .collect();
         Some(
             div()
@@ -252,57 +245,41 @@ impl Shell {
         )
     }
 
-    fn live_agent_card(
-        &mut self,
-        agent: LiveAgent,
-        now: u64,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn live_agent_card(&mut self, agent: LiveAgent, cx: &mut Context<Self>) -> AnyElement {
         let id = agent.id;
         let project = self.project_label(&agent.cwd);
-        let elapsed = if agent.done {
-            agent.duration_ms.map(live_elapsed)
-        } else {
-            agent
-                .started_at
-                .map(|at| live_elapsed(now.saturating_sub(at)))
-        };
+        let elapsed = agent.duration_ms.map(live_elapsed);
         let selected = self.selected_sessions.contains(&id)
             || (self.workspace.active == Some(id) && !self.mono_active(cx));
-        let status: AnyElement = if agent.needs_approval {
-            icon("alert-circle", 12.)
-                .text_color(rgb(AMBER))
-                .into_any_element()
-        } else if agent.done {
-            icon("check", 12.)
-                .text_color(rgb(EMERALD))
-                .into_any_element()
-        } else {
-            let provider = agent.provider.clone();
-            let mark = self
-                .live_marks
-                .entry(id)
-                .or_insert_with(|| {
-                    cx.new(|cx| {
-                        let mut mark = SessionMark::tab(provider.clone());
-                        mark.set(&provider, MarkState::Working, cx);
-                        mark
+        let status: AnyElement =
+            if let Some(glyph) = crate::session_mark::activity_glyph(&agent.activity, 12.) {
+                glyph.into_any_element()
+            } else {
+                let provider = agent.provider.clone();
+                let mark = self
+                    .live_marks
+                    .entry(id)
+                    .or_insert_with(|| {
+                        cx.new(|cx| {
+                            let mut mark = SessionMark::tab(provider.clone());
+                            mark.set(&provider, MarkState::Working, cx);
+                            mark
+                        })
                     })
-                })
-                .clone();
-            div()
-                .size(px(12.))
-                .flex_shrink_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(mark)
-                .into_any_element()
-        };
+                    .clone();
+                div()
+                    .size(px(12.))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(mark)
+                    .into_any_element()
+            };
         let label = [
             Some(agent.title.clone()),
             Some(project.clone()),
-            Some(agent.activity.clone()),
+            Some(agent.label.clone()),
             elapsed.clone(),
         ]
         .into_iter()
@@ -353,15 +330,9 @@ impl Shell {
                     .gap_1p5()
                     .text_size(px(11.))
                     .line_height(px(14.))
-                    .text_color(if agent.needs_approval {
-                        rgb(AMBER).into()
-                    } else if agent.done {
-                        rgb(EMERALD).into()
-                    } else {
-                        content(0.5)
-                    })
+                    .text_color(crate::session_mark::activity_color(&agent.activity))
                     .child(status)
-                    .child(div().min_w_0().truncate().child(agent.activity)),
+                    .child(div().min_w_0().truncate().child(agent.label)),
             )
             .child(
                 div()

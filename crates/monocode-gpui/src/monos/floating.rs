@@ -379,7 +379,8 @@ impl gpui::Render for Floating {
         let failure = owner.error.clone();
         let (state, busy) = chat.as_ref().map_or(("idle".to_owned(), false), |c| {
             let c = c.read(cx);
-            (c.mono_status().to_owned(), c.busy)
+            let status = c.mono_status();
+            (status.to_owned(), status == "working")
         });
         let light = is_light();
         div()

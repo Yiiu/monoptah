@@ -79,6 +79,7 @@ pub use kind::Kind;
 
 const BATCH_BYTES: usize = 64 * 1024;
 const TICK: Duration = Duration::from_millis(16);
+const CLAUDE_CONTINUATION_GRACE: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Debug)]
 pub struct Request {
@@ -117,8 +118,9 @@ pub enum Event {
     Reasoning(String),
     Tool(ToolCall),
     Status(String),
-    /// What the turn still waits on after the provider yielded; empty clears it.
+    /// Background work for the session, including shells that outlive a result.
     Background(Vec<BackgroundTask>),
+    TurnActivity(TurnActivity),
     UsageLimited(crate::usage::Limit),
     Interjection {
         text: String,
@@ -133,11 +135,29 @@ pub enum Event {
     Done,
 }
 
+/// Assistant progress can change while the process still owns the same wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TurnActivity {
+    Running,
+    Yielded { wake_tasks: u32 },
+    Completed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskKind {
+    Shell,
+    Agent,
+    Monitor,
+    Workflow,
+    Other,
+}
+
 /// A command or subagent left running after the provider yielded its answer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BackgroundTask {
     pub id: String,
     pub description: String,
+    pub kind: TaskKind,
     pub agent: bool,
     /// The shell command behind a backgrounded Bash call, when known.
     pub command: Option<String>,
@@ -287,7 +307,13 @@ struct Protocol {
     /// with a result of its own, so a result does not end the turn while any wait.
     claude_unstarted_steers: std::collections::HashSet<String>,
     claude_usage_limit: Option<crate::usage::Limit>,
+    /// The deadline for a queued prompt to start after the previous result.
     claude_resume_at: Option<Instant>,
+    /// Time for the CLI to start a continuation after a terminal task event.
+    claude_task_wake_at: Option<Instant>,
+    /// Keep reading for follow-up output after shells end or inventory shrinks.
+    claude_drain_at: Option<Instant>,
+    claude_turn_activity: TurnActivity,
     follow_up_ready: bool,
     steering: HashMap<String, (crate::follow_up::Message, Instant)>,
     request: Request,
@@ -337,6 +363,9 @@ impl Protocol {
             claude_unstarted_steers: Default::default(),
             claude_usage_limit: None,
             claude_resume_at: None,
+            claude_task_wake_at: None,
+            claude_drain_at: None,
+            claude_turn_activity: TurnActivity::Running,
             follow_up_ready: false,
             steering: HashMap::new(),
             emitted: HashMap::new(),
@@ -429,6 +458,14 @@ impl Protocol {
         }
     }
     fn frame(&mut self, v: Value, stdin: &mut impl Write) -> Result<Vec<Event>, String> {
+        let mut events = self.frame_inner(v, stdin)?;
+        if self.request.kind == Kind::Claude {
+            self.sync_claude_result(&mut events);
+        }
+        Ok(events)
+    }
+
+    fn frame_inner(&mut self, v: Value, stdin: &mut impl Write) -> Result<Vec<Event>, String> {
         if self.request.kind == Kind::Codex {
             // Codex requests its clock before thread/start may have replied.
             if v["method"] == "currentTime/read" && v.get("id").is_some() {
@@ -468,6 +505,7 @@ impl Protocol {
                 return Ok(Vec::new());
             }
         }
+        let mut activity_events = Vec::new();
         if self.request.kind == Kind::Claude {
             if v["type"] == "control_cancel_request" {
                 let id = v["request_id"].to_string();
@@ -490,23 +528,32 @@ impl Protocol {
             {
                 self.claude_prompt(stdin)?;
             }
-            if v["type"] == "user" && v["isReplay"] == true {
-                if let Some(uuid) = v["uuid"].as_str() {
-                    self.claude_unstarted_steers.remove(uuid);
-                }
-                return Ok(Vec::new());
-            }
+            let replay = v["type"] == "user" && v["isReplay"] == true;
+            let steer_started = replay
+                && v["uuid"]
+                    .as_str()
+                    .is_some_and(|uuid| self.claude_unstarted_steers.remove(uuid));
             let starts_message = v["parent_tool_use_id"].is_null()
-                && (v["type"] == "assistant"
+                && (steer_started
+                    || (v["type"] == "assistant" && v["message"]["model"] != "<synthetic>")
                     || (v["type"] == "stream_event" && v["event"]["type"] == "message_start")
-                    || (v["type"] == "system" && v["subtype"] == "init"));
+                    || (v["type"] == "control_request"
+                        && v["request"]["subtype"] == "can_use_tool")
+                    || (v["origin"]["kind"] == "task-notification" && claude_turn_result(&v)));
             if starts_message && self.claude_result_seen {
                 self.claude_result_seen = false;
                 self.claude_resume_at = None;
+                self.claude_task_wake_at = None;
+                self.claude_drain_at = None;
                 self.text_key = None;
+                self.begun = false;
+                self.emitted.clear();
+                self.set_claude_turn_activity(TurnActivity::Running, &mut activity_events);
+            }
+            if replay {
+                return Ok(activity_events);
             }
         }
-        let mut activity_events = Vec::new();
         if self.activity(&v, &mut activity_events) {
             return Ok(activity_events);
         }
@@ -1086,16 +1133,8 @@ impl Protocol {
                         // The queued prompt's run starts right after this result. The
                         // deadline only guards against a steer the CLI never picks up.
                         if !self.claude_unstarted_steers.is_empty() {
-                            self.claude_resume_at = Some(Instant::now() + Duration::from_secs(15));
-                        }
-                        if self.activities.claude_background.is_empty()
-                            && self.activities.claude_pending.is_empty()
-                            && self.claude_resume_at.is_none()
-                        {
-                            events.push(Event::Done);
-                            self.done = true;
-                        } else if self.claude_unstarted_steers.is_empty() {
-                            events.push(Event::Status("Waiting for background tasks…".into()));
+                            self.claude_resume_at =
+                                Some(Instant::now() + CLAUDE_CONTINUATION_GRACE);
                         }
                     }
                     // A limit reported for the replay must not carry over to the real turn.
@@ -1898,6 +1937,7 @@ fn run_operation(
         let mut ready_emitted = false;
         let mut interrupted = false;
         loop {
+            let mut activity_changed = false;
             if cancel.load(Ordering::Relaxed) && !interrupted {
                 interrupted = true;
                 if !protocol.interrupt(&mut stdin)? {
@@ -1922,7 +1962,11 @@ fn run_operation(
                     }
                 }
                 pending.extend(protocol.expire_steering());
-                pending.extend(protocol.lifecycle_tick(started, &mut stdin)?);
+                let lifecycle = protocol.lifecycle_tick(started, &mut stdin)?;
+                activity_changed = lifecycle
+                    .iter()
+                    .any(|event| matches!(event, Event::TurnActivity(_)));
+                pending.extend(lifecycle);
                 if protocol.ready() && !ready_emitted {
                     ready_emitted = true;
                     pending.push(Event::Ready);
@@ -1934,6 +1978,17 @@ fn run_operation(
             if interrupted && protocol.done {
                 stop_confirmed = true;
                 return Err("Stopped".into());
+            }
+            // An activity edge must reach the runtime before the next frame
+            // can replace it (for example, a shell result followed by a wake).
+            if !pending.is_empty() && (protocol.done || activity_changed) {
+                emit(std::mem::take(&mut pending))?;
+                pending_bytes = 0;
+                last_emit = Instant::now();
+                activity_changed = false;
+            }
+            if protocol.done {
+                return Ok(protocol.catalog_result.take());
             }
             if protocol.request.settings.text_only && started.elapsed() >= Duration::from_secs(45) {
                 return Err("Background text request timed out".into());
@@ -2027,6 +2082,14 @@ fn run_operation(
                         if interrupted {
                             continue;
                         }
+                        if matches!(event, Event::TurnActivity(_)) {
+                            if activity_changed {
+                                emit(std::mem::take(&mut pending))?;
+                                pending_bytes = 0;
+                                last_emit = Instant::now();
+                            }
+                            activity_changed = true;
+                        }
                         pending_bytes += match &event {
                             Event::Text(text) | Event::Reasoning(text) | Event::Status(text) => {
                                 text.len()
@@ -2049,6 +2112,14 @@ fn run_operation(
                     if interrupted {
                         return Err("Stopped".into());
                     }
+                    if protocol.request.kind == Kind::Claude
+                        && protocol.claude_turn_activity == TurnActivity::Completed
+                    {
+                        pending.push(Event::Background(Vec::new()));
+                        pending.push(Event::Done);
+                        protocol.done = true;
+                        return Ok(None);
+                    }
                     return Err(format!(
                         "Provider exited before completing the turn. {}",
                         String::from_utf8_lossy(&tail.lock().unwrap())
@@ -2057,7 +2128,10 @@ fn run_operation(
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
             if !pending.is_empty()
-                && (last_emit.elapsed() >= TICK || pending_bytes >= BATCH_BYTES || protocol.done)
+                && (last_emit.elapsed() >= TICK
+                    || pending_bytes >= BATCH_BYTES
+                    || protocol.done
+                    || activity_changed)
             {
                 emit(std::mem::take(&mut pending))?;
                 pending_bytes = 0;

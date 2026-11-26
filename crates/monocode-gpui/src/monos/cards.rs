@@ -19,94 +19,6 @@ fn line_card(id: impl Into<ElementId>) -> Stateful<Div> {
         .line_height(px(20.))
         .hover(|s| s.border_color(content(0.2)).bg(content(0.05)))
 }
-/// Suggested replies, one line card each. Picking one sends it; once any
-/// reply follows, the picked one is checked and the rest step back.
-fn choices(
-    value: &Value,
-    chosen: Option<&str>,
-    cx: &mut Context<crate::transcript::TranscriptView>,
-) -> AnyElement {
-    let options: Vec<String> = value["options"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|v| v.as_str().map(str::to_owned))
-        .collect();
-    let picked = chosen.and_then(|reply| options.iter().position(|o| o.trim() == reply.trim()));
-    let answered = chosen.is_some();
-    // Each card hugs its own label (items_start stops the stretch) and
-    // wraps once it reaches 80% of the transcript's width.
-    div()
-        .flex()
-        .flex_col()
-        .items_start()
-        .gap_1p5()
-        .children(options.into_iter().enumerate().map(|(ix, label)| {
-            let checked = picked == Some(ix);
-            let mark = if checked {
-                div()
-                    .size(px(16.))
-                    .flex_shrink_0()
-                    .rounded_full()
-                    .bg(rgb(0x34d399))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(icon("check", 11.).text_color(rgb(0x062e22)))
-            } else {
-                div()
-                    .size(px(16.))
-                    .flex_shrink_0()
-                    .rounded_full()
-                    .border(px(1.5))
-                    .border_color(content(0.35))
-                    .when(!answered, |d| {
-                        d.group_hover("mono-choice", |s| s.border_color(content(0.7)))
-                    })
-            };
-            let answer = label.clone();
-            div()
-                .id(("mono-choice", ix))
-                .debug_selector(move || format!("mono-choice-{ix}"))
-                .group("mono-choice")
-                .role(Role::Button)
-                .aria_label(label.clone())
-                .aria_toggled(if checked {
-                    gpui::Toggled::True
-                } else {
-                    gpui::Toggled::False
-                })
-                .flex()
-                .max_w(gpui::relative(0.8))
-                .min_w_0()
-                .items_center()
-                .gap_2p5()
-                .rounded_xl()
-                .border_1()
-                .border_color(content(if checked { 0.2 } else { 0.1 }))
-                .line_height(px(20.))
-                .py(px(6.))
-                .pl(px(10.))
-                .pr_3()
-                .when(answered && !checked, |d| d.opacity(0.45))
-                .when(!answered, |d| {
-                    d.cursor_pointer()
-                        .hover(|s| s.border_color(content(0.2)).bg(content(0.05)))
-                        .on_click(cx.listener(move |_, _, _, cx| {
-                            cx.emit(CardAction(json!({"type":"choice","text":answer})))
-                        }))
-                })
-                .child(mark)
-                .child(
-                    div()
-                        .min_w_0()
-                        .text_size(px(13.))
-                        .text_color(content(1.))
-                        .child(label),
-                )
-        }))
-        .into_any_element()
-}
 /// ArtifactCard: the document's icon and title, opening it in the reader.
 fn artifact(value: &Value, cx: &mut Context<crate::transcript::TranscriptView>) -> AnyElement {
     let html = value["kind"] == "html";
@@ -244,16 +156,13 @@ pub(crate) fn launch(
         )
         .into_any_element()
 }
-/// `chosen` is the reply sent after the card, if any, which answers it.
 pub(crate) fn render(
     value: &Value,
-    chosen: Option<&str>,
     cx: &mut Context<crate::transcript::TranscriptView>,
 ) -> AnyElement {
     let kind = value["type"].as_str().unwrap_or_default();
     match kind {
         "document" => return artifact(value, cx),
-        "choices" => return choices(value, chosen, cx),
         "session" => {
             let id = value["sessionId"].as_i64().unwrap_or_default();
             let view = value["state"]
@@ -369,19 +278,24 @@ pub(crate) fn render(
         .into_any_element()
 }
 /// launchedSessionState: where a session the Mono started stands.
-fn launched_state(session: &Conversation, cx: &App) -> &'static str {
-    if session.needs_approval() {
-        "input"
-    } else if session.busy {
-        "working"
-    } else if !session.summary.has_messages {
-        "draft"
-    } else {
-        match session.external_outcome(cx) {
-            (false, status) if status.starts_with("Stopped") => "stopped",
-            (false, _) => "failed",
-            _ => "done",
-        }
+fn launched_state(
+    activity: &monocode_core::agent_status::Activity,
+    has_messages: bool,
+) -> &'static str {
+    use monocode_core::agent_status::{Activity, Outcome};
+    match activity {
+        Activity::NeedsYou { .. } => "input",
+        Activity::Running { .. } | Activity::BackgroundWait { .. } => "working",
+        Activity::Done {
+            outcome: Outcome::Interrupted,
+            ..
+        } => "stopped",
+        Activity::Done {
+            outcome: Outcome::Failed,
+            ..
+        } => "failed",
+        Activity::Idle if !has_messages => "draft",
+        _ => "done",
     }
 }
 /// LaunchedSessionCard: how each session `mono` started stands, for its cards
@@ -403,7 +317,10 @@ pub(crate) fn launch_views(
                     let session = session.read(cx);
                     crate::transcript::LaunchView {
                         title: session.summary.title.clone(),
-                        state: launched_state(session, cx),
+                        state: launched_state(
+                            &owner.agent_status(launch.session_id).activity,
+                            session.summary.has_messages,
+                        ),
                         harness: session.summary.provider.clone(),
                         cwd: session.summary.cwd.clone(),
                         cloud: owner.cloud_badge_of(launch.session_id),
@@ -416,15 +333,10 @@ pub(crate) fn launch_views(
                             .map(|s| s.title.clone())
                             .unwrap_or_else(|| launch.title.clone()),
                         state: summary.map_or("unavailable", |s| {
-                            if s.needs_input {
-                                "input"
-                            } else if s.busy {
-                                "working"
-                            } else if !s.has_messages {
-                                "draft"
-                            } else {
-                                "done"
-                            }
+                            launched_state(
+                                &owner.agent_status(launch.session_id).activity,
+                                s.has_messages,
+                            )
                         }),
                         harness: launch.harness.clone(),
                         cwd: summary
@@ -480,7 +392,10 @@ impl Monos {
                 }) {
                     let session = session.read(cx);
                     value["title"] = json!(session.summary.title);
-                    value["state"] = json!(launched_state(session, cx));
+                    value["state"] = json!(launched_state(
+                        &session.displayed_activity,
+                        session.summary.has_messages
+                    ));
                     value["harness"] = json!(session.summary.provider);
                     value["cwd"] = json!(session.summary.cwd);
                 }
@@ -529,6 +444,47 @@ impl Monos {
         }
     }
 
+    fn answer_decision(
+        &mut self,
+        mono: &str,
+        value: &Value,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let id = value["id"]
+            .as_str()
+            .ok_or("Decision card is missing its id")?;
+        let chat = self
+            .chats
+            .get(mono)
+            .ok_or("This Mono's conversation is unavailable")?;
+        let pending = chat.read(cx).pending_mono_decisions(cx);
+        let Some(question) = pending.get(id) else {
+            // A second click or a stale card cannot enqueue another answer.
+            return Ok(());
+        };
+        let answers = mono::cards::decision_answers(
+            value["answers"]
+                .as_array()
+                .ok_or("Provide answers for this decision")?,
+        )?;
+        let text = format!("Decision on “{question}”:\n- {}", answers.join("\n- "));
+        let mono = self.roster.get_mut(mono).ok_or("Mono not found")?;
+        let record = mono.decision_cards.entry(id.to_owned()).or_insert_with(|| {
+            mono::cards::DecisionRecord {
+                question: question.clone(),
+                answers: Vec::new(),
+            }
+        });
+        if !record.answers.is_empty() {
+            return Ok(());
+        }
+        record.answers = answers;
+        let mono_id = mono.id.clone();
+        // The same roster save holds the answer and its queued user message.
+        self.enqueue(&mono_id, text, Vec::new(), false, cx);
+        Ok(())
+    }
+
     pub(super) fn hold_card(&mut self, session: i64, mono: &str, value: Value) {
         if let Some(run) = self.running.get_mut(&session) {
             run.cards.push(value);
@@ -538,7 +494,7 @@ impl Monos {
     }
 
     pub(super) fn card_action(&mut self, mono: &str, value: &Value, cx: &mut Context<Self>) {
-        if value["type"] != "choice" {
+        if value["type"] != "decision-answer" {
             self.make_active(mono, cx);
             if let Some(handle) = self.parent_window {
                 let app: &mut App = cx;
@@ -548,9 +504,10 @@ impl Monos {
             }
         }
         match value["type"].as_str().unwrap_or_default() {
-            "choice" => {
-                if let Some(text) = value["text"].as_str() {
-                    self.enqueue(mono, text.into(), Vec::new(), false, cx);
+            "decision-answer" => {
+                if let Err(error) = self.answer_decision(mono, value, cx) {
+                    self.error = Some(error);
+                    self.changed(cx);
                 }
             }
             "session" => {

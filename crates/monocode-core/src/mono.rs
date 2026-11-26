@@ -15,6 +15,7 @@ pub mod habits;
 pub mod heartbeat;
 pub mod memory;
 pub mod move_api;
+pub mod patrol;
 pub mod provider_files;
 pub mod work;
 pub mod workflows;
@@ -29,7 +30,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     path::{Path, PathBuf},
 };
 
@@ -67,6 +68,8 @@ pub struct Mono {
     pub desktop_launch_ids: Vec<i64>,
     pub outbox: Vec<Message>,
     pub pending_reports: Vec<String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub decision_cards: BTreeMap<String, cards::DecisionRecord>,
     pub habit_sessions: Vec<i64>,
     pub seen_rows: usize,
     /// Minutes of inactivity before a heartbeat; zero turns heartbeats off.
@@ -206,6 +209,7 @@ impl Default for Mono {
             desktop_launch_ids: Vec::new(),
             outbox: Vec::new(),
             pending_reports: Vec::new(),
+            decision_cards: BTreeMap::new(),
             habit_sessions: Vec::new(),
             seen_rows: 0,
             heartbeat_minutes: heartbeat::DEFAULT_MINUTES,
@@ -463,6 +467,7 @@ Start one directly, without reading help first: the app tool with action session
 ## Terminals\n\
 For a dev server, a watcher or a build the user wants to see (BE, FE, tests), open labeled terminals with terminals.open (a saved Project Action id as action, or a free shell command as command; place \"dock\" for a dock tab, \"tab\" for a title tab of its own, \"split\" to put several side by side in one view, or terminals.layout with preset columns, rows or grid to arrange up to 6 of them in one \"Logs <project>\" tab, for example BE and FE side by side), read output with terminals.read, and stop or close them when done. You may read any terminal of the project, including ones the user opened (never one that runs an agent CLI). Use a session (sessions.start) for work an agent should do, a terminal for a command that just runs. Never type into a terminal that runs an agent CLI such as claude or codex. A command or text runs at once, with no approval: the only rule is that the terminal's folder is inside the project or one of its git worktrees, so keep to the project, say in your reply what you run, and never run anything destructive or outside it. You can type only into terminals you opened; the check uses the terminal's live folder when the system can tell it, else the folder it started in. text takes no control characters, tab included (use key for ctrl-c, enter, up, down, q, tab, esc); command is typed and Enter is pressed, text is typed as is. Terminals are gone when the app restarts.\n\
 ## Soul, memory and habits\n\
+When work requires a decision from the user, use a question card with chat.card and type choices. Put one decision and its context in question, and include concrete options. The user can select several or type their own answer. Issue separate cards for independent decisions.\n\n\
 Your soul holds the user's standing instructions; they rank below the user's current request. Change it only when asked, through soul.read and soul.update with expectedHash; never edit its file directly. Keep useful facts through memory.add/replace/remove, saved after you have written your reply rather than before or in the middle of it; use memory.search before answering about earlier facts, and never save credentials. Topic notes are read with memory.read. Habits are scheduled work in separate sessions: suggest them when useful, but add one with habits.add only after agreement, state whether its instructions allow changes, and have quiet runs return NOTHING_TO_REPORT.\n\n\
 ## Workflows\n\
 {workflows}\n\n\

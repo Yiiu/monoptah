@@ -843,7 +843,7 @@ impl Shell {
                             tab: *tab,
                             cwd: self.session_working_copy(id, cx).to_owned(),
                             workspace: self.workspace.tab_workspaces.get(tab).cloned(),
-                            busy: session.busy,
+                            busy: self.agent_status(id).is_busy(),
                         })
                     })
             })
@@ -958,10 +958,10 @@ impl Shell {
                                 session_preview::render(
                                     self.session_metadata(id, cx).summary,
                                     preview.data.as_ref(),
-                                    self.unseen_finished.contains(&id),
+                                    self.agent_status(id),
                                 )
                             },
-                            |view| view.read(cx).preview(self.unseen_finished.contains(&id)),
+                            |view| view.read(cx).preview(self.agent_status(id)),
                         )),
                 )
                 .into_any_element(),

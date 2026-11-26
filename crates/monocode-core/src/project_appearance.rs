@@ -50,7 +50,13 @@ impl ProjectAppearance {
             .as_ref()
             .and_then(|name| MASCOTS.iter().position(|m| *m == name))
             .unwrap_or_else(|| {
-                let hash = project
+                let folder = project
+                    .trim_end_matches(['/', '\\'])
+                    .rsplit(['/', '\\'])
+                    .next()
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or(project);
+                let hash = folder
                     .encode_utf16()
                     .fold(0u32, |h, c| h.wrapping_mul(131).wrapping_add(c.into()));
                 hash as usize % MASCOTS.len()
@@ -68,6 +74,15 @@ impl ProjectAppearance {
             theme.normalize();
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn automatic_mascots_use_the_folder_name_on_either_platform() {
+    let appearance = ProjectAppearance::default();
+    let mascot = appearance.mascot("notes");
+    assert_eq!(appearance.mascot("/home/agent/notes/"), mascot);
+    assert_eq!(appearance.mascot(r"C:\somewhere\notes"), mascot);
 }
 
 /// A project's own copy of the Appearance page's color settings.

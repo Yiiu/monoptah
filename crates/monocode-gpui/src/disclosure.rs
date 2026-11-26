@@ -13,8 +13,9 @@ use std::time::{Duration, Instant};
 /// How long opening or closing takes: the modal card's entrance time.
 pub(crate) const DURATION: Duration = Duration::from_millis(200);
 
-/// The modal card's ease-out.
-fn ease_out(t: f32) -> f32 {
+/// The modal card's ease-out. Other motions that run beside a disclosure (the
+/// project tree's unread rows) share it so they move on one curve.
+pub(crate) fn ease_out(t: f32) -> f32 {
     1. - (1. - t).powi(3)
 }
 
@@ -95,12 +96,15 @@ impl Disclosure {
         let clip = if self.animating(now) {
             let fraction = self.fraction(now);
             // Until the content has been laid out once its height is unknown: the first
-            // frame of an opening stays shut and the next one has the measure.
-            let height = self
-                .content
-                .get()
-                .map_or(px(0.), |bounds| bounds.size.height * fraction);
-            clip.h(height).opacity(fraction)
+            // frame of an opening stays shut, and that of a closing keeps the content's
+            // own height (the project tree builds its disclosure at the toggle), so
+            // neither snaps; the next frame has the measure.
+            let clip = match self.content.get() {
+                Some(bounds) => clip.h(bounds.size.height * fraction),
+                None if self.open => clip.h(px(0.)),
+                None => clip,
+            };
+            clip.opacity(fraction)
         } else {
             clip
         };
@@ -179,5 +183,56 @@ mod tests {
         disclosure.set(false, false, start);
         assert_eq!(disclosure.fraction(start), 0.);
         assert!(!disclosure.mounted(start));
+    }
+
+    /// The project tree builds a disclosure at the toggle, so a close starts
+    /// before the content was ever measured. Its first frame must keep the
+    /// content's height, not snap shut and spring back on the next one.
+    #[gpui::test]
+    fn a_close_before_any_measure_starts_at_the_content_height(cx: &mut gpui::TestAppContext) {
+        use gpui::{Bounds, Pixels, canvas};
+        use std::{cell::RefCell, rc::Rc};
+        type Seen = Rc<RefCell<Vec<Bounds<Pixels>>>>;
+        struct View(Disclosure, Instant, Seen);
+        impl gpui::Render for View {
+            fn render(
+                &mut self,
+                _: &mut gpui::Window,
+                _: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                let seen = self.2.clone();
+                let clip = self
+                    .0
+                    .render(div().w(px(50.)).h(px(100.)), self.1)
+                    .expect("closing keeps the content mounted");
+                div().child(
+                    clip.relative().child(
+                        canvas(
+                            move |bounds, _, _| seen.borrow_mut().push(bounds),
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full(),
+                    ),
+                )
+            }
+        }
+        let start = Instant::now();
+        let mut disclosure = Disclosure::new(true);
+        disclosure.set(false, true, start);
+        let seen = Seen::default();
+        let window = cx.add_window({
+            let seen = seen.clone();
+            move |_, _| View(disclosure, start, seen)
+        });
+        gpui::VisualTestContext::from_window(window.into(), cx).run_until_parked();
+        let first = seen
+            .borrow()
+            .first()
+            .copied()
+            .expect("the clip was laid out");
+        assert_eq!(first.size.height, px(100.));
     }
 }

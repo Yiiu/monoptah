@@ -174,24 +174,11 @@ impl Shell {
         tui.update(cx, |tui, cx| tui.kill(cx));
         // A run waiting on this pane can never hear from it again.
         self.automation_tui_gone(id, cx);
-        self.refresh_session_mark_idle(id, cx);
-    }
-
-    /// The pane is gone, so its marks and busy state go quiet.
-    fn refresh_session_mark_idle(&mut self, id: i64, cx: &mut Context<Self>) {
-        if self.busy_sessions.remove(&id) {
-            self.push_inbox_busy(cx);
-        }
-        self.unseen_finished.remove(&id);
-        let Some(provider) = self.session_summaries.get(&id).map(|s| s.provider.clone()) else {
-            return;
-        };
-        if let Some(mark) = self.session_marks.get(&id) {
-            mark.update(cx, |mark, cx| mark.set(&provider, MarkState::Idle, cx));
-        }
-        if let Some(mark) = self.tab_marks.get(&id) {
-            mark.update(cx, |mark, cx| mark.set(&provider, MarkState::Idle, cx));
-        }
+        self.update_agent_status(
+            id,
+            Some(monocode_core::agent_status::Outcome::Interrupted),
+            cx,
+        );
     }
 
     fn tui_event(&mut self, id: i64, event: &TuiEvent, cx: &mut Context<Self>) {
@@ -199,7 +186,17 @@ impl Shell {
         match event {
             TuiEvent::Started => {}
             TuiEvent::Busy(_) | TuiEvent::Exited(_) => {
-                self.refresh_session_mark(id, cx);
+                use monocode_core::agent_status::Outcome;
+                let outcome = self
+                    .tui_sessions
+                    .get(&id)
+                    .and_then(|tui| tui.read(cx).exit())
+                    .map(|exit| match (exit.code, exit.error.is_some()) {
+                        (Some(0), false) => Outcome::Completed,
+                        (None, false) => Outcome::Interrupted,
+                        _ => Outcome::Failed,
+                    });
+                self.update_agent_status(id, outcome, cx);
                 self.invalidate_chrome(cx);
             }
             TuiEvent::Conversation(provider_id) => {

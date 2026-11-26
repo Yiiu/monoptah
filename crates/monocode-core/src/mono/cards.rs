@@ -1,4 +1,76 @@
+use crate::agent::{Question, QuestionItem, QuestionOption};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::{BTreeMap, HashSet};
+
+/// Native roster metadata. Answers and their user message are saved together.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DecisionRecord {
+    pub question: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub answers: Vec<String>,
+}
+
+pub fn question(card: &Value) -> Option<Question> {
+    if card["type"] != "choices" {
+        return None;
+    }
+    let id = card["id"].as_str().filter(|id| !id.is_empty())?;
+    let title = card["question"]
+        .as_str()
+        .unwrap_or("What should I do next?");
+    let options = card["options"]
+        .as_array()?
+        .iter()
+        .enumerate()
+        .filter_map(|(ix, label)| {
+            let label = label.as_str()?;
+            Some(QuestionOption {
+                id: ix.to_string(),
+                label: label.to_owned(),
+                description: card["optionDescriptions"][label]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_owned(),
+            })
+        })
+        .collect::<Vec<_>>();
+    (!options.is_empty()).then(|| Question {
+        id: id.to_owned(),
+        title: title.to_owned(),
+        auto_resolve_at: None,
+        items: vec![QuestionItem {
+            id: id.to_owned(),
+            prompt: title.to_owned(),
+            multiple: true,
+            allow_custom: true,
+            options,
+        }],
+    })
+}
+
+pub fn decision_answers(answers: &[Value]) -> Result<Vec<String>, String> {
+    let mut unique = HashSet::new();
+    let answers = answers
+        .iter()
+        .map(|answer| {
+            answer
+                .as_str()
+                .map(str::trim)
+                .filter(|text| !text.is_empty() && text.chars().count() <= 4_000)
+                .ok_or_else(|| "Provide an answer under 4000 characters".to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|answer| unique.insert(*answer))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if answers.is_empty() {
+        return Err("Choose an option or enter another answer".into());
+    }
+    Ok(answers)
+}
 fn text(v: &Value, key: &str, max: usize) -> Result<String, String> {
     v.get(key)
         .and_then(Value::as_str)
@@ -14,7 +86,7 @@ pub fn parse(v: &Value) -> Result<Value, String> {
     let allowed = match kind {
         "pr" => vec!["repo", "number", "note"],
         "session" => vec!["sessionId", "note"],
-        "choices" => vec!["options"],
+        "choices" => vec!["options", "question"],
         "habit" => vec!["name", "instructions", "schedule"],
         _ => return Err("Card type must be pr, session, choices or habit".into()),
     };
@@ -57,18 +129,61 @@ pub fn parse(v: &Value) -> Result<Value, String> {
             let options = v
                 .get("options")
                 .and_then(Value::as_array)
-                .filter(|o| !o.is_empty() && o.len() <= 4)
-                .ok_or("Choose 1–4 replies")?;
-            let options = options
-                .iter()
-                .map(|o| {
-                    o.as_str()
-                        .filter(|s| !s.trim().is_empty() && s.chars().count() <= 160)
-                        .map(str::to_owned)
-                        .ok_or("Replies must contain 1–160 characters")
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            json!({"type":"choices","options":options})
+                .filter(|options| !options.is_empty())
+                .ok_or("Provide at least one option")?;
+            let question = v
+                .get("question")
+                .map(|_| text(v, "question", 500))
+                .transpose()?;
+            let mut labels = Vec::with_capacity(options.len());
+            let mut descriptions = BTreeMap::new();
+            let mut seen = HashSet::new();
+            for option in options {
+                let (label, description) = if let Some(label) = option.as_str() {
+                    (label, None)
+                } else {
+                    let option = option.as_object().ok_or("Provide an option label")?;
+                    if option
+                        .keys()
+                        .any(|key| key != "label" && key != "description")
+                    {
+                        return Err("Unexpected choice option field".into());
+                    }
+                    let label = option
+                        .get("label")
+                        .and_then(Value::as_str)
+                        .ok_or("Provide an option label")?;
+                    let description = option
+                        .get("description")
+                        .map(|description| {
+                            description
+                                .as_str()
+                                .filter(|s| s.chars().count() <= 400)
+                                .ok_or("Option descriptions must be under 400 characters")
+                        })
+                        .transpose()?;
+                    (label, description)
+                };
+                let label = label.trim();
+                if label.is_empty() || label.chars().count() > 160 {
+                    return Err("Options must contain 1–160 characters".into());
+                }
+                if !seen.insert(label) {
+                    return Err("Option labels must be distinct".into());
+                }
+                labels.push(label);
+                if let Some(description) = description {
+                    descriptions.insert(label, description.trim());
+                }
+            }
+            let mut card = json!({"type":"choices","options":labels});
+            if let Some(question) = question {
+                card["question"] = json!(question);
+            }
+            if !descriptions.is_empty() {
+                card["optionDescriptions"] = json!(descriptions);
+            }
+            card
         }
         "habit" => {
             let schedule =
@@ -114,11 +229,30 @@ mod tests {
     fn cards_validate_fields_and_do_not_accept_arbitrary_links_or_commands() {
         assert!(parse(&json!({"type":"pr","repo":"owner/repo;echo x","number":1})).is_err());
         assert!(parse(&json!({"type":"choices","options":["a"],"command":"rm"})).is_err());
-        assert!(parse(&json!({"type":"choices","options":["a","b","c","d","e"]})).is_err());
+        assert!(parse(&json!({"type":"choices","options":["same"," same "]})).is_err());
         assert_eq!(
             parse(&json!({"type":"session","sessionId":"12"})).unwrap()["sessionId"],
             12
         );
         assert!(parse(&json!({"type":"habit","name":"Report","instructions":"Report builds","schedule":{"kind":"daily","time":"09:00"}})).is_ok());
+    }
+    #[test]
+    fn decisions_support_more_than_four_options_and_custom_multiple_answers() {
+        let mut card = parse(&json!({
+            "type":"choices", "question":"Which checks run?",
+            "options":["One","Two","Three","Four",{"label":"Five","description":"Slow"}]
+        }))
+        .unwrap();
+        card["id"] = json!("first-card");
+        let request = question(&card).unwrap();
+        assert_eq!(request.id, "first-card");
+        assert_eq!(request.title, "Which checks run?");
+        assert_eq!(request.items[0].options.len(), 5);
+        assert_eq!(request.items[0].options[4].description, "Slow");
+        assert!(request.items[0].multiple && request.items[0].allow_custom);
+        assert_eq!(
+            decision_answers(&[json!("Two"), json!("Five"), json!("My own check")]).unwrap(),
+            vec!["Two", "Five", "My own check"]
+        );
     }
 }

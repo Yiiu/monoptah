@@ -1,5 +1,6 @@
 mod accounts;
 mod actions;
+mod agent_activity;
 mod app_commands;
 mod app_views;
 mod archive_family;
@@ -62,8 +63,10 @@ mod notifications;
 mod orchestration;
 mod picker_preferences;
 mod pinned_tabs;
+mod progress_summary;
 mod project_rail;
 mod project_removal;
+mod project_tree;
 pub(crate) use project_removal::FilesOutcome;
 mod cloud_workspaces;
 mod mono_terminals;
@@ -106,7 +109,7 @@ mod window_chrome;
 mod worktrees;
 
 use crate::{
-    conversation::{Conversation, SessionChanged},
+    conversation::{AgentProgress, Conversation, SessionChanged},
     input,
     notes::Notes,
     pane_layout::{Edge, LayoutLeaf, Rect, SplitDir},
@@ -160,6 +163,7 @@ actions!(
         NextTab,
         PreviousTab,
         ToggleSidebar,
+        NextTreeRequest,
         FocusSearch,
         FocusPrompt,
         SearchFiles,
@@ -224,7 +228,10 @@ impl Render for Chrome {
             .update(cx, |shell, cx| match kind {
                 ChromeKind::Sidebar => {
                     let sidebar = shell.sidebar(cx);
-                    if shell.spaces_nudge.is_some() || shell.classic_tabs.animating() {
+                    if shell.spaces_nudge.is_some()
+                        || shell.classic_tabs.animating()
+                        || shell.tree_animating()
+                    {
                         window.request_animation_frame();
                     }
                     sidebar
@@ -307,10 +314,11 @@ pub(crate) fn bind_keys(cx: &mut App) {
         KeyBinding::new(&format!("{modifier}-shift-b"), ToggleRightPanel, context),
         KeyBinding::new(&format!("{modifier}-d"), SplitRight, context),
         KeyBinding::new(&format!("{modifier}-j"), ToggleTerminal, context),
+        KeyBinding::new("ctrl-j", NextTreeRequest, Some("Workspace && TreeLayout")),
         KeyBinding::new(&format!("{modifier}-shift-j"), SplitTerminal, context),
         KeyBinding::new(&format!("{modifier}-`"), NewTerminal, context),
         KeyBinding::new(&format!("{modifier}-alt-j"), NewTerminalHome, context),
-        // Switch between the original two-sidebar layout and the new layout.
+        // Cycle through Classic, Focused and Tree.
         KeyBinding::new(&format!("{modifier}-shift-l"), ToggleLayout, context),
         // Switch the Focused layout between its rounded and boxy workspace.
         KeyBinding::new(&format!("{modifier}-alt-l"), ToggleWorkspaceStyle, context),
@@ -648,7 +656,11 @@ struct TabShift {
 }
 impl TabShift {
     fn at(&self, now: std::time::Instant) -> (f32, bool) {
-        let t = now.saturating_duration_since(self.start).as_secs_f32() / REORDER_DURATION;
+        self.at_within(now, REORDER_DURATION)
+    }
+    /// The same glide over `duration` seconds.
+    fn at_within(&self, now: std::time::Instant, duration: f32) -> (f32, bool) {
+        let t = now.saturating_duration_since(self.start).as_secs_f32() / duration;
         if t >= 1. {
             return (self.to, true);
         }
@@ -710,6 +722,9 @@ pub(crate) struct Shell {
     classic_session_search: Entity<input::Input>,
     classic_worktree_picker: Option<classic_sidebar::WorktreePicker>,
     sidebar_list: sidebar_list::SidebarList,
+    tree: project_tree::TreeState,
+    progress_summary_jobs: HashMap<i64, progress_summary::Job>,
+    worktree_archive: progress_summary::WorktreeArchive,
     sidebar_slide: Option<PaneSlide>,
     sidebar_fraction: f32,
     /// Settings' own nav collapse, apart from the project sidebar's saved
@@ -851,13 +866,15 @@ pub(crate) struct Shell {
     live_agents_expanded: bool,
     /// Repaints the live agents card when one of its elapsed times changes.
     live_tick: Option<gpui::Task<()>>,
-    /// Milliseconds until the next elapsed label in the live agents card changes.
-    live_next_change: u64,
     busy_sessions: HashSet<i64>,
     notification_state: notifications::State,
     github_star: github_star::State,
     quick: crate::quick_composer::Controller,
-    unseen_finished: HashSet<i64>,
+    agent_statuses: HashMap<i64, monocode_core::agent_status::AgentStatus>,
+    session_activity: HashMap<i64, monocode_core::store::SessionActivity>,
+    status_timing: HashMap<i64, agent_activity::Timing>,
+    activity_writes: async_channel::Sender<agent_activity::Write>,
+    last_status_input_at: Option<u64>,
     archiving: HashSet<i64>,
     /// Sessions archived together with the session that started them, so
     /// restoring that session restores them and not the ones archived earlier.
@@ -1072,7 +1089,10 @@ impl Shell {
         let metadata = locked(&store)
             .map(|db| db.session_sidebar_metadata(&projects))
             .unwrap_or_default();
-        Self::new_with_metadata(store, summaries, cwd, saved, metadata, cx)
+        let activity = locked(&store)
+            .and_then(|db| db.restore_session_activity(monocode_core::time::now_ms()))
+            .unwrap_or_default();
+        Self::new_with_metadata(store, summaries, cwd, saved, metadata, activity, cx)
     }
     pub(crate) fn new_with_metadata(
         store: Database,
@@ -1080,6 +1100,7 @@ impl Shell {
         cwd: String,
         saved: Option<String>,
         sidebar_metadata: monocode_core::store::SessionSidebarMetadata,
+        session_activity: HashMap<i64, monocode_core::store::SessionActivity>,
         cx: &mut Context<Self>,
     ) -> Self {
         crate::accounts::install(store.clone(), cx);
@@ -1152,12 +1173,21 @@ impl Shell {
         let latest_state = Arc::new(Mutex::new(serde_json::to_string(&workspace).unwrap()));
         let quit_state = latest_state.clone();
         let quit_store = store.clone();
+        let activity_writes = agent_activity::start_writer(store.clone(), cx);
+        let quit_activity = activity_writes.clone();
         // This application-level hook survives the last window/entity being released.
         let app: &mut App = cx;
         app.on_app_quit(move |cx| {
             let state = quit_state.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let store = quit_store.clone();
+            let (flush, flushed) = async_channel::bounded(1);
+            let pending = quit_activity
+                .try_send(agent_activity::Write::Flush(flush))
+                .is_ok();
             cx.background_executor().spawn(async move {
+                if pending {
+                    let _ = flushed.recv().await;
+                }
                 let _ = locked(&store).and_then(|s| s.save_ui_state(&state));
             })
         })
@@ -1243,6 +1273,7 @@ impl Shell {
         });
         let worktree_focus = workspace.worktree_focus.clone();
         let session_worktrees = sidebar_metadata.worktrees;
+        let agent_statuses = agent_activity::restored(&session_activity);
         let notification_state = notifications::State::new(&workspace, store.clone(), cx);
         let classic_session_search = classic_sidebar::session_search(cx);
         let classic_search_subscription =
@@ -1291,6 +1322,9 @@ impl Shell {
             classic_session_search,
             classic_worktree_picker: None,
             sidebar_list: sidebar_list::SidebarList::new(cx),
+            tree: project_tree::TreeState::new(cx),
+            progress_summary_jobs: HashMap::new(),
+            worktree_archive: Default::default(),
             sidebar_slide: None,
             sidebar_fraction: if workspace.sidebar_visible { 1. } else { 0. },
             settings_nav_visible: true,
@@ -1372,12 +1406,15 @@ impl Shell {
             live_marks: HashMap::new(),
             live_agents_expanded: false,
             live_tick: None,
-            live_next_change: 1000,
             busy_sessions: HashSet::new(),
             notification_state,
             github_star: Default::default(),
             quick: Default::default(),
-            unseen_finished: HashSet::new(),
+            agent_statuses,
+            session_activity,
+            activity_writes,
+            status_timing: HashMap::new(),
+            last_status_input_at: None,
             archiving: HashSet::new(),
             archived_with: HashMap::new(),
             archive_shortcut_held: false,
@@ -1632,6 +1669,7 @@ impl Shell {
             }));
         this.monos = Some(monos);
         this.bind_notices(cx);
+        this.start_worktree_archive_watch(cx);
         this.init_app_bridge(cx);
         let telegram_dir = locked(&this.store)
             .ok()
@@ -1732,6 +1770,7 @@ impl Shell {
         }
         self.trim_session_histories(&shown, cx);
         self.sync_tui(&shown, cx);
+        self.refresh_visible_seen(cx);
     }
     fn add(&mut self, summary: Session, cx: &mut Context<Self>) {
         self.workspace.add_project(&summary.cwd);
@@ -1927,8 +1966,8 @@ impl Shell {
                 this.orchestration_session_changed(id, cx);
                 this.automation_session_changed(id, cx);
                 this.sync_review_locks(cx);
-                this.refresh_session_mark(id, cx);
-                this.notification_session_changed(id, cx);
+                this.refresh_status(id, cx);
+                this.process_notification_inputs(cx);
                 this.update_usage_provider(cx);
                 this.update_chat_visibility(cx);
                 this.invalidate_chrome(cx);
@@ -1970,10 +2009,18 @@ impl Shell {
                     this.sidebar_frame.update(cx, |_, cx| cx.notify());
                 }
             }));
+        self.observations
+            .push(cx.subscribe(&view, move |this, _, _: &AgentProgress, cx| {
+                this.refresh_status(id, cx)
+            }));
         self.observe_orchestration(&view, id, cx);
         self.observe_session_folders(&view, id, cx);
         self.observe_telegram(&view, id, cx);
         self.sessions.insert(id, view);
+        let shell = cx.weak_entity();
+        cx.defer(move |cx| {
+            let _ = shell.update(cx, |this, cx| this.refresh_status(id, cx));
+        });
         if !self.order.contains(&id) {
             self.order.push(id);
         }
@@ -1998,71 +2045,16 @@ impl Shell {
             review.update(cx, |review, cx| review.set_undo_locked(locked, cx));
         }
     }
-    fn refresh_session_mark(&mut self, id: i64, cx: &mut Context<Self>) {
-        let id = self.workspace.session_for_pane(id);
-        // A terminal session is busy while its CLI runs a turn; it has no
-        // approvals and no cancellation of its own.
-        let (busy, cancelling, attention, archived, provider) =
-            if let Some(view) = self.sessions.get(&id) {
-                let session = view.read(cx);
-                (
-                    session.responding(),
-                    session.busy,
-                    session.needs_approval(),
-                    session.summary.archived,
-                    session.summary.provider.clone(),
-                )
-            } else if let (Some(tui), Some(summary)) =
-                (self.tui_sessions.get(&id), self.session_summaries.get(&id))
-            {
-                (
-                    tui.read(cx).busy(),
-                    false,
-                    false,
-                    summary.archived,
-                    summary.provider.clone(),
-                )
-            } else {
-                return;
-            };
-        let focused = !self.app_view_open() && self.workspace.active == Some(id);
-        if busy {
-            self.busy_sessions.insert(id);
-            self.unseen_finished.remove(&id);
-        } else if cancelling {
-            // Explicit cancellation is already idle in the UI. The worker is
-            // only finishing its save, so it must not announce a completed turn.
-            self.busy_sessions.remove(&id);
-            self.unseen_finished.remove(&id);
-        } else if self.busy_sessions.remove(&id) && !focused && !archived {
-            self.unseen_finished.insert(id);
-        }
-        if focused || archived {
-            self.unseen_finished.remove(&id);
-        }
-        let state = if busy {
-            MarkState::Working
-        } else if self.unseen_finished.contains(&id) {
-            MarkState::Done
-        } else {
-            MarkState::Idle
-        };
-        // A blocked turn is still busy, but the tab asks for attention first.
-        let tab_state = if attention {
-            MarkState::Attention
-        } else {
-            state
-        };
-        self.session_marks[&id].update(cx, |mark, cx| mark.set(&provider, state, cx));
-        self.tab_marks[&id].update(cx, |mark, cx| mark.set(&provider, tab_state, cx));
-        self.push_inbox_busy(cx);
-        self.sync_today_sessions(cx);
-    }
     /// Tells the Inbox which sessions are running, for its row and chip spinners.
     fn push_inbox_busy(&self, cx: &mut Context<Self>) {
         if let Some(inbox) = &self.inbox {
             let busy = self.busy_sessions.clone();
-            inbox.update(cx, |inbox, cx| inbox.set_busy(busy, cx));
+            let animated = busy
+                .iter()
+                .copied()
+                .filter(|id| self.agent_status(*id).activity.is_animating())
+                .collect();
+            inbox.update(cx, |inbox, cx| inbox.set_busy(busy, animated, cx));
         }
     }
     fn toggle_archive(&mut self, id: i64, cx: &mut Context<Self>) {
@@ -4449,6 +4441,20 @@ impl Shell {
         }
         let source = drag.source;
         let start = drag.start;
+        if matches!(source, DragSource::Session(_))
+            && self.tree_session_rail_owns_position(event.position)
+        {
+            // The vertical strip is reordering this row. On re-entry clear the
+            // preview from outside the strip without ending the pointer gesture.
+            let active = std::mem::take(&mut self.pane_drag.as_mut().unwrap().active);
+            if self.sidebar_drop.take().is_some() {
+                self.notify_sidebar(cx);
+            }
+            if active {
+                cx.notify();
+            }
+            return;
+        }
         let delta = event.position - start;
         if !drag.active && delta.x.as_f32().hypot(delta.y.as_f32()) < 5. {
             return;
@@ -4761,7 +4767,7 @@ impl Shell {
             self.terminal_pane_views.remove(&pane);
         }
         if let Some(id) = self.workspace.active {
-            self.refresh_session_mark(id, cx);
+            self.refresh_status(id, cx);
         }
         self.workspace.worktree_focus = self.worktree_focus.clone();
         self.workspace.normalize_title_order();
@@ -6529,6 +6535,22 @@ impl Shell {
                         .icon("image-add")
                         .into(),
                 ];
+                if *rail && self.workspace.tree_layout() {
+                    let mut create = vec![
+                        MenuAction::new("tree-new-session", "New session")
+                            .icon("plus")
+                            .into(),
+                    ];
+                    if !path.starts_with(monocode_core::remote::REMOTE_PATH_PREFIX) {
+                        create.push(
+                            MenuAction::new("tree-new-worktree", "New worktree")
+                                .icon("folder-tree")
+                                .into(),
+                        );
+                    }
+                    create.push(MenuItem::Separator);
+                    items.splice(0..0, create);
+                }
                 if !path.starts_with(monocode_core::remote::REMOTE_PATH_PREFIX) {
                     if SHOW_TELEGRAM_MENU_ITEM {
                         items.push(
@@ -6577,11 +6599,12 @@ impl Shell {
                 if peers.len() > 1 {
                     let ix = peers.iter().position(|p| p == path).unwrap_or(0);
                     let (first, last) = (ix == 0, ix + 1 == peers.len());
-                    let (back, forward) = if self.workspace.classic_layout {
-                        ("Move up", "Move down")
-                    } else {
-                        ("Move left", "Move right")
-                    };
+                    let (back, forward) =
+                        if self.workspace.classic_layout || self.workspace.tree_layout() {
+                            ("Move up", "Move down")
+                        } else {
+                            ("Move left", "Move right")
+                        };
                     let shortcut = |command| {
                         crate::settings::command_shortcut(&self.workspace.preferences, command)
                     };
@@ -6708,7 +6731,11 @@ impl Shell {
                 }
             }
             MenuTarget::Project { path, .. } => {
-                if action == "pin" {
+                if action == "tree-new-session" {
+                    self.tree_new_session(path, window, cx);
+                } else if action == "tree-new-worktree" {
+                    self.compose_in_new_worktree(path, window, cx);
+                } else if action == "pin" {
                     self.toggle_project_rail_pin(&path, cx);
                 } else if action == "project-group:new" {
                     let id = self.create_project_rail_group(Some(&path), cx);
@@ -7129,6 +7156,7 @@ impl Shell {
             .gap_1()
             .flex_shrink_0()
             .children(work_item)
+            .children(self.shell_task_chip(id))
             .when(
                 self.automation_state.session_automations.contains_key(&id),
                 |row| row.child(icon("zap", 12.).text_color(content(0.35))),
@@ -7376,29 +7404,6 @@ impl Shell {
     /// A clock for a session that resumes by itself once its usage limit resets.
     /// Amber like the clock in the composer's usage notice, so it reads apart
     /// from a limited session that is not armed (which shows no clock).
-    pub(super) fn auto_resume_badge(
-        &self,
-        id: i64,
-        state: monocode_core::usage::AutoResume,
-        label: bool,
-        icon_size: f32,
-    ) -> AnyElement {
-        let tip = crate::conversation::auto_resume_tooltip(state, monocode_core::usage::now_ms());
-        div()
-            .id(("session-auto-resume", id as usize))
-            .debug_selector(move || format!("session-auto-resume-{id}"))
-            .role(Role::Image)
-            .aria_label(tip.clone())
-            .flex()
-            .items_center()
-            .gap_1()
-            .text_color(gpui::rgb(crate::right_panel::AMBER_400))
-            .child(icon("clock", icon_size))
-            .when(label, |d| d.child("Auto resume"))
-            .tooltip(move |_, cx| cx.new(|_| project_rail::ProjectTooltip(tip.clone())).into())
-            .into_any()
-    }
-
     fn session_suffix(
         &self,
         id: i64,
@@ -7410,73 +7415,111 @@ impl Shell {
         if self.session_hover == Some(id) {
             return self.session_archive_button(id, session, cx);
         }
+        if let Some(badge) = self.auto_resume_activity_badge(id, detailed, 14.) {
+            return badge;
+        }
         div()
             .flex_shrink_0()
             .text_size(px(11.))
             .line_height(px(16.))
             .font_weight(FontWeight::NORMAL)
             .text_color(content(0.4))
-            .child(if session.needs_approval() {
-                div()
-                    .id(("session-approval", id as usize))
-                    .role(Role::Image)
-                    .aria_label("Needs approval")
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .text_color(rgb(0xfbbf24))
-                    .child(icon("circle-alert", 14.))
-                    .when(detailed, |d| d.child("Needs approval"))
-                    .into_any()
-            } else if detailed && session.responding() {
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .text_color(content(0.5))
-                    .children(self.session_marks.get(&id).cloned())
-                    .child("Working…")
-                    .into_any()
-            } else if let Some(state) = session.auto_resume(monocode_core::usage::now_ms()) {
-                // Before "Done": a limit ends the turn, so the session is
-                // usually unseen-finished as well.
-                self.auto_resume_badge(id, state, detailed, 14.)
-            } else if detailed && self.unseen_finished.contains(&id) {
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .text_color(rgb(0x2dd4bf))
-                    .child(icon("check-circle-2", 14.).text_color(rgb(0x2dd4bf)))
-                    .child("Done")
-                    .into_any()
-            } else if session.has_saved_draft() {
-                div()
-                    .id(("session-draft", id as usize))
-                    .role(Role::Image)
-                    .aria_label("Draft")
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .child(icon("circle-dashed-hi", 14.).text_color(content(0.4)))
-                    .when(detailed, |d| d.child("Draft"))
-                    .into_any()
-            } else if let Some(reminder) = self.reminders.iter().find(|r| r.session_id == id) {
-                div()
-                    .id(("session-reminder", id as usize))
-                    .aria_label(local_reminder_label(reminder.due_at))
-                    .text_color(rgb(0xf59e0b))
-                    .child(session_groups::reminder_caption(reminder.due_at))
-                    .into_any()
-            } else {
-                div()
-                    .child(monocode_core::time::relative(
-                        session.summary.updated_at,
-                        monocode_core::time::now_ms(),
-                    ))
-                    .into_any()
-            })
+            .child(
+                if let Some(label) = self.agent_status(id).label(monocode_core::time::now_ms()) {
+                    let activity = &self.agent_status(id).activity;
+                    let glyph = crate::session_mark::activity_glyph(activity, 14.);
+                    div()
+                        .id(("session-activity", id as usize))
+                        .role(Role::Image)
+                        .aria_label(label.clone())
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .text_color(crate::session_mark::activity_color(activity))
+                        .children(glyph)
+                        .when(detailed, |row| row.child(label))
+                        .into_any()
+                } else if session.has_saved_draft()
+                    && matches!(
+                        self.agent_status(id).activity,
+                        monocode_core::agent_status::Activity::Idle
+                    )
+                {
+                    div()
+                        .id(("session-draft", id as usize))
+                        .role(Role::Image)
+                        .aria_label("Draft")
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(icon("circle-dashed-hi", 14.).text_color(content(0.4)))
+                        .when(detailed, |d| d.child("Draft"))
+                        .into_any()
+                } else if let Some(reminder) = self.reminders.iter().find(|r| r.session_id == id) {
+                    div()
+                        .id(("session-reminder", id as usize))
+                        .aria_label(local_reminder_label(reminder.due_at))
+                        .text_color(rgb(0xf59e0b))
+                        .child(session_groups::reminder_caption(reminder.due_at))
+                        .into_any()
+                } else {
+                    div()
+                        .child(monocode_core::time::relative(
+                            match self.agent_status(id).activity {
+                                monocode_core::agent_status::Activity::Done { at, .. } => at,
+                                _ => session.summary.updated_at,
+                            },
+                            monocode_core::time::now_ms(),
+                        ))
+                        .into_any()
+                },
+            )
             .into_any()
+    }
+    pub(super) fn auto_resume_activity_badge(
+        &self,
+        id: i64,
+        detailed: bool,
+        icon_size: f32,
+    ) -> Option<AnyElement> {
+        use monocode_core::{
+            agent_status::{Activity, Wait},
+            usage::AutoResume,
+        };
+        let status = self.agent_status(id);
+        let now = monocode_core::time::now_ms();
+        let state = match status.activity {
+            Activity::BackgroundWait {
+                reason: Wait::UsageLimit { resume_at },
+                ..
+            } if resume_at > now => AutoResume::At(resume_at as i64),
+            Activity::BackgroundWait {
+                reason: Wait::UsageLimit { .. },
+                ..
+            } => AutoResume::Due,
+            Activity::BackgroundWait {
+                reason: Wait::UsageLimitPending,
+                ..
+            } => AutoResume::Unknown,
+            _ => return None,
+        };
+        let tip = crate::conversation::auto_resume_tooltip(state, now as i64);
+        Some(
+            div()
+                .id(("session-auto-resume", id as usize))
+                .debug_selector(move || format!("session-auto-resume-{id}"))
+                .role(Role::Image)
+                .aria_label(tip.clone())
+                .flex()
+                .items_center()
+                .gap_1()
+                .text_size(px(11.))
+                .text_color(crate::session_mark::activity_color(&status.activity))
+                .child(icon("clock", icon_size))
+                .when(detailed, |d| d.children(status.label(now)))
+                .tooltip(move |_, cx| cx.new(|_| project_rail::ProjectTooltip(tip.clone())).into())
+                .into_any(),
+        )
     }
 
     /// The project's sessions as the sidebar lists them, top to bottom.
@@ -7545,6 +7588,10 @@ impl Shell {
         if self.menu.is_some() {
             return;
         }
+        if self.workspace.tree_layout() && !in_tab {
+            self.step_tree_session(step, window, cx);
+            return;
+        }
         let ids = self.sidebar_navigation_ids(cx);
         let current = self.workspace.active;
         let Some(next) = adjacent(&ids, current.as_ref(), step) else {
@@ -7590,8 +7637,30 @@ impl Shell {
         cx.notify();
     }
     /// `Project: Previous/Next` along the project rail.
+    /// A new session in `path`, from the tree's project menu or its hover button.
+    /// Reuses an untouched blank the project already has instead of stacking another.
+    pub(super) fn tree_new_session(
+        &mut self,
+        path: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_project(path.clone(), window, cx);
+        let blank_prefix = format!("{path}\0");
+        if !self
+            .pending_project_blanks
+            .iter()
+            .any(|key| key.starts_with(&blank_prefix))
+        {
+            self.new_chat(cx);
+        }
+    }
     fn step_project(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
         if self.menu.is_some() {
+            return;
+        }
+        if self.workspace.tree_layout() {
+            self.step_tree_project(step, window, cx);
             return;
         }
         let projects = self.workspace.visible_project_order();
@@ -7645,6 +7714,9 @@ impl Shell {
         }
         if self.workspace.classic_layout {
             return self.classic_sidebar(cx);
+        }
+        if self.workspace.tree_layout() {
+            return self.tree_sidebar(cx);
         }
         self.refresh_sidebar_structure(cx);
         let live_agents = self.live_agents_preview(cx);
@@ -7853,13 +7925,10 @@ impl Shell {
                                         session_preview::render(
                                             self.session_metadata(preview.id, cx).summary,
                                             preview.data.as_ref(),
-                                            self.unseen_finished.contains(&preview.id),
+                                            self.agent_status(preview.id),
                                         )
                                     },
-                                    |view| {
-                                        view.read(cx)
-                                            .preview(self.unseen_finished.contains(&preview.id))
-                                    },
+                                    |view| view.read(cx).preview(self.agent_status(preview.id)),
                                 )),
                         ),
                 )
@@ -8161,9 +8230,8 @@ impl Shell {
             }
             if sessions.contains(&id) {
                 let session = self.session_metadata(id, cx);
-                let lit = session.responding()
-                    || session.needs_approval()
-                    || self.unseen_finished.contains(&id);
+                let status = self.agent_status(id);
+                let lit = status.is_busy() || status.needs_you() || status.unread_done();
                 let title = title(&id);
                 panes.push(TabPane {
                     key: (id, false),
@@ -8380,7 +8448,14 @@ impl Shell {
     /// tucked behind it.
     /// `leaving` is the pane that had focus while `shuffle` (linear) runs
     /// the deck shuffle that deals the focused pane's tile to the front.
-    fn pane_tile_stack(&self, copy: &TabCopy, leaving: Option<usize>, shuffle: f32) -> AnyElement {
+    fn pane_tile_stack(
+        &self,
+        copy: &TabCopy,
+        leaving: Option<usize>,
+        shuffle: f32,
+        edge: gpui::Hsla,
+        reduce_motion: bool,
+    ) -> AnyElement {
         // The focused pane in front, the rest behind in layout order.
         // A tab with no panes yet (still loading, or closing) has no focus
         // to put in front, so an index past the end is skipped, never used.
@@ -8405,7 +8480,7 @@ impl Shell {
             .map(|(ix, pane)| {
                 // Only the front tile borrows a lit session's live mark: the
                 // view can draw in one place at a time.
-                let (face, mark) = self.pane_tile(&pane.mark, to[ix] == 0);
+                let (face, mark) = self.pane_tile(&pane.mark, to[ix] == 0, edge, reduce_motion);
                 crate::tab_tile::StackTile {
                     face,
                     mark,
@@ -8422,12 +8497,27 @@ impl Shell {
         .debug_selector(|| "title-tab-tile-stack".into())
         .into_any_element()
     }
-    /// A pane's tile: a session on its provider's colour with a white mark,
-    /// or, while it works or waits to be seen, its live mark on a neutral
-    /// tile; files and Monos neutral.
-    fn pane_tile(&self, mark: &PaneMark, live: bool) -> (Face, AnyElement) {
+    /// The focused workspace keeps the provider tile visible during activity.
+    fn pane_tile(
+        &self,
+        mark: &PaneMark,
+        live: bool,
+        edge: gpui::Hsla,
+        reduce_motion: bool,
+    ) -> (Face, AnyElement) {
         match mark {
             PaneMark::Session(provider, lit) => {
+                if !self.workspace.classic_layout
+                    && let Some(id) = lit.filter(|_| live)
+                {
+                    return crate::session_mark::activity_tile_parts(
+                        provider,
+                        &self.agent_status(id).activity,
+                        crate::session_mark::ActivityIconSurface::Tab,
+                        edge,
+                        reduce_motion,
+                    );
+                }
                 match lit.filter(|_| live).and_then(|id| self.tab_marks.get(&id)) {
                     Some(view) => (
                         Face::Neutral,
@@ -9054,7 +9144,13 @@ impl Shell {
                                         .border_color(content(if active { 0.3 } else { 0.25 })),
                                 )
                             })
-                            .child(self.pane_tile_stack(&copy, leaving, shuffle))
+                            .child(self.pane_tile_stack(
+                                &copy,
+                                leaving,
+                                shuffle,
+                                shell_fill().blend(title_tab_fill(active, hovered)),
+                                cx.reduce_motion(),
+                            ))
                             .child(self.pane_headline(
                                 &copy,
                                 (leaving, dir, progress),
@@ -9278,7 +9374,13 @@ impl Shell {
                         .map(|id| {
                             let copy = self.tab_copy(id, cx);
                             [
-                                self.pane_tile_stack(&copy, None, 1.),
+                                self.pane_tile_stack(
+                                    &copy,
+                                    None,
+                                    1.,
+                                    shell_fill().blend(title_tab_fill(false, false)),
+                                    cx.reduce_motion(),
+                                ),
                                 self.pane_headline(&copy, (None, 0., 1.), false, false),
                             ]
                         })
@@ -9617,7 +9719,7 @@ impl Render for Shell {
         if self.settings.is_some() && self.workspace.classic_layout {
             self.sidebar_fraction = 1.;
         }
-        let sidebar_width = self.workspace.sidebar_width * self.sidebar_fraction;
+        let sidebar_width = self.session_sidebar_width();
         if !self.window_observed {
             self.window_observed = true;
             self.shortcuts = Some(shortcuts::install(cx.weak_entity(), window, cx));
@@ -9659,6 +9761,7 @@ impl Render for Shell {
                     this.window_active = window.is_window_active();
                     this.sync_cloud_chip_window(cx);
                     if this.window_active {
+                        this.refresh_visible_seen(cx);
                         this.reconcile_sync_jobs(cx);
                         if this.active_app_view == Some(app_views::AppView::Contributors)
                             && let Some(page) = this.contributors.clone()
@@ -9800,7 +9903,11 @@ impl Render for Shell {
             .relative()
             .role(Role::Application)
             .aria_label("Monoptah Native")
-            .key_context("Workspace")
+            .key_context(if self.workspace.tree_layout() && self.settings.is_none() {
+                "Workspace TreeLayout"
+            } else {
+                "Workspace"
+            })
             .track_focus(&self.focus)
             .when(self.blocking_modal().is_some(), |el| {
                 shortcuts::block_menu_actions(el)
@@ -9825,14 +9932,20 @@ impl Render for Shell {
             .bg(shell_fill())
             .text_color(content(1.))
             .font_family(crate::fonts::UI)
+            .on_mouse_move(cx.listener(|this, _: &MouseMoveEvent, _, cx| {
+                this.note_status_input(cx);
+            }))
             .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                this.note_status_input(cx);
                 this.git.update(cx, |git, cx| git.note_input(cx));
                 this.quit_hotkey_down(event, cfg!(target_os = "macos"), window, cx)
             }))
             .on_scroll_wheel(cx.listener(|this, _: &gpui::ScrollWheelEvent, _, cx| {
+                this.note_status_input(cx);
                 this.git.update(cx, |git, cx| git.note_input(cx));
             }))
             .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                this.note_status_input(cx);
                 this.git.update(cx, |git, cx| git.note_input(cx));
                 if this.session_preview.as_ref().is_some_and(|preview| {
                     !preview
@@ -10156,6 +10269,11 @@ impl Render for Shell {
             }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, window, cx| {
                 this.toggle_primary_sidebar(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &NextTreeRequest, window, cx| {
+                if this.workspace.tree_layout() && this.settings.is_none() {
+                    this.open_next_tree_request(window, cx);
+                }
             }))
             .on_action(cx.listener(|this, _: &ToggleRightPanel, window, cx| {
                 if this.workspace.classic_layout {
@@ -10539,13 +10657,20 @@ mod tests {
         window
             .update(cx, |shell, window, cx| {
                 assert!(
-                    shell.unseen_finished.contains(&a),
+                    shell.agent_status(a).unread_done(),
                     "a reply completed in the background"
                 );
+                shell.window_active = true;
+                shell.last_status_input_at = Some(monocode_core::time::now_ms() - 180_001);
                 shell.open(a, window, cx);
                 assert!(
-                    !shell.unseen_finished.contains(&a),
-                    "opening it restores the provider mark"
+                    shell.agent_status(a).unread_done(),
+                    "showing the session after a long idle period keeps it unread"
+                );
+                shell.note_status_input(cx);
+                assert!(
+                    !shell.agent_status(a).unread_done(),
+                    "input while the session is visible restores the provider mark"
                 );
             })
             .unwrap();
@@ -11631,12 +11756,30 @@ mod tests {
         } else {
             "ctrl"
         };
-        for classic in [true, false] {
+        use crate::workspace::NavigationLayout;
+        window
+            .update(cx, |shell, _, _| {
+                assert_eq!(
+                    shell.workspace.navigation_layout(),
+                    NavigationLayout::Focused
+                );
+            })
+            .unwrap();
+        // The shortcut cycles Classic → Focused → Tree, and back to where it started.
+        for expected in [
+            NavigationLayout::Tree,
+            NavigationLayout::Classic,
+            NavigationLayout::Focused,
+        ] {
             cx.simulate_keystrokes(window.into(), &format!("{m}-shift-l"));
             cx.run_until_parked();
             window
                 .update(cx, |shell, _, _| {
-                    assert_eq!(shell.workspace.classic_layout, classic);
+                    assert_eq!(shell.workspace.navigation_layout(), expected);
+                    assert_eq!(
+                        shell.workspace.classic_layout,
+                        expected == NavigationLayout::Classic
+                    );
                     assert!(!shell.workspace.right_panel_open);
                 })
                 .unwrap();

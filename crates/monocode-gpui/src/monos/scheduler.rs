@@ -2,7 +2,7 @@ use super::panels::{button, empty_state, matches_query, search_bar};
 use super::workflows_ui::view::{needs_review_badge, notice_line};
 use super::*;
 use monocode_core::mono::habits::{Run, Schedule};
-use monocode_core::mono::heartbeat;
+use monocode_core::mono::{heartbeat, patrol};
 use monocode_core::time::now_ms;
 
 enum Claimed {
@@ -14,6 +14,7 @@ struct HeartbeatCandidate {
     mono: Mono,
     /// The Mono's own chat, habit runs and other app-hidden sessions.
     skip: HashSet<i64>,
+    patrol: patrol::Snapshot,
 }
 /// The user's inbox across the Mono's projects. Fetched without holding the
 /// database: providers are network calls.
@@ -36,6 +37,49 @@ fn fetch_inbox(store: &Database, mono: &Mono) -> Vec<monocode_core::inbox::Item>
     let projects: Vec<std::path::PathBuf> = mono.projects.iter().map(Into::into).collect();
     service.list(&projects, &state).items
 }
+fn patrol_inventory(beat: &HeartbeatCandidate, state: &heartbeat::State) -> patrol::Snapshot {
+    let mut snapshot = beat.patrol.clone();
+    for project in &beat.mono.projects {
+        if project.starts_with("remote://") {
+            continue;
+        }
+        match monocode_core::git::worktrees(std::path::Path::new(project)) {
+            Ok(worktrees) => {
+                for worktree in worktrees {
+                    let path = worktree.path;
+                    let changes = (!worktree.missing)
+                        .then(|| monocode_core::scm::diff_stats(std::path::Path::new(&path)).ok())
+                        .flatten();
+                    snapshot.worktrees.insert(
+                        monocode_core::files::path_key(&path),
+                        patrol::Worktree {
+                            project: project.clone(),
+                            path,
+                            branch: worktree.branch,
+                            head: worktree.head,
+                            missing: worktree.missing,
+                            changes,
+                        },
+                    );
+                }
+            }
+            Err(_) => {
+                // An unavailable checkout cannot establish that its worktrees were removed.
+                if let Some(previous) = &state.patrol {
+                    snapshot.worktrees.extend(
+                        previous
+                            .worktrees
+                            .iter()
+                            .filter(|(_, tree)| &tree.project == project)
+                            .map(|(key, tree)| (key.clone(), tree.clone())),
+                    );
+                }
+            }
+        }
+    }
+    snapshot
+}
+
 /// Runs on a worker. Advances the cursor whenever a heartbeat is due, even when
 /// nothing changed, so a quiet Mono costs no model call.
 fn prepare_heartbeat(
@@ -48,11 +92,17 @@ fn prepare_heartbeat(
     let mono = &beat.mono;
     let state = heartbeat::load(root, &mono.id)?;
     if state.last_run_at == 0 {
-        // Enabling heartbeats or a first launch is not inactivity.
-        heartbeat::update(root, &mono.id, |s| s.last_run_at = now)?;
+        // Enabling heartbeats or a first launch only establishes a baseline.
+        let snapshot = patrol_inventory(beat, &state);
+        heartbeat::update(root, &mono.id, |s| {
+            if s.last_run_at == 0 {
+                s.last_run_at = now;
+                s.patrol = Some(snapshot.clone());
+            }
+        })?;
         return Ok(None);
     }
-    let (rows, sessions, notes) = {
+    let (rows, sessions, notes, activity) = {
         let db = locked(store)?;
         let chat = mono
             .session_id
@@ -68,9 +118,6 @@ fn prepare_heartbeat(
             .transpose()?
             .map(|t| t.rows)
             .unwrap_or_default();
-        if activity > state.last_run_at {
-            heartbeat::update(root, &mono.id, |s| s.quiet_streak = 0)?;
-        }
         let all = db.sessions()?;
         let since = state.last_run_at;
         let mut sessions = Vec::new();
@@ -94,10 +141,23 @@ fn prepare_heartbeat(
             });
         }
         let notes = heartbeat::changed_notes(&db.list_notes()?, &mono.projects, since, now);
-        (rows, sessions, notes)
+        (rows, sessions, notes, activity)
     };
+    let snapshot = patrol_inventory(beat, &state);
     let since = state.last_run_at;
-    heartbeat::update(root, &mono.id, |s| s.last_run_at = now)?;
+    let Some(changes) = heartbeat::update(root, &mono.id, |s| {
+        if s.last_run_at != since {
+            return None;
+        }
+        s.last_run_at = now;
+        if activity > since {
+            s.quiet_streak = 0;
+        }
+        Some(s.observe_patrol(snapshot.clone()))
+    })?
+    else {
+        return Ok(None);
+    };
     let inbox = heartbeat::changed_inbox(&inbox(store, mono), &mono.projects, since, now);
     let files = mono::load_files(root, mono)?;
     let standing = files
@@ -105,18 +165,20 @@ fn prepare_heartbeat(
         .as_deref()
         .and_then(heartbeat::standing_instructions);
     let digest = heartbeat::digest(sessions, notes, inbox);
-    if digest.is_empty() && standing.is_none() {
+    if digest.is_empty() && changes.is_empty() && standing.is_none() {
         return Ok(None);
     }
     let brief = heartbeat::brief(&rows);
-    Ok(Some(heartbeat::message(
+    let mut text = heartbeat::message(
         standing.as_deref(),
         &digest,
         &state.recent,
         &brief,
         since,
         now,
-    )))
+    );
+    text.push_str(&patrol::briefing(&changes));
+    Ok(Some(text))
 }
 
 #[derive(Default)]
@@ -1426,15 +1488,55 @@ impl Monos {
             skip.extend(m.session_id);
             skip.extend(m.habit_sessions.iter().copied());
         }
+        let owner = self.owner.upgrade();
+        let shell = owner.as_ref().map(|owner| owner.read(cx));
+        let views = shell
+            .map(|shell| shell.mono_session_views(cx))
+            .unwrap_or_default();
         self.roster
             .monos
             .iter()
-            .filter(|m| m.heartbeat_minutes > 0 && m.session_id.is_some() && m.outbox.is_empty())
+            .filter(|m| {
+                m.heartbeat_minutes > 0
+                    && (m.session_id.is_some() || !m.projects.is_empty())
+                    && m.unavailable_session.is_none()
+                    && m.outbox.is_empty()
+            })
             .filter(|m| !self.chats.get(&m.id).is_some_and(|v| v.read(cx).busy))
             .filter(|m| !self.inflight.contains_key(&m.id))
-            .map(|m| HeartbeatCandidate {
-                mono: m.clone(),
-                skip: skip.clone(),
+            .map(|m| {
+                let sessions = views
+                    .iter()
+                    .filter(|view| m.works_on(&view.project) && !skip.contains(&view.id))
+                    .map(|view| {
+                        let at = match view.activity {
+                            monocode_core::agent_status::Activity::Done { at, .. } => Some(at),
+                            _ => None,
+                        };
+                        (
+                            view.id,
+                            patrol::Session {
+                                title: view.title.clone(),
+                                project: view.project.clone(),
+                                worktree: view.worktree.clone(),
+                                state: (&view.activity).into(),
+                                completed_at: at,
+                                summary: shell
+                                    .and_then(|shell| shell.progress_summary(view.id))
+                                    .map(str::to_owned),
+                                archived: view.archived,
+                            },
+                        )
+                    })
+                    .collect();
+                HeartbeatCandidate {
+                    mono: m.clone(),
+                    skip: skip.clone(),
+                    patrol: patrol::Snapshot {
+                        sessions,
+                        ..Default::default()
+                    },
+                }
             })
             .collect()
     }
@@ -1645,6 +1747,13 @@ impl Monos {
         self.start_run(id, habit.id, habit.name, text, false, cx);
     }
     pub(super) fn start_heartbeat(&mut self, id: &str, text: String, cx: &mut Context<Self>) {
+        if !self.roster.get(id).is_some_and(|mono| {
+            mono.heartbeat_minutes > 0
+                && mono.unavailable_session.is_none()
+                && mono.outbox.is_empty()
+        }) {
+            return;
+        }
         self.start_run(
             id,
             heartbeat::RUN_ID.into(),
@@ -1665,26 +1774,55 @@ impl Monos {
         triage: bool,
         cx: &mut Context<Self>,
     ) {
-        self.active_run = Some(-1);
         let Some(mono) = self.roster.get(id).cloned() else {
             return;
         };
+        self.active_run = Some(-1);
         self.ensure_chat(id, cx);
-        let mut inherited = self
-            .chats
-            .get(id)
-            .map(|v| v.read(cx).settings.clone())
-            .unwrap_or_default();
-        let provider = self
-            .chats
-            .get(id)
-            .map(|v| v.read(cx).summary.provider.clone())
-            .unwrap_or_else(|| "codex".into());
+        let live = self.chats.get(id).and_then(|view| {
+            let view = view.read(cx);
+            view.settings_loaded()
+                .then(|| (view.summary.provider.clone(), view.settings.clone()))
+        });
+        let new_chat_provider = self
+            .prefs
+            .default_provider
+            .as_deref()
+            .and_then(Kind::parse)
+            .unwrap_or(Kind::Codex);
+        let new_chat_model = self
+            .prefs
+            .default_models
+            .get(new_chat_provider.id())
+            .cloned();
         let store = self.store.clone();
         let target = id.to_string();
         let work = cx.background_executor().spawn(async move {
             let db = locked(&store)?;
-            let cwd = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            let (provider, mut inherited) = match (live, mono.session_id) {
+                (Some(live), _) => live,
+                (None, Some(session)) => {
+                    let summary = db
+                        .mono_session(session)?
+                        .ok_or("This Mono's saved conversation is unavailable")?;
+                    (
+                        summary.provider,
+                        db.agent_settings(session)?.unwrap_or_default(),
+                    )
+                }
+                (None, None) => (
+                    new_chat_provider.id().into(),
+                    Settings {
+                        access: AccessMode::Auto,
+                        model: new_chat_model,
+                        effort: Some("low".into()),
+                        ..Default::default()
+                    },
+                ),
+            };
+            let cwd = std::env::var("HOME")
+                .or_else(|_| std::env::var("USERPROFILE"))
+                .unwrap_or_else(|_| ".".into());
             // Always a chat: the app drives this session, whatever the surface preference.
             let mut s = db.create(&provider, &cwd)?;
             s.title = format!("{} · {}", mono.label(), name);
@@ -1792,14 +1930,17 @@ impl Monos {
             return;
         }
         let run = self.running.remove(&session).unwrap();
-        self.active_run = None;
+        let beat = run.habit == heartbeat::RUN_ID;
+        if !beat {
+            self.active_run = None;
+        }
         let completion = {
             let view = run.view.read(cx);
-            NotificationFinished {
+            HabitFinished {
                 summary: view.summary.clone(),
-                body: view.notification_reply_text(cx),
-                habit: true,
-                was_cancelled: view.notification_was_cancelled(),
+                outcome: view
+                    .agent_outcome
+                    .unwrap_or(monocode_core::agent_status::Outcome::Completed),
             }
         };
         cx.emit(completion);
@@ -1853,27 +1994,74 @@ impl Monos {
             report: stored,
             error,
         };
-        let beat = habit == heartbeat::RUN_ID;
-        if beat {
-            let remembered = report.clone();
-            let quiet = ok && report.is_none();
-            self.file_work(
-                id.clone(),
-                move || {
-                    heartbeat::update(&root, &id, |state| {
-                        if let Some(report) = &remembered {
-                            state.remember(report);
-                            state.quiet_streak = 0;
-                        } else if quiet {
-                            state.quiet_streak = state.quiet_streak.saturating_add(1);
-                        }
-                    })
-                },
-                cx,
-            );
-            if ok && report.is_none() && run.cards.is_empty() && run.created.is_empty() {
-                self.discard_quiet_heartbeat(&run.mono, session, cx);
+        let post = habit_stop::post_text(
+            report.as_deref(),
+            run.stop,
+            user_stopped,
+            run.created.len(),
+            remaining,
+            &stuck,
+        );
+        let posting = post.is_some() || !run.cards.is_empty();
+        let saved = if posting && let Some(mono) = self.roster.get_mut(&id) {
+            if let Some(post) = post {
+                mono.pending_reports.push(if beat {
+                    post
+                } else {
+                    format!("**Habit report**\n\n{post}")
+                });
             }
+            for card in &run.cards {
+                mono.pending_reports.push(format!("mono-card:{card}"));
+            }
+            self.ensure_chat(&id, cx);
+            let saved = self.save_reporting(cx);
+            self.dispatch(&id, cx);
+            Some(saved)
+        } else {
+            None
+        };
+        if beat {
+            let quiet = ok && !posting;
+            if quiet && run.created.is_empty() {
+                self.discard_quiet_heartbeat(&id, session, cx);
+            }
+            // Keep the claim until the baseline write settles so the next scan
+            // cannot acknowledge a different batch. A posted report must be
+            // recoverable even if the process exits before rendering its chat.
+            cx.spawn(async move |this, cx| {
+                let published = match saved {
+                    Some(saved) => matches!(saved.recv().await, Ok(Ok(()))),
+                    None => !posting,
+                };
+                let result = if ok && published {
+                    cx.background_executor()
+                        .spawn(async move {
+                            heartbeat::update(&root, &id, |state| {
+                                state.confirm_patrol();
+                                if let Some(report) = &report {
+                                    state.remember(report);
+                                    state.quiet_streak = 0;
+                                } else if quiet {
+                                    state.quiet_streak = state.quiet_streak.saturating_add(1);
+                                }
+                            })
+                        })
+                        .await
+                } else {
+                    Ok(())
+                };
+                let _ = this.update(cx, |this, cx| {
+                    if this.active_run == Some(session) {
+                        this.active_run = None;
+                    }
+                    if let Err(error) = result {
+                        this.error = Some(error);
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
         } else {
             self.habit_file_work(
                 id.clone(),
@@ -1887,28 +2075,6 @@ impl Monos {
                 },
                 cx,
             );
-        }
-        if let Some(post) = habit_stop::post_text(
-            report.as_deref(),
-            run.stop,
-            user_stopped,
-            run.created.len(),
-            remaining,
-            &stuck,
-        ) {
-            if let Some(m) = self.roster.get_mut(&run.mono) {
-                m.pending_reports.push(if beat {
-                    post
-                } else {
-                    format!("**Habit report**\n\n{post}")
-                });
-                for card in &run.cards {
-                    m.pending_reports.push(format!("mono-card:{card}"));
-                }
-            }
-            self.ensure_chat(&run.mono, cx);
-            self.save(cx);
-            self.dispatch(&run.mono, cx);
         }
         self.changed(cx);
     }
@@ -1964,6 +2130,7 @@ mod tests {
                 ..Default::default()
             },
             skip: HashSet::from([chat]),
+            patrol: patrol::Snapshot::default(),
         };
         let no_inbox: fn(&Database, &Mono) -> Vec<monocode_core::inbox::Item> = |_, _| Vec::new();
         let t = now_ms();
@@ -1985,6 +2152,71 @@ mod tests {
             heartbeat::load(&root, &beat.mono.id).unwrap().last_run_at,
             t + 2 * heartbeat::IDLE_MS + 31 * min
         );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[gpui::test]
+    fn patrol_groups_cloud_sessions_with_their_local_project(cx: &mut gpui::TestAppContext) {
+        let (s, _, _, _guard) = crate::monos::cloud_tests::cloud_setup(cx, "Shutdown");
+        let id = crate::monos::cloud_tests::cloud_session(&s, cx);
+        s.window
+            .update(cx, |shell, _, cx| shell.mono_refresh_cloud(cx))
+            .unwrap();
+        cx.run_until_parked();
+        s.manager.read_with(cx, |manager, cx| {
+            let candidates = manager.heartbeat_candidates(cx);
+            let beat = candidates.iter().find(|beat| beat.mono.id == s.id).unwrap();
+            assert_eq!(beat.patrol.sessions[&id].project, s.project);
+        });
+    }
+
+    #[test]
+    fn patrol_uses_default_interval_and_only_briefs_project_changes() {
+        let dir = std::env::temp_dir().join(format!("mono-patrol-{}", mono::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let project = dir.to_string_lossy().to_string();
+        let store: Database = std::sync::Arc::new(std::sync::Mutex::new(
+            monocode_core::store::Store::open(&dir.join("native.sqlite")).unwrap(),
+        ));
+        let root = dir.join("monos");
+        let mut beat = HeartbeatCandidate {
+            mono: Mono {
+                projects: vec![project.clone()],
+                ..Default::default()
+            },
+            skip: HashSet::new(),
+            patrol: patrol::Snapshot::default(),
+        };
+        beat.patrol.sessions.insert(
+            18,
+            patrol::Session {
+                title: "Prepare a release".into(),
+                project,
+                worktree: None,
+                state: patrol::State::Running,
+                completed_at: None,
+                summary: None,
+                archived: false,
+            },
+        );
+        let start = now_ms();
+        let interval = u64::from(beat.mono.heartbeat_minutes + 1) * 60_000;
+        let prepare = |beat: &HeartbeatCandidate, at| {
+            prepare_heartbeat(&store, &root, beat, at, |_, _| Vec::new()).unwrap()
+        };
+        assert!(prepare(&beat, start).is_none());
+        assert!(prepare(&beat, start + interval).is_none());
+        beat.patrol.sessions.get_mut(&18).unwrap().state = patrol::State::NeedsYou;
+        let changed = prepare(&beat, start + 2 * interval).unwrap();
+        assert!(changed.contains("Project patrol changes"));
+        assert!(changed.contains("Prepare a release"));
+        assert!(changed.contains("needsYou"));
+        let state = heartbeat::load(&root, &beat.mono.id).unwrap();
+        assert!(state.pending_patrol.is_some());
+        assert_ne!(state.patrol, state.pending_patrol);
+        heartbeat::update(&root, &beat.mono.id, heartbeat::State::confirm_patrol).unwrap();
+        assert!(prepare(&beat, start + 3 * interval).is_none());
+        drop(store);
         std::fs::remove_dir_all(dir).ok();
     }
 

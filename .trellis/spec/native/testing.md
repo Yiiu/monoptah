@@ -107,3 +107,26 @@ once per batch, not per edit.
 
 When a change touches macOS-only code or macOS-gated tests, also run those tests on a Mac and
 `npm run native:check:mac`; Linux and Windows sessions cannot verify them.
+
+### Windows gotchas
+
+- **Toolchain:** vendored `gpui-pre` uses `std::hint::cold_path` and does not build on Rust
+  1.93 (`E0658`). If `rustup`'s `stable` is older, pass a newer toolchain explicitly
+  (`cargo +1.98.1 ntest ...`, or `RUSTUP_TOOLCHAIN=1.98.1 npm run native:dev -- --detach`).
+- **A running Native Dev locks the exe:** plain `cargo ntest -p monocode-gpui` also builds the
+  `monocode-gpui` binary for the integration tests and fails with `failed to remove file
+  ...\target\native-dev\monocode-gpui.exe`. Run the unit tests only with
+  `cargo ntest -p monocode-gpui --bin monocode-gpui <filter> -- --test-threads=1`, or close the
+  dev app first.
+- **Clippy on Windows** reports pre-existing dead-code and `unused_mut` lints in Windows-gated
+  code (`terminal.rs`, `automations/editor.rs`, `today/note_composer.rs`,
+  `runtime/remote/tests.rs`). CI lints on Linux only; judge your own files, not the crate's exit
+  code.
+
+### Keyboard shortcuts in tests
+
+Key bindings are not registered by default. A test that sends a shortcut must call
+`cx.update(crate::shell::bind_keys)` before building the window and focus something inside the
+`Workspace` key context (e.g. `shell.focus_active(window, cx)`) before
+`visual.simulate_keystrokes("secondary-,")`. Without both, the keystroke is silently ignored and
+the assertion fails for the wrong reason.

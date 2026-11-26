@@ -8,7 +8,7 @@ use crate::{
     resource_pressure::SessionInfo,
     right_panel::{RightPanel, RightTab},
     theme::*,
-    workspace::TitleTab,
+    workspace::{NavigationLayout, TitleTab},
 };
 use gpui::{
     AnyElement, Context, CursorStyle, Entity, MouseButton, MouseDownEvent, Role, StyleRefinement,
@@ -148,6 +148,19 @@ fn panel_button(enabled: bool, dot: bool) -> gpui::Stateful<gpui::Div> {
 }
 
 impl Shell {
+    pub(super) fn session_sidebar_width(&self) -> f32 {
+        let collapsed = if self.workspace.tree_layout() && self.settings.is_none() {
+            super::project_tree::COLLAPSED_WIDTH
+        } else {
+            0.
+        };
+        collapsed + (self.workspace.sidebar_width - collapsed) * self.sidebar_fraction
+    }
+
+    fn show_tree_status_bar(&self) -> bool {
+        self.workspace.tree_layout() && self.settings.is_none() && self.sidebar_fraction == 0.
+    }
+
     pub(super) fn classic_titlebar_spans_window(&self, cx: &gpui::App) -> bool {
         cfg!(target_os = "macos")
             && self.workspace.classic_layout
@@ -157,8 +170,19 @@ impl Shell {
             && !self.search_page()
             && !self.mono_active(cx)
     }
-    /// Switch navigation layouts without changing the new layout's frame style.
+    /// Cycle through the navigation layouts without changing the workspace style.
     pub(super) fn toggle_layout(&mut self, cx: &mut Context<Self>) {
+        self.set_navigation_layout(self.workspace.navigation_layout().next(), cx);
+    }
+
+    pub(super) fn set_navigation_layout(
+        &mut self,
+        layout: NavigationLayout,
+        cx: &mut Context<Self>,
+    ) {
+        if layout == self.workspace.navigation_layout() {
+            return;
+        }
         // Someone leaving the original layout before answering the new-layout
         // notice has never picked a frame, so they land on the boxy default.
         // Those who already went through it keep the frame they had.
@@ -166,7 +190,7 @@ impl Shell {
             self.workspace.new_layout_boxy = true;
             self.workspace.new_layout_prompt_dismissed = true;
         }
-        self.workspace.classic_layout = !self.workspace.classic_layout;
+        self.workspace.set_navigation_layout(layout);
         self.project_resize = None;
         self.layout_changed(cx);
         self.sync_settings(cx);
@@ -290,16 +314,21 @@ impl Shell {
                             .h_full()
                             .overflow_hidden()
                             .bg(inset_chrome_wash())
-                            .child(
-                                div()
-                                    .absolute()
-                                    .left_0()
-                                    .top_0()
-                                    .w(px(self.workspace.sidebar_width))
-                                    .h_full()
-                                    .opacity(self.sidebar_fraction)
-                                    .child(self.sidebar_contents()),
-                            ),
+                            .when(self.show_tree_status_bar(), |d| {
+                                d.child(self.tree_status_bar(cx))
+                            })
+                            .when(!self.show_tree_status_bar(), |d| {
+                                d.child(
+                                    div()
+                                        .absolute()
+                                        .left_0()
+                                        .top_0()
+                                        .w(px(self.workspace.sidebar_width))
+                                        .h_full()
+                                        .opacity(self.sidebar_fraction)
+                                        .child(self.sidebar_contents()),
+                                )
+                            }),
                     )
                 })
                 .child(div().w(px(sidebar_width)).h_full().flex_shrink_0())
@@ -410,30 +439,48 @@ impl Shell {
                             crate::right_panel::stroke()
                         })
                         .when(original, |d| d.bg(pane_fill()))
-                        .child(
-                            // Full width while it slides; the frame clips it.
-                            div()
-                                .absolute()
-                                .left_0()
-                                .top_0()
-                                .w(px(self.workspace.sidebar_width))
-                                .h_full()
-                                .flex()
-                                .flex_col()
-                                .opacity(self.sidebar_fraction)
-                                .when(!original, |d| {
-                                    d.child(
-                                        // The traffic lights head the sidebar, where
-                                        // the window's top is; the toggle floats
-                                        // above them (see below).
+                        .when(self.show_tree_status_bar(), |d| {
+                            d.child(
+                                div()
+                                    .size_full()
+                                    .flex()
+                                    .flex_col()
+                                    .child(
                                         titlebar_drag_area()
-                                            .w_full()
                                             .h(px(TITLE_BAR_HEIGHT))
                                             .flex_shrink_0(),
                                     )
-                                })
-                                .child(div().flex_1().min_h_0().child(self.sidebar_contents())),
-                        ),
+                                    .child(
+                                        div().flex_1().min_h_0().child(self.tree_status_bar(cx)),
+                                    ),
+                            )
+                        })
+                        .when(!self.show_tree_status_bar(), |d| {
+                            d.child(
+                                // Full width while it slides; the frame clips it.
+                                div()
+                                    .absolute()
+                                    .left_0()
+                                    .top_0()
+                                    .w(px(self.workspace.sidebar_width))
+                                    .h_full()
+                                    .flex()
+                                    .flex_col()
+                                    .opacity(self.sidebar_fraction)
+                                    .when(!original, |d| {
+                                        d.child(
+                                            // The traffic lights head the sidebar, where
+                                            // the window's top is; the toggle floats
+                                            // above them (see below).
+                                            titlebar_drag_area()
+                                                .w_full()
+                                                .h(px(TITLE_BAR_HEIGHT))
+                                                .flex_shrink_0(),
+                                        )
+                                    })
+                                    .child(div().flex_1().min_h_0().child(self.sidebar_contents())),
+                            )
+                        }),
                 )
             })
             .child(
@@ -943,6 +990,54 @@ mod tests {
     use crate::{monos::Monos, shell::tests::window};
     use gpui::{TestAppContext, WindowHandle};
     use std::time::{Duration, Instant};
+
+    #[gpui::test]
+    fn tree_uses_the_layout_shortcut_and_retains_a_collapsed_status_bar(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            crate::shell::bind_keys(cx);
+            cx.set_reduce_motion(true);
+        });
+        let (window, _, _) = window(cx);
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.simulate_resize(gpui::size(px(1450.), px(900.)));
+        visual.run_until_parked();
+        visual.simulate_keystrokes("secondary-shift-l");
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        assert!(visual.debug_bounds("project-tree-sidebar").is_some());
+        assert!(visual.debug_bounds("sidebar-project-button").is_none());
+
+        visual.simulate_keystrokes("secondary-b");
+        visual.run_until_parked();
+        for (theme, opacity) in [("dark", 85), ("dark", 100), ("light", 85)] {
+            window
+                .update(visual, |shell, _, cx| {
+                    shell.workspace.preferences.theme = theme.into();
+                    shell.workspace.preferences.sidebar_opacity = opacity;
+                    shell.invalidate_chrome(cx);
+                    cx.notify();
+                })
+                .unwrap();
+            visual.refresh().unwrap();
+            let status = visual
+                .debug_bounds("tree-status-bar")
+                .expect("collapsed status bar");
+            assert_eq!(status.size.width, px(48.));
+        }
+        window
+            .update(visual, |shell, _, cx| shell.set_peek(true, cx))
+            .unwrap();
+        visual.refresh().unwrap();
+        assert!(visual.debug_bounds("sidebar-peek").is_some());
+        assert!(visual.debug_bounds("tree-peek-pin").is_some());
+
+        visual.simulate_keystrokes("secondary-b");
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        assert!(visual.debug_bounds("project-tree-sidebar").is_some());
+        assert!(visual.debug_bounds("tree-status-bar").is_none());
+        assert!(visual.debug_bounds("sidebar-peek").is_none());
+    }
 
     fn mixed_window(cx: &mut TestAppContext) -> (WindowHandle<Shell>, Entity<Monos>, String, i64) {
         let (window, _, session) = window(cx);

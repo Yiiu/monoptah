@@ -18,12 +18,7 @@ impl Shell {
             return None;
         }
         let meta = self.session_metadata(id, cx);
-        // The tab's mark also knows a session waiting for approval.
-        let state = match self.tab_marks.get(&id) {
-            Some(mark) => mark.read(cx).state(),
-            None if meta.busy => MarkState::Working,
-            None => MarkState::Idle,
-        };
+        let state = MarkState::from_activity(&self.agent_status(id).activity);
         let branch = self
             .sessions
             .get(&id)

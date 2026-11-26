@@ -42,7 +42,11 @@ fn workspace_style_is_only_offered_under_the_new_layout(cx: &mut TestAppContext)
     for classic in [false, true, false] {
         window
             .update(visual, |view, _, cx| {
-                view.ctx.classic = classic;
+                view.ctx.layout = if classic {
+                    crate::workspace::NavigationLayout::Classic
+                } else {
+                    crate::workspace::NavigationLayout::Focused
+                };
                 view.ctx.new_layout_boxy = true;
                 cx.notify();
             })

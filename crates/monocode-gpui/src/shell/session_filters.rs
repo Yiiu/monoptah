@@ -92,7 +92,12 @@ impl Shell {
             }
         }
         self.close_preview(cx);
-        let visible = self.sidebar_session_ids(cx);
+        let visible = if self.workspace.tree_layout() {
+            self.tree.archived_open = None;
+            self.tree_session_ids(cx)
+        } else {
+            self.sidebar_session_ids(cx)
+        };
         self.selected_sessions.retain(|id| visible.contains(id));
         self.selection_anchor = self.selection_anchor.filter(|id| visible.contains(id));
         self.invalidate_chrome(cx);
@@ -102,12 +107,13 @@ impl Shell {
 
     pub(super) fn filter_session(&self, id: i64, start: u64, cx: &App) -> bool {
         let session = self.session_metadata(id, cx);
+        let status = self.agent_status(id);
         self.workspace.session_filters.matches(
             session.summary,
             Status {
-                working: session.busy,
-                needs_approval: session.needs_approval(),
-                done: self.unseen_finished.contains(&id),
+                working: status.is_busy(),
+                needs_approval: status.needs_you(),
+                done: status.unread_done(),
             },
             start,
             self.workspace.preferences.show_archived,
@@ -119,6 +125,26 @@ impl Shell {
 mod tests {
     use super::*;
     use gpui::TestAppContext;
+    use monocode_core::agent_status::{Activity, AgentStatus, Outcome, Wait};
+
+    #[gpui::test]
+    fn working_filter_excludes_a_remote_session_that_needs_input(cx: &mut TestAppContext) {
+        let (window, id, _) = super::super::tests::window(cx);
+        window
+            .update(cx, |shell, _, cx| {
+                shell.remote_marks.insert(id, (true, true));
+                shell.refresh_status(id, cx);
+                assert!(shell.session_metadata(id, cx).busy);
+
+                shell.workspace.session_filters.status.working = true;
+                assert!(!shell.filter_session(id, 0, cx));
+
+                shell.workspace.session_filters.status.working = false;
+                shell.workspace.session_filters.status.needs_approval = true;
+                assert!(shell.filter_session(id, 0, cx));
+            })
+            .unwrap();
+    }
 
     #[gpui::test]
     fn filters_persist_and_update_without_closing_the_menu_or_active_chat(cx: &mut TestAppContext) {
@@ -141,6 +167,7 @@ mod tests {
                     s.summary.provider = "codex".into();
                     s.busy = true;
                 });
+                shell.refresh_status(a, cx);
                 shell.sessions[&b].update(cx, |s, _| s.summary.provider = "claude".into());
                 shell.selected_sessions.insert(b);
                 shell.open_menu(
@@ -175,11 +202,30 @@ mod tests {
             .update(visual, |shell, _, cx| {
                 assert_eq!(shell.sidebar_session_ids(cx).len(), 2);
                 shell.sessions[&a].update(cx, |s, _| s.busy = false);
-                shell.unseen_finished.insert(a);
+                shell.agent_statuses.insert(
+                    a,
+                    AgentStatus {
+                        activity: Activity::Done {
+                            outcome: Outcome::Completed,
+                            at: monocode_core::time::now_ms(),
+                            unread: true,
+                        },
+                        shells: Vec::new(),
+                    },
+                );
                 shell.change_session_filter("done", cx);
                 assert_eq!(shell.sidebar_session_ids(cx), [a]);
-                shell.sessions[&b].update(cx, |s, _| s.busy = true);
-                shell.change_session_filter("working", cx);
+                shell.agent_statuses.insert(
+                    b,
+                    AgentStatus {
+                        activity: Activity::BackgroundWait {
+                            reason: Wait::Subtasks(2),
+                            since: monocode_core::time::now_ms(),
+                        },
+                        shells: Vec::new(),
+                    },
+                );
+                shell.workspace.session_filters.status.working = true;
                 assert_eq!(shell.sidebar_session_ids(cx).len(), 2);
                 shell.change_session_filter("provider:claude", cx);
                 assert_eq!(shell.sidebar_session_ids(cx), [a]);

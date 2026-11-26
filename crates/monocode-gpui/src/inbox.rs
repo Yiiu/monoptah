@@ -71,6 +71,7 @@ pub(crate) struct Inbox {
     memory: memory::ViewMemories,
     /// Ids of the sessions running a turn right now, pushed by the shell.
     busy: HashSet<i64>,
+    animated: HashSet<i64>,
     summary_width: std::rc::Rc<std::cell::Cell<Pixels>>,
     activity: Vec<ui::Activity>,
     activity_revision: u64,
@@ -289,6 +290,7 @@ impl Inbox {
             list_scroll: ScrollHandle::new(),
             memory: Default::default(),
             busy: HashSet::new(),
+            animated: HashSet::new(),
             summary_width: Default::default(),
             activity: vec![],
             activity_revision: 0,
@@ -388,9 +390,15 @@ impl Inbox {
         }
     }
 
-    pub(crate) fn set_busy(&mut self, busy: HashSet<i64>, cx: &mut Context<Self>) {
-        if self.busy != busy {
+    pub(crate) fn set_busy(
+        &mut self,
+        busy: HashSet<i64>,
+        animated: HashSet<i64>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.busy != busy || self.animated != animated {
             self.busy = busy;
+            self.animated = animated;
             cx.notify();
         }
     }

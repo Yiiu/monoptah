@@ -94,11 +94,19 @@ impl Shell {
                                 this.rehome_mono_panes(id, cx);
                                 this.session_summaries.remove(&id);
                                 this.sessions.remove(&id);
+                                this.forget_agent_status(id);
+                            } else {
+                                this.update_agent_status(
+                                    id,
+                                    Some(monocode_core::agent_status::Outcome::Interrupted),
+                                    cx,
+                                );
                             }
                         }
                         for (summary, running, waiting, draft) in summaries {
                             let id = summary.id;
-                            this.remote_marks.insert(id, (running, waiting));
+                            let activity = (running, waiting);
+                            let changed = this.remote_marks.insert(id, activity) != Some(activity);
                             if draft {
                                 this.draft_sessions.insert(id);
                             } else {
@@ -121,7 +129,11 @@ impl Shell {
                                 });
                             }
                             this.session_summaries.insert(id, summary);
+                            if changed {
+                                this.refresh_status(id, cx);
+                            }
                         }
+                        this.process_notification_inputs(cx);
                         if this.workspace.project == project {
                             this.refresh_sidebar_structure(cx);
                             this.invalidate_chrome(cx);

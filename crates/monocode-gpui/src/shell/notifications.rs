@@ -38,7 +38,6 @@ pub(super) struct State {
     permission: Permission,
     permission_probe: Option<Receiver<Permission>>,
     announcements: approvals::InputAnnouncements,
-    responding: HashSet<i64>,
     sequence: u64,
     badge: usize,
     sounds_enabled: bool,
@@ -79,7 +78,6 @@ impl State {
             permission: Permission::Unsupported,
             permission_probe: None,
             announcements: Default::default(),
-            responding: HashSet::new(),
             sequence: 0,
             badge: 0,
             sounds_enabled: workspace.preferences.sounds,
@@ -114,31 +112,26 @@ impl Shell {
         self.notification_state.permission_probe = Some(platform::permission());
     }
 
-    /// Call from SessionChanged, so a turn beginning and ending between render
-    /// frames still produces exactly one completion. Render sync shares the set.
-    pub(super) fn notification_session_changed(&mut self, id: i64, cx: &mut Context<Self>) {
-        self.process_notification_inputs(cx);
-        let Some(view) = self.sessions.get(&id) else {
-            return;
-        };
+    pub(super) fn notification_turn_finished(
+        &mut self,
+        view: &Entity<Conversation>,
+        outcome: monocode_core::agent_status::Outcome,
+        cx: &mut Context<Self>,
+    ) {
         let chat = view.read(cx);
-        if chat.responding() {
-            self.notification_state.responding.insert(id);
-            return;
-        }
-        let ended = self.notification_state.responding.remove(&id) && !chat.busy;
-        if !ended
+        let id = chat.summary.id;
+        let habit = self.monos.as_ref().is_some_and(|monos| {
+            monos
+                .read(cx)
+                .notification_mono(id)
+                .is_some_and(|mono| mono.habit_sessions.contains(&id))
+        });
+        if outcome == monocode_core::agent_status::Outcome::Interrupted
             || chat.notification_was_cancelled()
             || chat.summary.archived
-            || self
-                .monos
-                .as_ref()
-                .is_some_and(|monos| monos.read(cx).is_mono_session(id))
+            || habit
         {
-            // Ended with no finish to send, as when stopped.
-            if ended {
-                self.mobile_turn_ended(id);
-            }
+            self.mobile_turn_ended(id);
             return;
         }
         let summary = chat.summary.clone();
@@ -213,7 +206,7 @@ impl Shell {
             |this, _, event, cx| {
                 if matches!(event, LayoutNoticeEvent::Try) && this.workspace.classic_layout {
                     // Dismisses the notice and picks the default frame.
-                    this.toggle_layout(cx);
+                    this.set_navigation_layout(crate::workspace::NavigationLayout::Focused, cx);
                 } else {
                     this.workspace.new_layout_prompt_dismissed = true;
                     this.persist(cx);
@@ -276,6 +269,12 @@ impl Shell {
             self.observations.push(cx.subscribe(
                 &monos,
                 |this, _, _: &crate::monos::NotificationChanged, cx| {
+                    for view in this.notification_chats(cx) {
+                        let id = view.read(cx).summary.id;
+                        if !this.sessions.contains_key(&id) {
+                            this.refresh_status(id, cx);
+                        }
+                    }
                     this.process_notification_inputs(cx);
                     cx.notify()
                 },
@@ -288,16 +287,13 @@ impl Shell {
             ));
             self.observations.push(cx.subscribe(
                 &monos,
-                |this, _, event: &crate::monos::NotificationFinished, cx| {
-                    if !event.was_cancelled && !event.habit && !event.summary.archived {
-                        this.deliver_session_notice(
-                            &event.summary,
-                            "agentFinished",
-                            &event.body,
-                            Some(crate::sound::Cue::Finished),
-                            cx,
-                        );
-                    }
+                |this, _, event: &crate::monos::HabitFinished, cx| {
+                    this.update_agent_status_for(
+                        event.summary.id,
+                        Some(&event.summary),
+                        Some(event.outcome),
+                        cx,
+                    );
                 },
             ));
         }
@@ -359,7 +355,7 @@ impl Shell {
                                 || this
                                     .notification_chats(cx)
                                     .iter()
-                                    .any(|v| v.read(cx).needs_approval())
+                                    .any(|v| this.agent_status(v.read(cx).summary.id).needs_you())
                             {
                                 cx.notify();
                             }
@@ -392,7 +388,7 @@ impl Shell {
     }
 
     /// Advance banners and the Dock badge while an occluded window skips render.
-    fn process_notification_inputs(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn process_notification_inputs(&mut self, cx: &mut Context<Self>) {
         let snapshots: Vec<_> = self
             .notification_chats(cx)
             .iter()
@@ -414,9 +410,9 @@ impl Shell {
             notices.track_pending(&snapshots);
         });
         let badge = delivery::dock_badge_count(
-            snapshots
+            self.agent_statuses
                 .iter()
-                .filter_map(|s| Some((s.session_id.parse().ok()?, !s.pending.is_empty()))),
+                .map(|(&id, status)| (id, status.needs_you())),
         );
         if badge != self.notification_state.badge {
             self.notification_state.badge = badge;
@@ -448,11 +444,11 @@ impl Shell {
             return false;
         }
         if self.mono_active(cx) {
-            return self
-                .monos
-                .as_ref()
-                .and_then(|m| m.read(cx).active_notification_session(cx))
-                == Some(id);
+            return self.monos.as_ref().is_some_and(|monos| {
+                let monos = monos.read(cx);
+                monos.active_notification_session(cx) == Some(id)
+                    || (self.workspace.right_panel_open && monos.routed_session() == Some(id))
+            });
         }
         self.workspace.active_tab().is_some_and(|tab| {
             self.workspace
@@ -480,30 +476,9 @@ impl Shell {
         let views = self.notification_chats(cx);
         let mut snapshots = Vec::new();
         let mut directories = HashMap::new();
-        let mut completed = Vec::new();
-        let mut quiet = Vec::new();
-        let mut live_ids = HashSet::new();
         for view in views {
             let chat = view.read(cx);
             let id = chat.summary.id;
-            live_ids.insert(id);
-            if chat.responding() {
-                self.notification_state.responding.insert(id);
-            } else if self.notification_state.responding.remove(&id) && !chat.busy {
-                if !chat.notification_was_cancelled()
-                    && !chat.summary.archived
-                    && self.sessions.contains_key(&id)
-                    && !self
-                        .monos
-                        .as_ref()
-                        .is_some_and(|monos| monos.read(cx).is_mono_session(id))
-                {
-                    completed.push((chat.summary.clone(), chat.notification_reply_text(cx)));
-                } else {
-                    // Ended with no finish to send, as when stopped.
-                    quiet.push(id);
-                }
-            }
             directories.insert(id.to_string(), chat.summary.cwd.clone());
             let mono_visible = self.mono_active(cx) && self.notice_session_visible(id, cx);
             snapshots.push(SessionInputs {
@@ -520,16 +495,10 @@ impl Shell {
                     && chat.composer_focused(window, cx),
             });
         }
-        self.notification_state
-            .responding
-            .retain(|id| live_ids.contains(id));
-        for id in quiet {
-            self.mobile_turn_ended(id);
-        }
         let badge = delivery::dock_badge_count(
-            snapshots
+            self.agent_statuses
                 .iter()
-                .filter_map(|s| Some((s.session_id.parse().ok()?, !s.pending.is_empty()))),
+                .map(|(&id, status)| (id, status.needs_you())),
         );
         if self.notification_state.badge != badge {
             self.notification_state.badge = badge;
@@ -549,15 +518,6 @@ impl Shell {
                     cx,
                 );
             }
-        }
-        for (summary, body) in completed {
-            self.deliver_session_notice(
-                &summary,
-                "agentFinished",
-                &body,
-                Some(crate::sound::Cue::Finished),
-                cx,
-            );
         }
         let prefs = &self.workspace.preferences;
         self.notification_state.approvals.update(cx, |notices, cx| {
@@ -732,6 +692,7 @@ impl Shell {
                 if let Some(monos) = this.monos.clone()
                     && monos.update(cx, |m, cx| m.open_notification_session(id, window, cx))
                 {
+                    this.mark_agent_seen(id, cx);
                     window.activate_window();
                     return;
                 }
@@ -750,13 +711,19 @@ impl Shell {
                     this.observations.push(cx.subscribe(
                         &view,
                         move |this, _, _: &SessionChanged, cx| {
-                            this.refresh_session_mark(id, cx);
-                            this.notification_session_changed(id, cx);
+                            this.refresh_status(id, cx);
+                            this.process_notification_inputs(cx);
                             this.invalidate_chrome(cx);
                             cx.notify();
                         },
                     ));
+                    this.observations.push(
+                        cx.subscribe(&view, move |this, _, _: &AgentProgress, cx| {
+                            this.refresh_status(id, cx)
+                        }),
+                    );
                     this.sessions.insert(id, view);
+                    this.refresh_status(id, cx);
                     if !this.order.contains(&id) {
                         this.order.push(id);
                     }
@@ -777,6 +744,7 @@ impl Shell {
                     }
                     this.close_settings(window, cx);
                     this.open(id, window, cx);
+                    this.mark_agent_seen(id, cx);
                     if let Some(newer) = newer {
                         this.reminders.push(newer);
                     }

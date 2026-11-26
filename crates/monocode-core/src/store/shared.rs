@@ -416,11 +416,7 @@ impl Store {
     pub fn persisted_session_id(&self, id: i64) -> Result<String, String> {
         if id < 0 {
             if let Some(remote) = self.remote_session(id)? {
-                return Ok(format!(
-                    "remote:{}:{}",
-                    remote.project.environment_id,
-                    remote.session_id.unwrap_or_else(|| id.to_string())
-                ));
+                return Ok(remote.persisted_key(id));
             }
         }
         if let Some(shared) = &self.shared {

@@ -15,6 +15,7 @@ mod follow_tests;
 pub(crate) mod git_turns;
 mod goal;
 mod history;
+mod mono_decisions;
 pub(crate) use history::{HistoryPager, PreparedHistory};
 mod links;
 mod live_phase;
@@ -733,6 +734,7 @@ pub(crate) struct TranscriptView {
     history_search: Option<(usize, String)>,
     prepared_parsers: HashMap<usize, MarkdownParser>,
     mono: bool,
+    mono_decisions: mono_decisions::Decisions,
     /// The Mono's emoji library, for `:emo[..]` tokens in its replies.
     emoji: Option<emoji::MonoEmoji>,
     /// How many times a changed library laid every message out again.
@@ -916,6 +918,7 @@ impl TranscriptView {
             return;
         }
         self.mono = true;
+        self.refresh_legacy_mono_decisions();
         self.anchor_prompts = false;
         self.chat_layout = true;
         // A short chat rests on the composer, like `justify-end`.
@@ -1966,6 +1969,7 @@ impl TranscriptView {
         }
         let from = self.source.iter().rposition(|r| r.is_prompt()).unwrap_or(0);
         if self.source.is_empty() {
+            self.refresh_legacy_mono_decisions();
             self.rows.clear();
             self.messages.clear();
             self.push_pending(0);
@@ -2717,6 +2721,7 @@ impl TranscriptView {
             history_search: None,
             prepared_parsers: HashMap::new(),
             mono: false,
+            mono_decisions: Default::default(),
             emoji: None,
             #[cfg(test)]
             emoji_rebuilds: 0,
@@ -3410,6 +3415,7 @@ impl TranscriptView {
         {
             self.rebuild_passes += 1;
         }
+        self.refresh_legacy_mono_decisions();
         self.phase_layouts.clear();
         let now = Instant::now();
         let following = self.list.is_following_tail();
@@ -5150,17 +5156,6 @@ impl TranscriptView {
             )
             .into_any_element()
     }
-    /// The first reply the user sent after `message`, queued ones included,
-    /// which answers any choices that message offered.
-    fn reply_after(&self, message: usize) -> Option<String> {
-        self.messages
-            .get(message + 1..)?
-            .iter()
-            .find(|m| m.role == "user")
-            .and_then(|m| self.source.get(m.start))
-            .map(|row| row.text.clone())
-            .or_else(|| self.pending.first().map(|p| p.text.to_string()))
-    }
     fn row_body(
         &mut self,
         ix: usize,
@@ -5295,10 +5290,10 @@ impl TranscriptView {
                     .into_any_element()
             }
             Body::Goal(ref notice) => self.goal_row(message_start, notice, cx),
-            Body::MonoCard(ref value) => {
-                let chosen = self.reply_after(row.message);
-                crate::monos::cards::render(value, chosen.as_deref(), cx)
+            Body::MonoCard(ref value) if value["type"] == "choices" => {
+                self.mono_decision(value, cx)
             }
+            Body::MonoCard(ref value) => crate::monos::cards::render(value, cx),
             Body::MonoDivider => mono_divider::render(),
             Body::Pending(_)
             | Body::Launch(_)

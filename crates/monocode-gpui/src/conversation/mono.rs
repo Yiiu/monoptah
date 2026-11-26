@@ -115,8 +115,7 @@ impl Conversation {
         });
         window.focus(&self.input.focus_handle(cx), cx);
     }
-    /// A stop was requested and the runtime hasn't settled the turn yet: its
-    /// rows and receipt aren't final, so completion reports must wait.
+    /// The provider is still saving rows and a completion receipt after Stop.
     pub(crate) fn mono_stopping(&self) -> bool {
         self.stopping
     }
@@ -205,8 +204,10 @@ impl Conversation {
         self.input
             .update(cx, |input, cx| input.mono_composer(&mono.label(), cx));
         let name = mono.label();
-        self.transcript
-            .update(cx, |t, _| t.mono_mode(&mono.mascot, mono.color, &name));
+        let decision_changed = self.transcript.update(cx, |t, cx| {
+            t.mono_mode(&mono.mascot, mono.color, &name);
+            t.set_mono_decisions(mono.decision_cards.clone(), cx)
+        });
         self.settings.environment = environment;
         self.mono_ui.pending = mono.outbox.clone();
         self.mono_ui
@@ -224,8 +225,19 @@ impl Conversation {
             executable: std::env::current_exe().unwrap_or_default(),
         });
         self.sync_tool_paths(cx);
+        if decision_changed {
+            cx.emit(SessionChanged);
+        }
         cx.notify();
     }
+
+    pub(crate) fn pending_mono_decisions(
+        &self,
+        cx: &App,
+    ) -> std::collections::BTreeMap<String, String> {
+        self.transcript.read(cx).pending_mono_decisions()
+    }
+
     /// Give a Mono chat its emoji library, or take it away with `None`. The transcript draws
     /// each `:emo[<emotion>]` token of the Mono's replies as a picture of that emotion.
     /// `emoji.session` is overwritten with this conversation's session id, so the same
@@ -386,12 +398,11 @@ impl Conversation {
         Ok(())
     }
     pub(crate) fn mono_status(&self) -> &str {
-        if self.needs_approval() || self.settings.usage_limit.is_some() {
-            "needs-you"
-        } else if self.responding() {
-            "working"
-        } else {
-            "idle"
+        use monocode_core::agent_status::Activity;
+        match self.displayed_activity {
+            Activity::NeedsYou { .. } => "needs-you",
+            Activity::Running { .. } | Activity::BackgroundWait { .. } => "working",
+            Activity::Done { .. } | Activity::Idle => "idle",
         }
     }
     pub(crate) fn mono_model(&self) -> Option<String> {

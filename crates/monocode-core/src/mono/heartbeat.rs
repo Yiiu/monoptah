@@ -1,7 +1,7 @@
 //! Inactivity heartbeats: an app-owned wake-up that lets a Mono look for
 //! useful follow-ups and propose them. The app gathers short headlines of what
 //! changed; the Mono opens details itself only when something looks worth it.
-use super::files;
+use super::{files, patrol};
 use crate::{store::Session, transcript::Row};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -18,6 +18,7 @@ const MAX_SESSIONS: usize = 5;
 const MAX_NOTES: usize = 3;
 const MAX_INBOX: usize = 5;
 const MAX_RECENT: usize = 5;
+const MAX_PATROL_CHANGES: usize = 20;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -28,6 +29,10 @@ pub struct State {
     pub recent: Vec<String>,
     /// Model runs in a row that found nothing; the interval backs off.
     pub quiet_streak: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub patrol: Option<patrol::Snapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_patrol: Option<patrol::Snapshot>,
 }
 pub fn load(root: &Path, id: &str) -> Result<State, String> {
     let file = files::read(root, id, None, "heartbeat.json")?;
@@ -56,6 +61,37 @@ pub fn update<T>(root: &Path, id: &str, change: impl Fn(&mut State) -> T) -> Res
     Err("Heartbeat state kept changing; try again".into())
 }
 impl State {
+    pub fn observe_patrol(&mut self, snapshot: patrol::Snapshot) -> Vec<patrol::Change> {
+        let Some(previous) = &self.patrol else {
+            self.patrol = Some(snapshot);
+            return Vec::new();
+        };
+        let mut changes = snapshot.changes_from(previous);
+        self.pending_patrol = match changes.len() {
+            0 => None,
+            count if count <= MAX_PATROL_CHANGES => Some(snapshot),
+            _ => {
+                changes.sort_by_key(|change| {
+                    !matches!(change, patrol::Change::Session { current, .. }
+                        if current.state == patrol::State::NeedsYou)
+                });
+                changes.truncate(MAX_PATROL_CHANGES);
+                let mut pending = previous.clone();
+                for change in &changes {
+                    pending.apply(change);
+                }
+                Some(pending)
+            }
+        };
+        changes
+    }
+
+    pub fn confirm_patrol(&mut self) {
+        if let Some(snapshot) = self.pending_patrol.take() {
+            self.patrol = Some(snapshot);
+        }
+    }
+
     pub fn remember(&mut self, report: &str) {
         self.recent.insert(0, clip(report, 300));
         self.recent.truncate(MAX_RECENT);
@@ -379,7 +415,7 @@ Do one round:
 
 The headlines below are only filtered to your assigned projects, not to your role. Your soul decides what kind of work is yours: skip anything outside it. For example, if you are not meant to review or work on pull requests, ignore PRs entirely. Most headlines will not concern you; that is expected.
 
-A heartbeat does not authorize new projects, code changes, starting sessions, sending messages, commenting, publishing or destructive actions. Propose those instead: write a short, specific message to the user and add a choices card with the replies they can pick. At most 2 proposals. Never invent work to fill the interval, and never repeat something you raised recently unless it changed. If nothing is worth raising, reply exactly NOTHING_TO_REPORT.";
+A heartbeat does not authorize new projects, code changes, starting sessions, sending messages, commenting, publishing or destructive actions. Propose those instead: write a short, specific message and add a choices card with a question and concrete options. At most 2 proposals. Never invent work to fill the interval, and never repeat something you raised recently unless it changed. If nothing is worth raising, reply exactly NOTHING_TO_REPORT.";
 
 pub fn message(
     standing: Option<&str>,
@@ -508,6 +544,68 @@ mod tests {
             first,
             sent_at: None,
         }
+    }
+
+    #[test]
+    fn patrol_first_seeds_then_retries_changes_until_confirmed() {
+        let mut state = State::default();
+        let before = patrol::Snapshot::default();
+        assert!(state.observe_patrol(before.clone()).is_empty());
+        let mut after = before;
+        after.worktrees.insert(
+            "checkout".into(),
+            patrol::Worktree {
+                project: "/repo".into(),
+                path: "/checkout".into(),
+                branch: Some("feature".into()),
+                head: "new-head".into(),
+                missing: false,
+                changes: None,
+            },
+        );
+        assert_eq!(state.observe_patrol(after.clone()).len(), 1);
+        let mut restored: State =
+            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert_eq!(restored.observe_patrol(after.clone()).len(), 1);
+        restored.confirm_patrol();
+        assert!(restored.observe_patrol(after).is_empty());
+    }
+
+    #[test]
+    fn a_large_patrol_reports_urgent_changes_and_defers_unreported_changes() {
+        let mut state = State::default();
+        assert!(state.observe_patrol(patrol::Snapshot::default()).is_empty());
+        let urgent_id = MAX_PATROL_CHANGES as i64 + 3;
+        let mut snapshot = patrol::Snapshot::default();
+        for id in 1..=urgent_id {
+            snapshot.sessions.insert(
+                id,
+                patrol::Session {
+                    project: "/repo".into(),
+                    title: format!("Session {id}"),
+                    worktree: None,
+                    state: if id == urgent_id {
+                        patrol::State::NeedsYou
+                    } else {
+                        patrol::State::Completed
+                    },
+                    completed_at: None,
+                    summary: None,
+                    archived: false,
+                },
+            );
+        }
+        let first = state.observe_patrol(snapshot.clone());
+        assert_eq!(first.len(), MAX_PATROL_CHANGES);
+        assert!(matches!(first[0], patrol::Change::Session { id, .. } if id == urgent_id));
+        state.confirm_patrol();
+        let remaining = state.observe_patrol(snapshot.clone());
+        assert_eq!(remaining.len(), 3);
+        assert!(
+            matches!(&remaining[..], [patrol::Change::Session { id, .. }, ..] if *id == MAX_PATROL_CHANGES as i64)
+        );
+        state.confirm_patrol();
+        assert!(state.observe_patrol(snapshot).is_empty());
     }
 
     #[test]

@@ -139,6 +139,15 @@ fn is_zero(value: &u64) -> bool {
 /// How long `running` stays believable after the last successful poll.
 pub const FLAGS_FRESH_MS: u64 = 120_000;
 impl RemoteSession {
+    pub(super) fn persisted_key(&self, id: i64) -> String {
+        let host_id = self
+            .session_id
+            .as_deref()
+            .map(std::borrow::Cow::Borrowed)
+            .unwrap_or_else(|| std::borrow::Cow::Owned(id.to_string()));
+        format!("remote:{}:{}", self.project.environment_id, host_id,)
+    }
+
     /// True when this record backs a local session instead of being a session of its own.
     /// Whether the Host was running a turn at its last poll AND that poll is recent. A stale
     /// flag must not block anything: it is exactly what an unreachable Host leaves behind.

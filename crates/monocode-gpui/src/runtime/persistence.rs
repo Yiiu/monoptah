@@ -441,6 +441,8 @@ mod persistence_safety_tests {
             metrics: None,
             usage_limit: None,
             background: None,
+            activity: None,
+            provider_event: true,
             approvals: Vec::new(),
             approvals_resolved: Vec::new(),
             questions: Vec::new(),
