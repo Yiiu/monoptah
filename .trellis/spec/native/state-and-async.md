@@ -102,6 +102,21 @@ Child processes are owned by core: quitting calls `monos::begin_quit` and then
 `stop_processes`), and `process::guard` kills CLIs left by a crashed run. Do not spawn
 long-lived processes directly from a view; go through the core service that owns them.
 
+## Transcript updates and row caches
+
+`TranscriptView::patch` applies contiguous updates using source row offsets.
+Derived state keyed by those offsets must follow in-place edits, history
+prepend or rebasing, and source replacement or eviction. Tool-role changes
+and equal-length payload replacements invalidate panel classification too.
+Keep classification metadata separate from tool inputs, outputs and steps.
+
+The displayed row order can differ from source order when a subagent card
+is moved next to the folded reply. Reuse the projected prefix only when the
+same visible reply owns the entire display suffix and the fold target is
+stable after advancing the reveal. Keep the wider rebuild for a changed
+fold, moved or removed card, or an exiting row. A regression test should
+compare the incremental keys and reading anchor against a full rebuild.
+
 ## Errors shown to the user
 
 Core returns `Result<_, String>`. The GPUI side stores a display string on the entity
