@@ -13,9 +13,9 @@ use serde_json::Value;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Permission {
     Prompt,
-    // Only macOS reports these; the other platforms still match on them.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "macos", windows, test)), allow(dead_code))]
     Granted,
+    // Windows leaves OS-level authorization to the notification center.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Denied,
     Unsupported,
@@ -125,7 +125,8 @@ impl WindowsToastDedupe {
     pub(crate) fn should_show(&mut self, session_id: i64, now: Instant) -> bool {
         self.last_shown
             .retain(|_, shown| now.duration_since(*shown) < Duration::from_secs(5));
-        if let std::collections::hash_map::Entry::Vacant(entry) = self.last_shown.entry(session_id) {
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.last_shown.entry(session_id)
+        {
             entry.insert(now);
             return true;
         }

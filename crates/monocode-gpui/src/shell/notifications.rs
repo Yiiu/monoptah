@@ -38,6 +38,8 @@ pub(super) struct State {
     permission: Permission,
     permission_probe: Option<Receiver<Permission>>,
     announcements: approvals::InputAnnouncements,
+    #[cfg(windows)]
+    toast_dedupe: delivery::WindowsToastDedupe,
     sequence: u64,
     badge: usize,
     sounds_enabled: bool,
@@ -78,6 +80,8 @@ impl State {
             permission: Permission::Unsupported,
             permission_probe: None,
             announcements: Default::default(),
+            #[cfg(windows)]
+            toast_dedupe: Default::default(),
             sequence: 0,
             badge: 0,
             sounds_enabled: workspace.preferences.sounds,
@@ -315,12 +319,12 @@ impl Shell {
         .detach();
     }
 
-    pub(super) fn start_native_notifications(&mut self, cx: &mut Context<Self>) {
-        platform::set_dock_badge(0);
-        if platform::initialize() {
+    pub(super) fn start_native_notifications(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if platform::initialize(window, cx) {
             self.notification_state.permission = Permission::Prompt;
             self.notification_state.permission_probe = Some(platform::permission());
         }
+        platform::set_dock_badge(0);
         self.notification_state.badge = 0;
         self.process_notification_inputs(cx);
         self.notification_state.poll = Some(cx.spawn(async move |this, cx| {
@@ -423,15 +427,21 @@ impl Shell {
                 && let Some(view) = self.notification_chat(id, cx)
             {
                 let summary = view.read(cx).summary.clone();
-                let body = if input.kind == approvals::InputKind::Approval {
+                let mobile_body = if input.kind == approvals::InputKind::Approval {
                     format!("Approve: {}", input.label)
                 } else {
-                    input.label
+                    input.label.clone()
                 };
-                self.deliver_session_notice(
+                self.notify_mobile(&summary, "agentInput", &mobile_body, cx);
+                self.dispatch_notice(
                     &summary,
                     "agentInput",
-                    &body,
+                    Target::Session(id),
+                    if cfg!(windows) {
+                        &input.label
+                    } else {
+                        &mobile_body
+                    },
                     Some(crate::sound::Cue::Input),
                     cx,
                 );
@@ -610,6 +620,12 @@ impl Shell {
         cue: Option<crate::sound::Cue>,
         cx: &mut Context<Self>,
     ) {
+        // Completed turns still reach the mobile delivery path and update the
+        // status cache. Windows native alerts are reserved for input/reminders.
+        #[cfg(windows)]
+        if category == "agentFinished" {
+            return;
+        }
         let now = monocode_core::time::now_ms();
         let occurred = match target {
             Target::Session(_) => now,
@@ -634,22 +650,52 @@ impl Shell {
             }
             return;
         }
+        #[cfg(windows)]
+        if let Target::Session(id) = target {
+            if !self
+                .notification_state
+                .toast_dedupe
+                .should_show(id, std::time::Instant::now())
+            {
+                return;
+            }
+            if !self.window_active {
+                platform::flash_taskbar();
+            }
+        }
         self.notification_state.sequence = self.notification_state.sequence.wrapping_add(1);
         let body = if body.trim().is_empty() && category == "agentFinished" {
             format!("{} finished", Kind::from_id(&summary.provider).label())
         } else {
             body.to_owned()
         };
-        let receiver = platform::show(platform::Notification {
-            tag: target.tag(self.notification_state.sequence),
-            subtitle: if category == "reminders" {
-                "Session reminder".into()
-            } else {
-                summary.title.clone()
+        let subtitle = if category == "reminders" {
+            "Session reminder".into()
+        } else {
+            summary.title.clone()
+        };
+        #[cfg(not(windows))]
+        let clipped_body = delivery::clip_body(&body);
+        #[cfg(windows)]
+        let (subtitle, clipped_body) = if matches!(target, Target::Session(_)) {
+            let project = project_name(self.project_of(summary.id, &summary.cwd));
+            let title = self
+                .notification_chat(summary.id, cx)
+                .map_or(subtitle, |chat| chat.read(cx).display_title());
+            delivery::windows_toast_text(&project, &title, &body)
+        } else {
+            (subtitle, delivery::clip_body(&body))
+        };
+        let receiver = platform::show(
+            platform::Notification {
+                tag: target.tag(self.notification_state.sequence),
+                subtitle,
+                body: clipped_body,
+                sound: prefs.sounds
+                    && (!cfg!(windows) || occurred >= self.notification_state.sounds_enabled_at),
             },
-            body: delivery::clip_body(&body),
-            sound: prefs.sounds,
-        });
+            cx,
+        );
         let directory = summary.cwd.clone();
         let category = category.to_owned();
         let work = cx.background_executor().spawn(async move {
@@ -774,6 +820,7 @@ impl Shell {
                 due_at: expected,
             }
             .tag(0),
+            cx,
         );
         let store = self.store.clone();
         let previous = self.group_writes.take();
@@ -837,6 +884,7 @@ impl Shell {
                             due_at: expected,
                         }
                         .tag(0),
+                        cx,
                     );
                     this.notification_state.reminder_error = None;
                     this.reload_notification_reminders(cx);
