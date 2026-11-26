@@ -160,6 +160,10 @@ fn project_key(path: &str) -> String {
     format!("project:{path}")
 }
 
+fn group_key(id: &str) -> String {
+    format!("group:{id}")
+}
+
 fn section_key(project: &str, name: &str) -> String {
     format!("section:{project}:{name}")
 }
@@ -693,20 +697,28 @@ impl Shell {
         if self.workspace.preferences.monos {
             rows.push(TreeRow::Monos);
         }
-        for entry in self.tree_project_entries(self.tree_filtered()) {
-            let ProjectEntry::Project(path) = &entry else {
-                rows.push(TreeRow::Header(entry));
-                continue;
-            };
-            let ids = catalog.projects.get(path).map_or(&[][..], Vec::as_slice);
-            if ids.is_empty() && self.tree_filtered() {
-                continue;
+        let mut entries = self.tree_project_entries(true).into_iter().peekable();
+        while let Some(entry) = entries.next() {
+            match entry {
+                ProjectEntry::Group(id) => {
+                    let open = self.tree_group_open(&id);
+                    let key = group_key(&id);
+                    rows.push(TreeRow::Header(ProjectEntry::Group(id)));
+                    let mut projects = Vec::new();
+                    while matches!(entries.peek(), Some(ProjectEntry::Project(_))) {
+                        if let Some(ProjectEntry::Project(path)) = entries.next() {
+                            projects.push(path);
+                        }
+                    }
+                    self.tree_children(&mut rows, key, open, |rows| {
+                        for path in projects {
+                            self.tree_project_block(rows, path, catalog, cx);
+                        }
+                    });
+                }
+                ProjectEntry::Project(path) => self.tree_project_block(&mut rows, path, catalog, cx),
+                heading => rows.push(TreeRow::Header(heading)),
             }
-            rows.push(TreeRow::Header(entry.clone()));
-            let open = self.tree_project_open(path);
-            self.tree_children(&mut rows, project_key(path), open, |rows| {
-                self.tree_project_rows(rows, path, ids, catalog, cx)
-            });
         }
         if !catalog.archived.is_empty() {
             rows.push(TreeRow::Archived(catalog.archived.len()));
@@ -719,6 +731,24 @@ impl Shell {
             });
         }
         rows
+    }
+
+    fn tree_group_open(&self, id: &str) -> bool {
+        self.tree_filtered() || self.workspace.project_rail_groups.iter()
+            .any(|group| group.id == id && !group.collapsed)
+    }
+
+    fn tree_project_block(&self, rows: &mut Vec<TreeRow>, path: String, catalog: &TreeCatalog, cx: &App) {
+        let ids = catalog.projects.get(&path).map_or(&[][..], Vec::as_slice);
+        if ids.is_empty() && self.tree_filtered() {
+            return;
+        }
+        let open = self.tree_project_open(&path);
+        let key = project_key(&path);
+        rows.push(TreeRow::Header(ProjectEntry::Project(path.clone())));
+        self.tree_children(rows, key, open, |rows| {
+            self.tree_project_rows(rows, &path, ids, catalog, cx);
+        });
     }
 
     /// Adds a node's rows under it. At rest they are list items of their own;
@@ -1323,6 +1353,87 @@ mod tests {
             let heading = visual.debug_bounds("sidebar-mono-heading").expect("Mono heading");
             assert_eq!(heading.size.height, px(height));
         }
+    }
+
+    #[gpui::test]
+    fn tree_group_clicks_disclose_the_group_members(cx: &mut TestAppContext) {
+        let (window, mut visual, _, _) = tree_window(cx);
+        window
+            .update(&mut visual, |shell, _, cx| {
+                shell.workspace.project_rail_groups.push(crate::workspace::ProjectRailGroup {
+                    id: "release".into(),
+                    name: "Release".into(),
+                    ..Default::default()
+                });
+                shell.workspace.project_rail_assignments.insert("/work/monocode".into(), "release".into());
+                shell.notify_sidebar(cx);
+            })
+            .unwrap();
+        visual.run_until_parked();
+        let header = visual.debug_bounds("tree-group-release").expect("Tree group");
+        assert_eq!(header.size.height, px(30.));
+        visual.update(|cx| cx.set_reduce_motion(false));
+        visual.simulate_click(header.center(), Default::default());
+        window
+            .update(&mut visual, |shell, _, cx| {
+                let key = group_key("release");
+                assert!(!shell.tree_group_open("release"));
+                assert!(shell.tree.disclosing(&key, Instant::now()));
+                let rows = shell.tree_rows(&shell.tree_catalog(cx), cx);
+                assert!(rows.iter().any(|row| matches!(
+                    row, TreeRow::Reveal { key: k, rows } if k == &key && !rows.is_empty()
+                )));
+            })
+            .unwrap();
+        visual.simulate_click(header.center(), Default::default());
+        window
+            .update(&mut visual, |shell, _, _| {
+                assert!(shell.tree_group_open("release"));
+                assert!(shell.tree.disclosing(&group_key("release"), Instant::now()));
+            })
+            .unwrap();
+        visual.update(|cx| cx.set_reduce_motion(true));
+        visual.simulate_click(header.center(), Default::default());
+        window
+            .update(&mut visual, |shell, _, _| {
+                assert!(!shell.tree_group_open("release"));
+                assert!(!shell.tree.disclosing(&group_key("release"), Instant::now()));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn classic_group_headers_keep_their_geometry_and_toggle_in_place(cx: &mut TestAppContext) {
+        use gpui::{VisualTestContext, px, size};
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (window, _, _) = crate::shell::tests::window(cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        visual.simulate_resize(size(px(1400.), px(900.)));
+        window
+            .update(visual, |shell, _, cx| {
+                shell.workspace.project_rail_open = true;
+                shell.set_navigation_layout(NavigationLayout::Classic, cx);
+                shell.workspace.project_rail_groups.push(crate::workspace::ProjectRailGroup {
+                    id: "release".into(),
+                    name: "Release".into(),
+                    ..Default::default()
+                });
+                shell.workspace.project_rail_assignments.insert("/work/monocode".into(), "release".into());
+                shell.projects_frame.update(cx, |_, cx| cx.notify());
+            })
+            .unwrap();
+        visual.run_until_parked();
+        let header = visual.debug_bounds("rail-group-release").expect("Classic group");
+        assert_eq!(header.size.height, px(32.));
+        visual.simulate_click(header.center(), Default::default());
+        visual.run_until_parked();
+        assert_eq!(visual.debug_bounds("rail-group-release"), Some(header));
+        window
+            .update(visual, |shell, _, _| {
+                assert!(shell.workspace.project_rail_groups[0].collapsed);
+                assert!(shell.tree.disclosures.is_empty());
+            })
+            .unwrap();
     }
 
     #[gpui::test]

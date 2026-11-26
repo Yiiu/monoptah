@@ -179,7 +179,7 @@ impl Shell {
             ),
             TreeRow::Header(ProjectEntry::Heading(name)) => self.tree_heading(name, cx),
             TreeRow::Header(ProjectEntry::Group(group)) => {
-                self.project_rail_group_header(group, cx)
+                self.tree_group_header(group, cx)
             }
             TreeRow::Header(ProjectEntry::Project(path)) => self.tree_project_row(path, cx),
             TreeRow::Section {
@@ -270,6 +270,104 @@ impl Shell {
                 )
             })
             .into_any()
+    }
+
+    fn tree_group_header(&mut self, id: String, cx: &mut Context<Self>) -> AnyElement {
+        let Some(group) = self.workspace.project_rail_groups.iter().find(|g| g.id == id) else {
+            return div().into_any();
+        };
+        let name = group.name.clone();
+        let appearance = super::super::project_rail::project_group_appearance(group);
+        let open = self.tree_group_open(&id);
+        let active = self.workspace.project_rail_group(&self.workspace.project) == Some(id.as_str())
+            && !self.workspace.project_rail_pinned.contains(&self.workspace.project)
+            && !self.app_view_open()
+            && !self.mono_active(cx);
+        let key = group_key(&id);
+        let offset = self.rail_item_offset(&id, &RailDragKind::Group);
+        let raised = self.rail_item_raised(&id, &RailDragKind::Group);
+        let anchor = self.project_rail_group_anchor(&id);
+        self.tree.track_anchor(&anchor);
+        let drag = id.clone();
+        let menu = id.clone();
+        let options = id.clone();
+        let selector = format!("tree-group-{id}");
+        let row = div()
+            .id(SharedString::from(selector.clone()))
+            .debug_selector(move || selector.clone())
+            .group("tree-group")
+            .role(Role::Button)
+            .aria_label(name.clone())
+            .aria_expanded(open)
+            .aria_selected(active)
+            .relative()
+            .top(px(offset))
+            .h(px(30.))
+            .px(px(6.))
+            .rounded(px(6.))
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .when(active, |d| d.bg(content(0.10)))
+            .hover(|d| d.bg(content(if active { 0.10 } else { 0.05 })))
+            .child(
+                tree_chevron(self.tree.openness(&key, open, Instant::now()), 12.)
+                    .text_color(content(0.42)),
+            )
+            .child(crate::project_settings::project_icon(&appearance, &id, 12.))
+            .child(tree_heading_text(&name))
+            .child(
+                icon_button("tree-group-options", "Group options", "more-horizontal")
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, e: &gpui::ClickEvent, window, cx| {
+                        cx.stop_propagation();
+                        this.open_menu(
+                            MenuTarget::ProjectRailGroup(options.clone()),
+                            Anchor::Point(e.position()),
+                            window,
+                            cx,
+                        );
+                    }))
+                    .invisible()
+                    .group_hover("tree-group", |d| d.visible()),
+            )
+            .child(anchor.probe())
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, e: &MouseDownEvent, window, cx| {
+                    this.start_project_rail_drag(drag.clone(), true, e, window, cx);
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, e: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.open_menu(
+                        MenuTarget::ProjectRailGroup(menu.clone()),
+                        Anchor::Point(e.position),
+                        window,
+                        cx,
+                    );
+                }),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if this.tree_take_project_drag_click() {
+                    return;
+                }
+                if let Some(group) = this.workspace.project_rail_groups.iter_mut().find(|g| g.id == id) {
+                    group.collapsed = !group.collapsed;
+                }
+                if !this.tree_filtered() {
+                    this.tree_disclose(key.clone(), !open, cx);
+                }
+                this.persist(cx);
+                this.notify_sidebar(cx);
+            }));
+        if raised {
+            gpui::deferred(row).with_priority(1).into_any()
+        } else {
+            row.into_any()
+        }
     }
 
     fn tree_project_row(&mut self, path: String, cx: &mut Context<Self>) -> AnyElement {

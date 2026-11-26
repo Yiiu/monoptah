@@ -10,6 +10,25 @@ use monocode_core::scm::DiffStats;
 
 const ICON_RAIL_WIDTH: f32 = 48.;
 
+pub(super) fn project_group_appearance(
+    group: &workspace::ProjectRailGroup,
+) -> monocode_core::project_appearance::ProjectAppearance {
+    let color = group
+        .custom_color
+        .as_ref()
+        .and_then(|c| u32::from_str_radix(c.trim_start_matches('#'), 16).ok())
+        .or_else(|| {
+            group
+                .color_index
+                .and_then(|i| monocode_core::project_appearance::COLORS.get(i).copied())
+        });
+    monocode_core::project_appearance::ProjectAppearance {
+        color,
+        mascot: group.mascot.clone(),
+        ..Default::default()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ProjectRailRow {
     Monos,
@@ -1026,31 +1045,10 @@ impl Shell {
         let context = id.clone();
         let options = id.clone();
         let drag_id = id.clone();
-        let bounds = self
-            .project_rail_list
-            .group_bounds
-            .entry(id.clone())
-            .or_default()
-            .clone();
-        if self.workspace.tree_layout() {
-            self.tree.track_anchor(&bounds);
-        }
+        let appearance = project_group_appearance(group);
+        let bounds = self.project_rail_group_anchor(&id);
         let offset = self.rail_item_offset(&id, &RailDragKind::Group);
         let dragging = self.rail_item_raised(&id, &RailDragKind::Group);
-        let color = group
-            .custom_color
-            .as_ref()
-            .and_then(|c| u32::from_str_radix(c.trim_start_matches('#'), 16).ok())
-            .or_else(|| {
-                group
-                    .color_index
-                    .and_then(|i| monocode_core::project_appearance::COLORS.get(i).copied())
-            });
-        let appearance = monocode_core::project_appearance::ProjectAppearance {
-            color,
-            mascot: group.mascot.clone(),
-            ..Default::default()
-        };
         let row = div()
             .w_full()
             .px_2()
@@ -1702,6 +1700,10 @@ impl Shell {
             .entry(path.to_owned())
             .or_default()
             .clone()
+    }
+
+    pub(super) fn project_rail_group_anchor(&mut self, id: &str) -> AnchorSlot {
+        self.project_rail_list.group_bounds.entry(id.to_owned()).or_default().clone()
     }
 
     pub(super) fn tree_take_project_drag_click(&mut self) -> bool {
