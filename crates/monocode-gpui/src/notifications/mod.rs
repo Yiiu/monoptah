@@ -1,6 +1,8 @@
 //! Notification surfaces and delivery shared by the workspace and Settings.
 pub(crate) mod app_update;
 pub(crate) mod approvals;
+#[cfg(any(windows, test))]
+mod badge;
 pub(crate) mod delivery;
 pub(crate) mod errors;
 pub(crate) mod file_error;
