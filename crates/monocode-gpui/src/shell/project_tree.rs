@@ -919,11 +919,18 @@ impl Shell {
                 self.tree_session_rows(rows, &ids, (2, true), Some(&key), catalog, cx)
             });
         }
-        let copies = catalog
-            .worktrees
-            .get(path)
-            .filter(|copies| copies.len() > 1);
-        let Some(copies) = copies else {
+        let mut by_worktree: Vec<(String, Vec<i64>)> = Vec::new();
+        let mut known = HashMap::new();
+        for &id in &split.loose {
+            let copy = self.tree_session_worktree(id, path, cx);
+            let key = path_key(copy);
+            let index = *known.entry(key).or_insert_with(|| {
+                by_worktree.push((copy.to_owned(), Vec::new()));
+                by_worktree.len() - 1
+            });
+            by_worktree[index].1.push(id);
+        }
+        let Some(copies) = catalog.worktrees.get(path).filter(|_| by_worktree.len() > 1) else {
             self.tree_session_rows(
                 rows,
                 &split.loose,
@@ -935,17 +942,6 @@ impl Shell {
             return;
         };
         let copy_key = path_key(path);
-        let mut by_worktree: Vec<(String, Vec<i64>)> = Vec::new();
-        let mut known = HashMap::new();
-        for id in split.loose {
-            let copy = self.tree_session_worktree(id, path, cx);
-            let key = path_key(copy);
-            let index = *known.entry(key).or_insert_with(|| {
-                by_worktree.push((copy.to_owned(), Vec::new()));
-                by_worktree.len() - 1
-            });
-            by_worktree[index].1.push(id);
-        }
         by_worktree.sort_by_key(|(copy, _)| path_key(copy) != copy_key);
         for (copy, members) in by_worktree {
             let open = !self.tree.worktrees.contains(&copy) || self.tree_filtered();
@@ -1299,6 +1295,35 @@ mod tests {
                 .update(visual, |shell, _, _| shell.settings.is_some())
                 .unwrap()
         );
+    }
+
+    #[gpui::test]
+    fn only_loose_sessions_determine_whether_worktree_rows_are_needed(cx: &mut TestAppContext) {
+        let (window, pinned, loose) = crate::shell::tests::window(cx);
+        window
+            .update(cx, |shell, _, cx| {
+                let project = "/work/another-project";
+                shell.tree.projects.insert(project.into(), true);
+                shell.session_summaries.get_mut(&pinned).unwrap().pinned = true;
+                let rows = shell.tree_rows(&shell.tree_catalog(cx), cx);
+                assert!(rows.iter().any(|row| matches!(
+                    row, TreeRow::Section { name: "Pinned", count: 1, .. }
+                )));
+                assert!(!rows.iter().any(|row| matches!(row, TreeRow::Worktree { .. })));
+
+                let summary = shell.session_summaries.get_mut(&loose).unwrap();
+                summary.cwd = project.into();
+                summary.has_messages = true;
+                shell.session_worktrees.insert(loose, Some("/work/topic".into()));
+                let catalog = shell.tree_catalog(cx);
+                assert_eq!(catalog.worktrees[project].len(), 2);
+                let rows = shell.tree_rows(&catalog, cx);
+                assert!(rows.iter().any(|row| matches!(
+                    row, TreeRow::Session { id, depth: 1, .. } if *id == loose
+                )));
+                assert!(!rows.iter().any(|row| matches!(row, TreeRow::Worktree { .. })));
+            })
+            .unwrap();
     }
 
     /// A project row's hover "+" starts a session there without the context menu.
