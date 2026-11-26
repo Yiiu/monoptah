@@ -2155,6 +2155,62 @@ mod tests {
             .unwrap();
     }
 
+    #[gpui::test]
+    fn collapsing_projects_and_worktrees_keeps_child_rows_aligned(cx: &mut TestAppContext) {
+        let (window, mut visual, main, topic) = tree_window(cx);
+        let visual = &mut visual;
+        let project = "/work/another-project";
+        let copy = "/work/another-project-topic";
+        let child = format!("sidebar-session-{main}").leak();
+        window
+            .update(visual, |shell, _, cx| {
+                let summary = shell.session_summaries.get_mut(&topic).unwrap();
+                summary.cwd = project.into();
+                summary.has_messages = true;
+                if let Some(view) = shell.sessions.get(&topic).cloned() {
+                    view.update(cx, |view, _| {
+                        view.summary.cwd = project.into();
+                        view.summary.has_messages = true;
+                    });
+                }
+                shell.session_worktrees.insert(topic, Some(copy.into()));
+                shell.notify_sidebar(cx);
+            })
+            .unwrap();
+
+        for (key, header) in [
+            (worktree_key(project), "tree-worktree-/work/another-project"),
+            (project_key(project), "tree-project-/work/another-project"),
+        ] {
+            visual.refresh().unwrap();
+            let content = visual.debug_bounds(child).expect("open child row");
+            window
+                .update(visual, |_, _, cx| cx.set_reduce_motion(false))
+                .unwrap();
+            let header = visual.debug_bounds(header).expect("open parent header");
+            visual.simulate_click(header.center(), Default::default());
+            window
+                .update(visual, |shell, _, cx| {
+                    let disclosure = shell.tree.disclosures.get_mut(&key).expect("closing node");
+                    // Hold the start of the transition while the first clipped row is laid out.
+                    let start = Instant::now() + Duration::from_secs(30);
+                    *disclosure = Disclosure::new(true);
+                    disclosure.set(false, true, start);
+                    shell.notify_sidebar(cx);
+                })
+                .unwrap();
+            visual.refresh().unwrap();
+            let closing = visual.debug_bounds(child).expect("closing child row");
+            assert_eq!(closing.left(), content.left(), "{key}");
+            assert_eq!(closing.right(), content.right(), "{key}");
+
+            window
+                .update(visual, |_, _, cx| cx.set_reduce_motion(true))
+                .unwrap();
+            visual.simulate_click(header.center(), Default::default());
+        }
+    }
+
     /// While a project is dragged its whole block follows the pointer on a
     /// lifted plate, and the block it passes steps aside by the dragged
     /// block's height. Dropping saves the order shared with Classic.

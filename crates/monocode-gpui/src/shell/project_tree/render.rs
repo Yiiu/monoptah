@@ -236,7 +236,8 @@ impl Shell {
             .disclosures
             .get(&key)
             .and_then(|d| d.render(div().flex().flex_col().children(rows), Instant::now()))
-            .map_or_else(|| div().into_any(), IntoElement::into_any_element)
+            // Unlike the steady block rows, this flex root otherwise sizes to its contents.
+            .map_or_else(|| div().into_any(), |clip| clip.w_full().into_any())
     }
 
     fn tree_row(&mut self, row: TreeRow, plate: gpui::Hsla, cx: &mut Context<Self>) -> AnyElement {
