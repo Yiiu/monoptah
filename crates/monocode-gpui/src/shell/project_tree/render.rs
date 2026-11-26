@@ -14,6 +14,12 @@ impl Shell {
             self.tree.replace_rows(rows);
         }
         self.tree.clear_anchors();
+        let has_requests = !self.tree.requests.is_empty();
+        self.tree.request_disclosure.set(
+            has_requests,
+            has_requests && !cx.reduce_motion(),
+            Instant::now(),
+        );
         let lift = self.tree_lift_plate();
         div()
             .id("project-tree-sidebar")
@@ -588,8 +594,23 @@ impl Shell {
     }
 
     fn tree_request_queue(&self, ids: &[i64], cx: &mut Context<Self>) -> AnyElement {
+        let queue = div().id("tree-needs-you").mx(px(6.)).mb(px(4.));
+        let color = needs_you_color(ids.len());
+        if ids.is_empty() {
+            return queue
+                .debug_selector(|| "tree-needs-you-empty".into())
+                .h(px(28.))
+                .px(px(6.))
+                .flex()
+                .items_center()
+                .text_size(px(12.))
+                .text_color(color)
+                .child("Nothing needs you")
+                .into_any();
+        }
         let summary = div()
             .id("tree-next-request")
+            .debug_selector(|| "tree-next-request".into())
             .role(Role::Button)
             .aria_label(format!("Open next session needing you, {}", ids.len()))
             .flex()
@@ -598,7 +619,7 @@ impl Shell {
             .h(px(28.))
             .px(px(6.))
             .rounded(px(6.))
-            .text_color(warning_color())
+            .text_color(color)
             .text_size(px(12.))
             .hover(|d| d.bg(content(0.05)))
             .child(icon("hand", 14.))
@@ -610,22 +631,17 @@ impl Shell {
             )
             .child(tree_caption("Ctrl J", content(0.45)))
             .on_click(cx.listener(|this, _, window, cx| this.open_next_tree_request(window, cx)));
-        div()
-            .id("tree-needs-you")
-            .mx(px(6.))
-            .mb(px(4.))
+        let list = div()
+            .id("tree-request-list")
+            .debug_selector(|| "tree-request-list".into())
+            .max_h(px(118.))
+            .overflow_y_scroll()
+            .children(ids.iter().map(|id| self.tree_request_item(*id, cx)));
+        queue
             .rounded(px(6.))
-            .bg(warning_color().opacity(0.055))
+            .bg(color.opacity(0.055))
             .child(summary)
-            .when(!ids.is_empty(), |d| {
-                d.child(
-                    div()
-                        .id("tree-request-list")
-                        .max_h(px(118.))
-                        .overflow_y_scroll()
-                        .children(ids.iter().map(|id| self.tree_request_item(*id, cx))),
-                )
-            })
+            .children(self.tree.request_disclosure.render(list, Instant::now()))
             .into_any()
     }
 
@@ -986,7 +1002,7 @@ impl Shell {
                     .role(Role::Button)
                     .aria_label(format!("Needs you {requests}"))
                     .text_size(px(11.))
-                    .text_color(warning_color())
+                    .text_color(needs_you_color(requests))
                     .rounded(px(6.))
                     .h(px(28.))
                     .px(px(3.))
@@ -1157,6 +1173,10 @@ impl Shell {
         })
         .collect()
     }
+}
+
+pub(super) fn needs_you_color(count: usize) -> gpui::Hsla {
+    if count == 0 { content(0.4) } else { warning_color() }
 }
 
 fn tree_caption(text: impl Into<SharedString>, color: gpui::Hsla) -> gpui::Div {

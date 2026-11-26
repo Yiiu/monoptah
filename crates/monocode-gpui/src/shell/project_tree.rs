@@ -236,6 +236,7 @@ pub(super) struct TreeState {
     rows: Vec<TreeRow>,
     counts: HashMap<String, Counts>,
     requests: Vec<i64>,
+    request_disclosure: Disclosure,
     projects: HashMap<String, bool>,
     worktrees: HashSet<String>,
     sessions: HashSet<i64>,
@@ -274,6 +275,7 @@ impl TreeState {
             rows: Vec::new(),
             counts: HashMap::new(),
             requests: Vec::new(),
+            request_disclosure: Disclosure::new(false),
             projects: HashMap::new(),
             worktrees: HashSet::new(),
             sessions: HashSet::new(),
@@ -293,7 +295,8 @@ impl TreeState {
     /// Something in the tree is moving: a node opening or closing, or a row
     /// changing between unread and read.
     fn animating(&self, now: Instant) -> bool {
-        self.disclosures.values().any(|d| d.animating(now))
+        self.request_disclosure.animating(now)
+            || self.disclosures.values().any(|d| d.animating(now))
             || self.fades.values().any(|fade| fade.running(now))
     }
 
@@ -1295,6 +1298,37 @@ mod tests {
                 .update(visual, |shell, _, _| shell.settings.is_some())
                 .unwrap()
         );
+    }
+
+    #[gpui::test]
+    fn needs_you_uses_a_neutral_empty_state_and_discloses_requests(cx: &mut TestAppContext) {
+        use monocode_core::agent_status::Ask;
+        let (window, id, _) = crate::shell::tests::window(cx);
+        window
+            .update(cx, |shell, _, cx| {
+                assert_eq!(render::needs_you_color(0), content(0.4));
+                assert_eq!(render::needs_you_color(1), warning_color());
+                for reduce_motion in [false, true] {
+                    cx.set_reduce_motion(reduce_motion);
+                    shell.agent_statuses.remove(&id);
+                    shell.tree_sidebar(cx);
+                    assert!(shell.tree.requests.is_empty());
+                    assert!(!shell.tree.request_disclosure.mounted(Instant::now()));
+                    shell.agent_statuses.insert(
+                        id,
+                        AgentStatus {
+                            activity: Activity::NeedsYou { kind: Ask::Question },
+                            ..Default::default()
+                        },
+                    );
+                    shell.tree_sidebar(cx);
+                    assert_eq!(shell.tree.requests, [id]);
+                    let now = Instant::now();
+                    assert!(shell.tree.request_disclosure.mounted(now));
+                    assert_eq!(shell.tree.request_disclosure.animating(now), !reduce_motion);
+                }
+            })
+            .unwrap();
     }
 
     #[gpui::test]
