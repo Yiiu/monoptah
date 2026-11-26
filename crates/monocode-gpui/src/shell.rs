@@ -9820,7 +9820,7 @@ impl Render for Shell {
                     this.refresh_notification_permission();
                     cx.notify();
                 }));
-            self.start_native_notifications(cx);
+            self.start_native_notifications(window, cx);
             self.check_github_star(false, cx);
             let shell = cx.entity().downgrade();
             window.on_window_should_close(cx, move |window, cx| {
