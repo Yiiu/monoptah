@@ -315,6 +315,9 @@ impl Shell {
             _events: events,
         });
         if panel {
+            if self.workspace.tree_layout() && self.tree_settle_unread(cx) {
+                self.notify_sidebar(cx);
+            }
             cx.notify();
             return;
         }

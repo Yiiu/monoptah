@@ -979,10 +979,9 @@ mod tests {
         let (window, _, _) = super::super::tests::window(cx);
         window
             .update(cx, |shell, _, cx| {
-                shell.workspace.classic_layout = true;
                 shell.workspace.project_rail_open = true;
                 shell.classic_sidebar_tab = ClassicSidebarTab::Sessions;
-                shell.layout_changed(cx);
+                shell.set_navigation_layout(crate::workspace::NavigationLayout::Classic, cx);
             })
             .unwrap();
         cx.run_until_parked();

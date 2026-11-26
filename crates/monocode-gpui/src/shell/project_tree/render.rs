@@ -1,6 +1,13 @@
 //! GPUI rows and the two presentations of the project tree.
 use super::*;
 
+#[derive(Default)]
+struct LiftedTreeRows {
+    start: usize,
+    heights: Vec<Pixels>,
+    overlays: Vec<AnyElement>,
+}
+
 impl Shell {
     pub(in crate::shell) fn tree_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         // A held drag uses the same rows it measured on press. Activity and
@@ -22,6 +29,11 @@ impl Shell {
         );
         let plate = self.tree_badge_plate();
         let lift = self.tree_lift_plate();
+        let LiftedTreeRows {
+            start,
+            heights,
+            overlays,
+        } = self.tree_dragged_rows(plate, cx).unwrap_or_default();
         div()
             .id("project-tree-sidebar")
             .debug_selector(|| "project-tree-sidebar".into())
@@ -57,10 +69,16 @@ impl Shell {
                     .overflow_hidden()
                     // Before the list, so the plate is painted under the lifted rows.
                     .children(lift)
+                    .children(overlays)
                     .child(
                         gpui::list(
                             self.tree.list.clone(),
-                            cx.processor(move |this, index, _, cx| {
+                            cx.processor(move |this, index: usize, _, cx| {
+                                if let Some(height) =
+                                    index.checked_sub(start).and_then(|ix| heights.get(ix))
+                                {
+                                    return div().h(*height).into_any_element();
+                                }
                                 this.tree_list_row(index, plate, cx)
                             }),
                         )
@@ -107,6 +125,7 @@ impl Shell {
         let viewport = self.tree.list.viewport_bounds();
         // The rows keep 6 px from the edges and 2 px below each.
         let plate = div()
+            .debug_selector(|| "tree-lift-plate".into())
             .absolute()
             .left(lift.left() - viewport.left() + px(4.))
             .top(lift.top() - viewport.top() - px(2.))
@@ -122,6 +141,44 @@ impl Shell {
                     .spread_radius(px(-6.)),
             ]);
         Some(gpui::deferred(plate).with_priority(1).into_any())
+    }
+
+    /// Draw held rows independently of their list slots, which can scroll
+    /// beyond the virtual list's overdraw during a gesture.
+    fn tree_dragged_rows(
+        &mut self,
+        plate: gpui::Hsla,
+        cx: &mut Context<Self>,
+    ) -> Option<LiftedTreeRows> {
+        let (kind, id) = self.tree_dragged_block()?;
+        let rows = self.tree.drag_block_rows(kind, id)?;
+        let measurements: Vec<_> = rows
+            .clone()
+            .map(|ix| self.tree.list.estimated_bounds_for_item(ix))
+            .collect::<Option<_>>()?;
+        let lift = self.tree_lift_bounds()?;
+        let viewport = self.tree.viewport_bounds();
+        let offset = lift.top() - measurements.first()?.top();
+        let mut overlays = Vec::new();
+        for (ix, bounds) in rows.clone().zip(&measurements) {
+            let top = bounds.top() + offset;
+            if top + bounds.size.height < viewport.top() || top > viewport.bottom() {
+                continue;
+            }
+            let row = self.tree_row(self.tree.rows[ix].clone(), plate, cx);
+            let overlay = div()
+                .absolute()
+                .top(top - viewport.top())
+                .left_0()
+                .w_full()
+                .child(row);
+            overlays.push(gpui::deferred(overlay).with_priority(2).into_any_element());
+        }
+        Some(LiftedTreeRows {
+            start: rows.start,
+            heights: measurements.iter().map(|row| row.size.height).collect(),
+            overlays,
+        })
     }
 
     fn tree_list_row(
@@ -316,8 +373,13 @@ impl Shell {
             && !self.app_view_open()
             && !self.mono_active(cx);
         let key = group_key(&id);
-        let offset = self.rail_item_offset(&id, &RailDragKind::Group);
-        let raised = self.rail_item_raised(&id, &RailDragKind::Group);
+        let lifted = self.tree_dragged_block() == Some((&RailDragKind::Group, id.as_str()));
+        let offset = if lifted {
+            0.
+        } else {
+            self.rail_item_offset(&id, &RailDragKind::Group)
+        };
+        let raised = !lifted && self.rail_item_raised(&id, &RailDragKind::Group);
         let anchor = self.project_rail_group_anchor(&id);
         self.tree.track_anchor(&anchor);
         let drag = id.clone();

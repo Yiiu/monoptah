@@ -227,10 +227,12 @@ impl Render for Chrome {
         self.owner
             .update(cx, |shell, cx| match kind {
                 ChromeKind::Sidebar => {
+                    let scrolling = shell.advance_tree_rail_frame(std::time::Instant::now(), cx);
                     let sidebar = shell.sidebar(cx);
                     if shell.spaces_nudge.is_some()
                         || shell.classic_tabs.animating()
                         || shell.tree_animating()
+                        || scrolling
                     {
                         window.request_animation_frame();
                     }
@@ -1770,6 +1772,9 @@ impl Shell {
         self.trim_session_histories(&shown, cx);
         self.sync_tui(&shown, cx);
         self.refresh_visible_seen(cx);
+        if self.workspace.tree_layout() && self.tree_settle_unread(cx) {
+            self.notify_sidebar(cx);
+        }
     }
     fn add(&mut self, summary: Session, cx: &mut Context<Self>) {
         self.workspace.add_project(&summary.cwd);
@@ -10447,12 +10452,12 @@ impl Render for Shell {
             }))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, _, window, cx| {
+                cx.listener(|this, event: &MouseUpEvent, window, cx| {
                     this.finish_tab_drag(window, cx);
                     this.finish_dock_drag(cx);
                     this.finish_pane_drag(window, cx);
                     this.finish_folder_drag(cx);
-                    this.finish_project_rail_drag(cx);
+                    this.finish_project_rail_drag(event.position, cx);
                     this.finish_space_drag(cx);
                     this.end_classic_sidebar_tab(cx);
                     if let Some(m) = this.monos.clone() {

@@ -11,7 +11,9 @@ use monocode_core::{
     agent_status::Activity, files::path_key, session_filters::Status, time::now_ms,
 };
 use std::{
+    borrow::Cow,
     cell::RefCell,
+    ops::Range,
     time::{Duration, Instant},
 };
 
@@ -209,6 +211,27 @@ fn ends_block(row: &TreeRow, kind: &RailDragKind) -> bool {
     }
 }
 
+fn drag_block_id<'a>(row: &'a TreeRow, kind: &RailDragKind) -> Option<Cow<'a, str>> {
+    match (row, kind) {
+        (TreeRow::Header(ProjectEntry::Project(path)), RailDragKind::Project)
+        | (TreeRow::Header(ProjectEntry::Group(path)), RailDragKind::Group) => {
+            Some(Cow::Borrowed(path))
+        }
+        (TreeRow::Folder { project, id, .. }, RailDragKind::Folder(scope)) if project == scope => {
+            Some(Cow::Borrowed(id))
+        }
+        (
+            TreeRow::Session {
+                id,
+                reorder_scope: Some(section),
+                ..
+            },
+            RailDragKind::Session(scope),
+        ) if section == scope => Some(Cow::Owned(id.to_string())),
+        _ => None,
+    }
+}
+
 fn session_ids(rows: &[TreeRow], ids: &mut Vec<i64>) {
     for row in rows {
         match row {
@@ -266,7 +289,7 @@ mod tree_diffs;
 
 impl TreeState {
     pub(super) fn new(cx: &mut Context<Shell>) -> Self {
-        let list = ListState::new(0, ListAlignment::Top, px(96.)).with_uniform_item_height(px(28.));
+        let list = ListState::new(0, ListAlignment::Top, px(96.));
         let shell = cx.weak_entity();
         list.set_scroll_handler(move |_, _, cx| {
             let _ = shell.update(cx, |shell, cx| {
@@ -317,9 +340,8 @@ impl TreeState {
             .map_or(if open { 1. } else { 0. }, |d| d.fraction(now))
     }
 
-    /// The laid-out extent of each project, group or folder block. Blocks
-    /// whose header has not been laid out are left out; the rest come in row
-    /// order, in window coordinates and without any drag offset.
+    /// Each block spans its header and child rows, using the list's height
+    /// estimates until those rows have been measured. Bounds are unshifted.
     pub(super) fn drag_blocks(
         &self,
         kind: &RailDragKind,
@@ -327,46 +349,41 @@ impl TreeState {
     ) -> Vec<(String, Bounds<Pixels>)> {
         let mut blocks = Vec::new();
         for (ix, row) in self.rows.iter().enumerate() {
-            let id = match (row, kind) {
-                (TreeRow::Header(ProjectEntry::Project(path)), RailDragKind::Project) => {
-                    path.clone()
-                }
-                (TreeRow::Header(ProjectEntry::Group(id)), RailDragKind::Group) => id.clone(),
-                (TreeRow::Folder { project, id, .. }, RailDragKind::Folder(scope))
-                    if project == scope =>
-                {
-                    id.clone()
-                }
-                (
-                    TreeRow::Session {
-                        id,
-                        reorder_scope: Some(section),
-                        ..
-                    },
-                    RailDragKind::Session(scope),
-                ) if section == scope => id.to_string(),
-                _ => continue,
+            let Some(id) = drag_block_id(row, kind) else {
+                continue;
             };
             if !include(&id) {
                 continue;
             }
-            let Some(head) = self.list.bounds_for_item(ix) else {
+            let Some(head) = self.list.estimated_bounds_for_item(ix) else {
                 continue;
             };
-            let end = self.rows[ix + 1..]
-                .iter()
-                .position(|row| ends_block(row, kind))
-                .map_or(self.rows.len(), |n| ix + 1 + n);
-            let bottom = (ix..end)
-                .rev()
-                .find_map(|item| self.list.bounds_for_item(item))
+            let end = self.drag_block_end(ix, kind);
+            let bottom = self
+                .list
+                .estimated_bounds_for_item(end - 1)
                 .map_or(head.bottom(), |last| last.bottom());
             blocks.push((
-                id,
+                id.into_owned(),
                 Bounds::from_corners(head.origin, gpui::point(head.right(), bottom)),
             ));
         }
         blocks
+    }
+
+    fn drag_block_end(&self, start: usize, kind: &RailDragKind) -> usize {
+        self.rows[start + 1..]
+            .iter()
+            .position(|row| ends_block(row, kind))
+            .map_or(self.rows.len(), |n| start + 1 + n)
+    }
+
+    fn drag_block_rows(&self, kind: &RailDragKind, id: &str) -> Option<Range<usize>> {
+        let start = self
+            .rows
+            .iter()
+            .position(|row| drag_block_id(row, kind).as_deref() == Some(id))?;
+        Some(start..self.drag_block_end(start, kind))
     }
 
     pub(super) fn session_reorder_scope(&self, session: i64) -> Option<String> {
@@ -380,6 +397,22 @@ impl TreeState {
 
     pub(super) fn viewport_bounds(&self) -> Bounds<Pixels> {
         self.list.viewport_bounds()
+    }
+
+    pub(super) fn scroll_top(&self) -> Pixels {
+        -self.list.scroll_px_offset_for_scrollbar().y
+    }
+
+    pub(super) fn scroll_while_dragging(&self, velocity: f32, seconds: f32) -> bool {
+        let top = self.scroll_top();
+        let max = self.list.max_offset_for_scrollbar().y;
+        let next = (top + px(velocity * seconds)).clamp(px(0.), max);
+        self.list.scroll_by(next - top);
+        if velocity > 0. {
+            next < max
+        } else {
+            next > px(0.)
+        }
     }
 
     fn set_owners(&mut self) {
@@ -457,8 +490,11 @@ impl TreeState {
             .take_while(|(a, b)| a == b)
             .count();
         if first + suffix != self.rows.len() || first + suffix != next.len() {
-            self.list
-                .splice(first..self.rows.len() - suffix, next.len() - first - suffix);
+            self.list.splice_with_height_hint(
+                first..self.rows.len() - suffix,
+                next.len() - first - suffix,
+                px(28.),
+            );
             self.rows = next;
             self.set_owners();
         }
@@ -807,7 +843,9 @@ impl Shell {
     /// read, or projects stepping aside for a drag.
     pub(super) fn tree_animating(&self) -> bool {
         self.workspace.tree_layout()
-            && (self.tree.animating(Instant::now()) || self.rail_shifting())
+            && (self.tree.animating(Instant::now())
+                || self.rail_shifting()
+                || self.tree_drop_frame())
     }
 
     /// Keeps the tree's unread looks in step with a session's new activity.
@@ -819,6 +857,9 @@ impl Shell {
         activity: &Activity,
         cx: &App,
     ) {
+        if !self.workspace.tree_layout() {
+            return;
+        }
         let now = Instant::now();
         let animate = !cx.reduce_motion();
         let unread = matches!(activity, Activity::Done { unread: true, .. });
@@ -839,7 +880,7 @@ impl Shell {
                 );
             }
         } else if was_unread && !unread {
-            if self.workspace.tree_layout() && self.workspace.active == Some(id) {
+            if self.tree_row_in_view(id, cx) {
                 // A turn that finishes in the open session is seen at once: let
                 // its badge finish popping in, since it ends on the look the row
                 // lingers in.
@@ -861,19 +902,31 @@ impl Shell {
         }
     }
 
-    /// Demotes the rows that kept their unread look while open once another
-    /// session is opened, and forgets finished fades.
-    pub(super) fn tree_settle_unread(&mut self, cx: &App) {
+    fn tree_row_in_view(&self, id: i64, cx: &App) -> bool {
+        self.workspace.active == Some(id)
+            && !self.app_view_open()
+            && self.settings.is_none()
+            && self.app_search.is_none()
+            && !self.mono_active(cx)
+    }
+
+    pub(super) fn settle_tree_unread_now(&mut self) {
+        self.tree.lingering.clear();
+        self.tree.fades.clear();
+    }
+
+    /// Demote rows whose session is no longer visible and expire finished fades.
+    pub(super) fn tree_settle_unread(&mut self, cx: &App) -> bool {
         let now = Instant::now();
         let animate = !cx.reduce_motion();
-        let active = self.workspace.active;
         let left: Vec<i64> = self
             .tree
             .lingering
             .iter()
             .copied()
-            .filter(|id| Some(*id) != active)
+            .filter(|id| !self.tree_row_in_view(*id, cx))
             .collect();
+        let demoted = !left.is_empty();
         for id in left {
             self.tree.lingering.remove(&id);
             if animate {
@@ -886,8 +939,11 @@ impl Shell {
                 );
             }
         }
-        self.tree.fades.retain(|_, fade| fade.running(now));
+        self.tree
+            .fades
+            .retain(|_, fade| animate && fade.running(now));
         self.tree.disclosures.retain(|_, d| d.animating(now));
+        demoted
     }
 
     /// How unread `id`'s row is drawn, 0 (read) to 1 (unread), and its badge.
@@ -1862,6 +1918,90 @@ mod tests {
             .unwrap();
     }
 
+    fn open_finished_tree_row(
+        shell: &mut Shell,
+        id: i64,
+        window: &mut Window,
+        cx: &mut Context<Shell>,
+    ) {
+        use monocode_core::{
+            agent_status::{Outcome, TurnEnd},
+            store::SessionActivity,
+        };
+        shell.session_activity.insert(
+            id,
+            SessionActivity {
+                last_turn: Some(TurnEnd {
+                    at: 1_000,
+                    outcome: Outcome::Completed,
+                }),
+                progress_summary: Some("Updated the release checklist".into()),
+                ..Default::default()
+            },
+        );
+        shell.update_agent_status(id, None, cx);
+        shell.open(id, window, cx);
+        shell.mark_agent_seen(id, cx);
+        assert!(shell.tree.lingering.contains(&id));
+    }
+
+    #[gpui::test]
+    fn a_tree_layout_round_trip_drops_lingering_without_a_fade(cx: &mut TestAppContext) {
+        let (window, mut visual, first, second) = tree_window(cx);
+        window
+            .update(&mut visual, |shell, w, cx| {
+                cx.set_reduce_motion(false);
+                open_finished_tree_row(shell, first, w, cx);
+                shell.set_navigation_layout(NavigationLayout::Classic, cx);
+                assert!(shell.tree.lingering.is_empty());
+                assert!(shell.tree.fades.is_empty());
+                shell.open(second, w, cx);
+                shell.set_navigation_layout(NavigationLayout::Tree, cx);
+                let activity = &shell.agent_status(first).activity;
+                assert_eq!(shell.tree_unread_look(first, activity).0, 0.);
+            })
+            .unwrap();
+        visual.run_until_parked();
+        assert!(
+            visual
+                .debug_bounds(format!("tree-session-summary-{first}").leak())
+                .is_none()
+        );
+    }
+
+    #[gpui::test]
+    fn opening_inbox_demotes_the_finished_row_even_if_the_session_stays_active(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, mut visual, first, _) = tree_window(cx);
+        window
+            .update(&mut visual, |shell, w, cx| {
+                cx.set_reduce_motion(false);
+                open_finished_tree_row(shell, first, w, cx);
+                shell.open_inbox(w, cx);
+                assert_eq!(shell.workspace.active, Some(first));
+                assert!(!shell.tree.lingering.contains(&first));
+                let fade = shell.tree.fades[&first];
+                assert!(!fade.arriving);
+                assert_eq!(fade.look(fade.start + disclosure::DURATION), 0.);
+
+                shell.open(first, w, cx);
+                cx.set_reduce_motion(true);
+                open_finished_tree_row(shell, first, w, cx);
+                shell.open_inbox(w, cx);
+                assert!(shell.tree.fades.is_empty());
+                let activity = &shell.agent_status(first).activity;
+                assert_eq!(shell.tree_unread_look(first, activity).0, 0.);
+            })
+            .unwrap();
+        visual.run_until_parked();
+        assert!(
+            visual
+                .debug_bounds(format!("tree-session-summary-{first}").leak())
+                .is_none()
+        );
+    }
+
     #[test]
     fn unread_fades_ease_out_and_the_badge_pops_past_full_size() {
         let start = Instant::now();
@@ -2018,6 +2158,198 @@ mod tests {
                 assert!(shell.tree_lift_bounds().is_none());
             })
             .unwrap();
+    }
+
+    fn add_tree_drag_projects(shell: &mut Shell, cx: &mut Context<Shell>) {
+        shell
+            .workspace
+            .projects
+            .extend((0..35).map(|index| format!("/work/motion-project-{index:02}")));
+        shell.notify_sidebar(cx);
+    }
+
+    #[gpui::test]
+    fn a_project_whose_header_scrolled_above_the_tree_can_still_step_aside(
+        cx: &mut TestAppContext,
+    ) {
+        use gpui::{Modifiers, MouseButton, point};
+
+        let (window, mut visual, _, _) = tree_window(cx);
+        let (first, second) = window
+            .update(&mut visual, |shell, _, cx| {
+                add_tree_drag_projects(shell, cx);
+                let first = shell.workspace.projects[0].clone();
+                for _ in 0..5 {
+                    let mut session = locked(&shell.store)
+                        .unwrap()
+                        .create("codex", &first)
+                        .unwrap();
+                    session.has_messages = true;
+                    shell.session_summaries.insert(session.id, session);
+                }
+                (first, shell.workspace.projects[1].clone())
+            })
+            .unwrap();
+        visual.run_until_parked();
+        let target = window
+            .update(&mut visual, |shell, _, cx| {
+                let head = shell
+                    .tree
+                    .rows
+                    .iter()
+                    .position(|row| {
+                        matches!(row, TreeRow::Header(ProjectEntry::Project(id)) if id == &first)
+                    })
+                    .unwrap();
+                shell.tree.list.scroll_to(ListOffset {
+                    item_ix: head + 1,
+                    offset_in_item: px(8.),
+                });
+                assert!(shell.tree.list.bounds_for_item(head).is_none());
+                shell.notify_sidebar(cx);
+                shell.tree.viewport_bounds().top() + px(2.)
+            })
+            .unwrap();
+        visual.run_until_parked();
+        let from = visual
+            .debug_bounds(format!("tree-project-{second}").leak())
+            .unwrap()
+            .center();
+        let to = point(from.x, target);
+        visual.simulate_mouse_down(from, MouseButton::Left, Modifiers::default());
+        visual.simulate_mouse_move(to, MouseButton::Left, Modifiers::default());
+        window
+            .update(&mut visual, |shell, _, _| {
+                assert!(shell.project_rail_project_offset(&first) > 0.);
+            })
+            .unwrap();
+        visual.simulate_mouse_up(to, MouseButton::Left, Modifiers::default());
+        window
+            .update(&mut visual, |shell, _, _| {
+                assert_eq!(&shell.workspace.projects[..2], &[second, first]);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_wheel_scroll_retargets_the_tree_drag_without_moving_the_grabbed_header(
+        cx: &mut TestAppContext,
+    ) {
+        use gpui::{Modifiers, MouseButton, ScrollDelta, ScrollWheelEvent, point};
+
+        let (window, mut visual, _, _) = tree_window(cx);
+        window
+            .update(&mut visual, |shell, _, cx| {
+                add_tree_drag_projects(shell, cx)
+            })
+            .unwrap();
+        visual.run_until_parked();
+        let selector = "tree-project-/work/motion-project-02";
+        let from = visual.debug_bounds(selector).unwrap().center();
+        let to = point(from.x, from.y + px(6.));
+        let read = |visual: &mut gpui::VisualTestContext| {
+            window
+                .update(visual, |shell, _, _| {
+                    let scroll = -shell.tree.list.scroll_px_offset_for_scrollbar().y;
+                    let offset = shell.project_rail_project_offset("/work/motion-project-02");
+                    (scroll, offset)
+                })
+                .unwrap()
+        };
+        visual.simulate_mouse_down(from, MouseButton::Left, Modifiers::default());
+        visual.simulate_mouse_move(to, MouseButton::Left, Modifiers::default());
+        let before = read(&mut visual);
+        visual.simulate_event(ScrollWheelEvent {
+            position: to,
+            delta: ScrollDelta::Pixels(point(px(0.), px(-180.))),
+            ..Default::default()
+        });
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        let after = read(&mut visual);
+        assert_eq!(after.0 - before.0, px(180.));
+        assert_eq!(after.1 - before.1, 180.);
+        assert_eq!(visual.debug_bounds(selector).unwrap().center().y, to.y);
+        visual.simulate_mouse_up(to, MouseButton::Left, Modifiers::default());
+        window
+            .update(&mut visual, |shell, _, _| {
+                let projects = &shell.workspace.projects;
+                let moved = projects.iter().position(|id| id.ends_with("-02")).unwrap();
+                assert!(projects[moved - 1].ends_with("-08"));
+                assert!(projects[moved + 1].ends_with("-09"));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn dropping_a_tree_block_keeps_the_plate_on_the_first_frame(cx: &mut TestAppContext) {
+        use gpui::{Modifiers, MouseButton, point};
+
+        let (window, mut visual, _, _) = tree_window(cx);
+        let from = visual
+            .debug_bounds("tree-project-/work/another-project")
+            .unwrap()
+            .center();
+        window
+            .update(&mut visual, |_, _, cx| cx.set_reduce_motion(false))
+            .unwrap();
+        visual.simulate_mouse_down(from, MouseButton::Left, Modifiers::default());
+        visual.simulate_mouse_move(
+            point(from.x, from.y + px(8.)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        visual.simulate_mouse_move(from, MouseButton::Left, Modifiers::default());
+        let plate = window
+            .update(&mut visual, |shell, _, _| shell.tree_lift_bounds().unwrap())
+            .unwrap();
+        visual.simulate_mouse_up(from, MouseButton::Left, Modifiers::default());
+        window
+            .update(&mut visual, |shell, _, _| {
+                assert_eq!(shell.tree_lift_bounds(), Some(plate));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_held_tree_drag_scrolls_at_both_edges_even_with_reduce_motion(cx: &mut TestAppContext) {
+        use gpui::{Modifiers, MouseButton, point};
+
+        let (window, mut visual, _, _) = tree_window(cx);
+        window
+            .update(&mut visual, |shell, _, cx| {
+                add_tree_drag_projects(shell, cx)
+            })
+            .unwrap();
+        visual.run_until_parked();
+        let from = visual
+            .debug_bounds("tree-project-/work/motion-project-00")
+            .unwrap()
+            .center();
+        let viewport = window
+            .update(&mut visual, |shell, _, _| shell.tree.viewport_bounds())
+            .unwrap();
+        let bottom = point(from.x, viewport.bottom() - px(2.));
+        let top = point(from.x, viewport.top() + px(2.));
+        visual.simulate_mouse_down(from, MouseButton::Left, Modifiers::default());
+        visual.simulate_mouse_move(bottom, MouseButton::Left, Modifiers::default());
+        let advance = |visual: &mut gpui::VisualTestContext| {
+            window
+                .update(visual, |shell, _, cx| {
+                    let now = Instant::now();
+                    shell.advance_tree_rail_frame(now, cx);
+                    shell.advance_tree_rail_frame(now + Duration::from_millis(24), cx);
+                    -shell.tree.list.scroll_px_offset_for_scrollbar().y
+                })
+                .unwrap()
+        };
+        let down = advance(&mut visual);
+        assert!(down > px(0.));
+        visual.simulate_mouse_move(top, MouseButton::Left, Modifiers::default());
+        let up = advance(&mut visual);
+        assert!(up < down);
+        visual.simulate_mouse_up(top, MouseButton::Left, Modifiers::default());
+        assert_eq!(advance(&mut visual), up);
     }
 
     #[gpui::test]
