@@ -1301,6 +1301,31 @@ mod tests {
     }
 
     #[gpui::test]
+    fn only_the_tree_layout_uses_the_tree_mono_heading(cx: &mut TestAppContext) {
+        use gpui::{VisualTestContext, px, size};
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (window, _, _) = crate::shell::tests::window(cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        visual.simulate_resize(size(px(1400.), px(900.)));
+        for (layout, height) in [
+            (NavigationLayout::Tree, 26.),
+            (NavigationLayout::Focused, 28.),
+            (NavigationLayout::Classic, 30.),
+        ] {
+            window
+                .update(visual, |shell, _, cx| {
+                    shell.workspace.project_rail_open = true;
+                    shell.workspace.sidebar_visible = true;
+                    shell.set_navigation_layout(layout, cx);
+                })
+                .unwrap();
+            visual.run_until_parked();
+            let heading = visual.debug_bounds("sidebar-mono-heading").expect("Mono heading");
+            assert_eq!(heading.size.height, px(height));
+        }
+    }
+
+    #[gpui::test]
     fn needs_you_uses_a_neutral_empty_state_and_discloses_requests(cx: &mut TestAppContext) {
         use monocode_core::agent_status::Ask;
         let (window, id, _) = crate::shell::tests::window(cx);

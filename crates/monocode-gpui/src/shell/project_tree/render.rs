@@ -175,7 +175,7 @@ impl Shell {
             TreeRow::Reveal { key, rows } => return self.tree_reveal(key, rows, cx),
             TreeRow::Monos => self.monos.clone().map_or_else(
                 || div().into_any(),
-                |monos| monos.update(cx, |monos, cx| monos.rail(None, cx)),
+                |monos| monos.update(cx, |monos, cx| monos.tree_rail(tree_section_heading("Monos"), cx)),
             ),
             TreeRow::Header(ProjectEntry::Heading(name)) => self.tree_heading(name, cx),
             TreeRow::Header(ProjectEntry::Group(group)) => {
@@ -254,16 +254,7 @@ impl Shell {
     }
 
     fn tree_heading(&mut self, name: &'static str, cx: &mut Context<Self>) -> AnyElement {
-        div()
-            .flex()
-            .items_center()
-            .min_h(px(26.))
-            .pl(px(6.))
-            .gap_1()
-            .text_size(px(10.))
-            .font_weight(FontWeight::SEMIBOLD)
-            .text_color(content(0.45))
-            .child(div().flex_1().child(name.to_uppercase()))
+        tree_section_heading(name)
             .when(name == "Projects", |heading| {
                 heading.child(self.sidebar_filter_button(cx)).child(
                     icon_button("tree-project-add", "Add a project or group", "plus").on_click(
@@ -1177,6 +1168,27 @@ impl Shell {
 
 pub(super) fn needs_you_color(count: usize) -> gpui::Hsla {
     if count == 0 { content(0.4) } else { warning_color() }
+}
+
+fn tree_section_heading(name: &str) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .min_h(px(26.))
+        .pl(px(6.))
+        .gap_1()
+        .child(tree_heading_text(name))
+}
+
+fn tree_heading_text(name: &str) -> gpui::Div {
+    div()
+        .flex_1()
+        .min_w_0()
+        .truncate()
+        .text_size(px(10.))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(content(0.45))
+        .child(name.to_uppercase())
 }
 
 fn tree_caption(text: impl Into<SharedString>, color: gpui::Hsla) -> gpui::Div {
