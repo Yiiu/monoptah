@@ -51,6 +51,10 @@ tree-sitter-zig = "1.1"
 # Settings → Mobile draws the pairing code from the module matrix.
 qrcode = { version = "0.14", default-features = false }
 
+[target.'cfg(windows)'.dependencies]
+raw-window-handle = "0.6"
+windows = { version = "0.62", features = ["Win32_Graphics_Gdi", "Win32_Media_Audio", "Win32_System_Com", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+
 [build-dependencies]
 embed-resource = "3"
 
