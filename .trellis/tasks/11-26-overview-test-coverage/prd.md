@@ -24,5 +24,27 @@ Parent: `11-25-agent-overview`。开工前先读父任务的 `handoff.md`。这�
 ## Acceptance Criteria
 
 - [ ] 上面 6 组测试全部加上，并且在 Linux CI 上通过。
-- [ ] 三种外观的截图已经存档，发现的问题都已修复，或者已经写明原因暂不修。
-- [ ] 没有为了让测试通过而放宽任何断言。
+- [x] 三种外观的截图已经存档，发现的问题都已修复，或者已经写明原因暂不修。
+- [x] 没有为了让测试通过而放宽任何断言。
+
+## Windows 外观核对
+
+2026-11-26 在 Windows 11 上用 Rust 1.98.1 启动 Native Dev。独立的演示数据库包含运行、等你、完成未读和失败四种会话，以及同一工作树内的五个标签页。临时应用内探针通过 Appearance 设置事件切换外观，再调用侧栏收起和 Peek 的界面入口。用 PrintWindow 捕获对应 Native Dev 进程的窗口，每张图为 1336 × 828。
+
+| 外观 | 展开 Tree | 收起状态栏 | 左侧 Peek |
+| --- | --- | --- | --- |
+| 深色玻璃，侧栏 85%，玻璃正文开启 | [Tree](research/appearance-check/dark-glass-tree.png) | [状态栏](research/appearance-check/dark-glass-status-bar.png) | [Peek](research/appearance-check/dark-glass-peek.png) |
+| 深色不透明，侧栏 100%，玻璃正文关闭 | [Tree](research/appearance-check/dark-solid-tree.png) | [状态栏](research/appearance-check/dark-solid-status-bar.png) | [Peek](research/appearance-check/dark-solid-peek.png) |
+| 浅色，侧栏 85%，玻璃正文关闭 | [Tree](research/appearance-check/light-tree.png) | [状态栏](research/appearance-check/light-status-bar.png) | [Peek](research/appearance-check/light-peek.png) |
+
+对照定稿核对了四种行状态、收起栏的项目汇总点、Peek 的角标边缘，以及共用的标签页图标。深色玻璃和深色不透明的正文同一位置分别采样为 `#151515` 和 `#0a0a0a`。九张截图的侧栏区域均采到主题定义的琥珀色和青色。浅色从深色的 `#fbbf24`、`#2dd4bf` 切换到 `#b45309`、`#0f766e`。Peek 核对使用了 `floating_fill()`，停靠的 Tree 与收起状态栏使用 `shell_fill()`。角标边缘沿用各自所在表面，所选行沿用该表面与选中底色的混合色。
+
+### 发现与处理
+
+- Focused 的徽标容器漏算后台 shell 小标签。已将独立小标签纳入显示条件，回归覆盖没有其他徽标的会话。
+- 第一轮截图带入了主机的工具更新卡片和用量页脚。重新捕获时只调整演示夹具，使用离线的 Hermes 会话，并在夹具中隐藏相应的更新提示。归档截图中的会话和提问均为演示内容。
+- 有标题的问题卡在 Tree 队列和行内会显示该卡片的标题。定稿示例使用问题正文。这次保留共享的通知摘要规则，避免把多问题卡片任意压缩成其中一个问题。
+
+### 本地检查
+
+Windows 的格式检查通过。Core 的 110 项原有测试通过，补齐假 ACP 会话的模式设置握手后，Hermes 回归定向重跑通过。GPUI 首轮 143 项通过。修正 Focused 徽标容器和 Mono 测试夹具的侧栏重绘后，两项定向重跑通过。严格 Clippy 报告了交接文档列出的八条原有 Windows 诊断。Linux CI 由 PR #22 验证。
