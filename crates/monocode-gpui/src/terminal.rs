@@ -105,6 +105,8 @@ impl Dimensions for GridSize {
 pub(crate) enum TerminalEvent {
     /// Title, foreground process or running state changed.
     Changed,
+    /// Output reached the launched program's terminal grid, at most once a second.
+    Output(u64),
     /// A launched program is running. Only `Terminal::launch` emits the rest,
     /// from the event task, so subscribe right after creating the entity.
     Started { at: Instant },
@@ -180,6 +182,7 @@ pub(crate) struct Terminal {
     shell_pid: u32,
     /// Created by `launch`: reports start, title and exit instead of a shell prompt.
     launched: bool,
+    last_output_at: Option<u64>,
     /// When the launched program started.
     pub started_at: Option<Instant>,
     spawn_error: Option<String>,
@@ -729,6 +732,7 @@ impl Terminal {
             master_fd,
             shell_pid,
             launched,
+            last_output_at: None,
             started_at: None,
             spawn_error: error,
             child_code: None,
@@ -758,9 +762,11 @@ impl Terminal {
 
     fn on_event(&mut self, event: TermEvent, cx: &mut Context<Self>) {
         match event {
-            TermEvent::Wakeup | TermEvent::MouseCursorDirty | TermEvent::CursorBlinkingChange => {
-                cx.notify()
+            TermEvent::Wakeup => {
+                self.note_output(monocode_core::time::now_ms(), cx);
+                cx.notify();
             }
+            TermEvent::MouseCursorDirty | TermEvent::CursorBlinkingChange => cx.notify(),
             TermEvent::PtyWrite(text) => self.write(text.into_bytes()),
             TermEvent::ColorRequest(index, format) => {
                 let colors = *self.term.lock().colors();
@@ -802,6 +808,17 @@ impl Terminal {
                 }
             }
             TermEvent::Title(_) | TermEvent::ResetTitle | TermEvent::Bell => {}
+        }
+    }
+
+    pub(crate) fn note_output(&mut self, at: u64, cx: &mut Context<Self>) {
+        if self.launched
+            && self
+                .last_output_at
+                .is_none_or(|last| at.saturating_sub(last) >= 1_000)
+        {
+            self.last_output_at = Some(at);
+            cx.emit(TerminalEvent::Output(at));
         }
     }
     fn child_exited(&mut self, code: Option<i32>, cx: &mut Context<Self>) {

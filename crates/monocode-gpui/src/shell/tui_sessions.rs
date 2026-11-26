@@ -185,6 +185,12 @@ impl Shell {
         self.automation_tui_event(id, event, cx);
         match event {
             TuiEvent::Started => {}
+            TuiEvent::Output => {
+                if self.terminal_busy(id, cx) {
+                    self.update_agent_status(id, None, cx);
+                }
+                return;
+            }
             TuiEvent::Busy(_) | TuiEvent::Exited(_) => {
                 use monocode_core::agent_status::Outcome;
                 let outcome = self

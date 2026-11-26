@@ -187,6 +187,14 @@ impl Shell {
         let local_stream = input.streaming && chat.is_some_and(|chat| !chat.is_remote());
         input.remote_waiting = remote_waiting;
         input.streaming |= remote_running || terminal_running;
+        if self.is_terminal(id) {
+            let output = self
+                .tui_sessions
+                .get(&id)
+                .and_then(|tui| tui.read(cx).last_output_at());
+            input.stale_applicable = output.is_some();
+            input.last_event_at = input.last_event_at.max(output.unwrap_or_default());
+        }
         let active = input.streaming || input.remote_waiting || input.wake_tasks > 0;
         let local = chat.is_some_and(|chat| !chat.is_remote()) || terminal_running;
         let outcome = external_outcome.or_else(|| chat.and_then(|chat| chat.agent_outcome));
