@@ -32,11 +32,31 @@ Windows 上窗口不在前台时，如果有会话需要你处理，你要能注
 
 ## Acceptance Criteria
 
-- [ ] 可移植的纯逻辑部分都有测试，并且能在 Linux 上运行：tag 解析（`Target::from_tag` 在 Windows 上启用）、5 秒去重、通知标题和正文的格式、角标图片的像素数据（数字字形和 "9+"）。
-- [ ] Windows 11 实机验证（结果写进 commit 正文或 PR 评论）：
+- [x] 可移植的纯逻辑部分都有测试，并且能在 Linux 上运行：tag 解析（`Target::from_tag` 在 Windows 上启用）、5 秒去重、通知标题和正文的格式、角标图片的像素数据（数字字形和 "9+"）。
+- [x] Windows 11 实机验证（结果写进 commit 正文或 PR 评论）：
   - 窗口在后台、有会话需要处理时，系统通知、角标、闪烁、提示音都出现；
   - 点「Open」进入对应会话，并且该会话算作已读；
   - 弹窗消失后，从通知中心点击仍然有效；
   - 记录任务栏是否把快捷方式和窗口分成两个按钮；
   - 开发版和正式版的通知设置互不影响。
 - [ ] `Cargo.lock` 已更新（CI 用 `--locked` 构建）；Linux 上的 clippy 和 Windows 上的 `cargo check` 都通过。
+
+## 验收记录
+
+2026-11-26 在 Windows 11 Sandbox 26100 上运行提交 `810c3068` 的 Native Dev 构建。两个测试实例使用独立会话库和模拟 Hermes ACP，一份带安装标记，另一份使用 Dev 身份。Sandbox 需要应用目录内的 VC++ 运行库，以及编译时源码路径下的三份 GPUI 调试着色器。
+
+| 要求 | Windows 11 观察结果 |
+|---|---|
+| 1. Toast、Open 和已读 | 后台收到 `Project · Windows attention fixture: two approvals`，正文为 `Allow the synthetic notification test?`。另一个会话的弹窗 Open 直接切入对应会话。第一条提醒在弹窗消失、会话结束后仍留在通知中心。点展开后的 Open 激活对应会话，SQLite 中 `seen_at` 从空变为该轮的结束时间。 |
+| 2. 任务栏角标 | 单个会话内两个待处理请求合计为 1，会话结束后降到 0 并清除。另一次测试中，待处理的会话增加时分别显示 2 和 3。 |
+| 3. 任务栏闪烁 | 后台批准请求到达后，运行中的窗口按钮显示橙红闪烁底色。点击弹窗 Open 回到会话后，底色消失，尚待处理的角标仍在。 |
+| 4. 提示音 | Windows 音频会话按应用 PID 模拟请求期间测得峰值 0.0530，生成的 `input.wav` 为 192044 字节。 |
+| 5. 去重 | 同一会话 1.21 秒内先后要求批准两件事，通知中心保留一条提示。 |
+| 6. 前台抑制 | 当前正在查看的会话出现批准请求，待处理角标从 1 更新为 2，系统没有弹窗，通知中心为空。 |
+| 7. 完成抑制 | 独立会话在后台完成，系统没有弹窗，通知中心为空，音频峰值为 0。两个其他会话仍在等待，角标留在 2。 |
+| 8. 身份与独立设置 | 两个 Windows 发送方分别注册为 `com.monoptah.native.dev` 和 `com.monoptah.native`。在 Windows 通知设置里关掉 Dev 项，正式身份项保持开启。 |
+| 9. 现有规则 | 发送路径沿用已有通知、声音与项目静音设置，macOS 后端沿用原实现。 |
+
+任务栏实测已确认未标记 AUMID 的 `Monoptah Fixture.lnk` 出现在固定列表。任务栏显示该快捷方式和另一个带数字角标的运行中窗口按钮。这个测试使用带安装标记的 Native Dev 构建和按现有 NSIS 方式创建的快捷方式。
+
+Windows 上 `cargo +1.98.1 fmt --all`、`cargo +1.98.1 ncheck -p monocode-gpui --all-targets`、`cargo +1.98.1 ntest -p monocode-gpui --bin monocode-gpui -- notifications:: --test-threads=1` 和 `cargo +1.98.1 nbuild -p monocode-gpui --bin monocode-gpui` 均以状态码 0 结束。通知测试通过 14 项，PCM 独立测试通过 1 项。Linux clippy 由 PR CI 验证。
