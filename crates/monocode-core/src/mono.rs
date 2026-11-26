@@ -268,6 +268,10 @@ impl Mono {
         self.projects
             .retain(|p| !p.trim().is_empty() && seen.insert(crate::files::path_key(p)));
     }
+
+    pub fn prune_decisions(&mut self, now: u64) {
+        cards::prune_decisions(&mut self.decision_cards, now);
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -352,6 +356,18 @@ impl Roster {
         });
         for mono in &mut roster.monos {
             mono.normalize();
+            if !mono.decision_cards.is_empty() {
+                let session = mono
+                    .session_id
+                    .map(|id| store.mono_session(id))
+                    .transpose()?
+                    .flatten();
+                if session.is_some_and(|session| session.archived) {
+                    mono.decision_cards.clear();
+                } else {
+                    mono.prune_decisions(crate::time::now_ms());
+                }
+            }
         }
         Ok(roster)
     }

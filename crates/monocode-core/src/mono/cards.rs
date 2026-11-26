@@ -3,6 +3,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashSet};
 
+const MAX_OPTIONS: usize = 12;
+const MAX_DECISIONS: usize = 200;
+const ANSWER_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+
 /// Native roster metadata. Answers and their user message are saved together.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -10,6 +14,30 @@ pub struct DecisionRecord {
     pub question: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub answers: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<u64>,
+}
+
+pub(super) fn prune_decisions(records: &mut BTreeMap<String, DecisionRecord>, now: u64) {
+    records.retain(|_, card| {
+        card.answers.is_empty()
+            || card
+                .updated_at
+                .is_none_or(|at| now.saturating_sub(at) < ANSWER_RETENTION_MS)
+    });
+    if records.len() > MAX_DECISIONS {
+        let mut by_recency: Vec<_> = records.iter().collect();
+        // Keep pending decisions ahead of answered history when the cap is reached.
+        by_recency.sort_by_key(|(id, card)| (card.answers.is_empty(), card.updated_at, *id));
+        let remove: Vec<_> = by_recency
+            .into_iter()
+            .take(records.len() - MAX_DECISIONS)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in remove {
+            records.remove(&id);
+        }
+    }
 }
 
 pub fn question(card: &Value) -> Option<Question> {
@@ -131,6 +159,11 @@ pub fn parse(v: &Value) -> Result<Value, String> {
                 .and_then(Value::as_array)
                 .filter(|options| !options.is_empty())
                 .ok_or("Provide at least one option")?;
+            if options.len() > MAX_OPTIONS {
+                return Err(format!(
+                    "choices card supports at most {MAX_OPTIONS} options"
+                ));
+            }
             let question = v
                 .get("question")
                 .map(|_| text(v, "question", 500))
@@ -225,6 +258,68 @@ pub fn pull_request(cwd: &str, repo: Option<&str>, number: u64) -> Result<Value,
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn choice_options_are_capped_with_an_explicit_error() {
+        let options: Vec<_> = (1..=12).map(|n| n.to_string()).collect();
+        assert!(parse(&json!({"type":"choices","options":options})).is_ok());
+        let options: Vec<_> = (1..=13).map(|n| n.to_string()).collect();
+        assert_eq!(
+            parse(&json!({"type":"choices","options":options})).unwrap_err(),
+            "choices card supports at most 12 options"
+        );
+    }
+
+    #[test]
+    fn loading_a_roster_clears_decisions_owned_by_archived_sessions() {
+        let store = crate::store::Store::open(std::path::Path::new(":memory:")).unwrap();
+        let id = store.create("claude", "/repo").unwrap().id;
+        store.set_archived(id, true).unwrap();
+        let mut roster = crate::mono::Roster::default();
+        let mono = roster.create(vec![]).id.clone();
+        let entry = roster.get_mut(&mono).unwrap();
+        entry.session_id = Some(id);
+        entry
+            .decision_cards
+            .insert("card".into(), DecisionRecord::default());
+        roster.save(&store).unwrap();
+        assert!(crate::mono::Roster::load(&store)
+            .unwrap()
+            .get(&mono)
+            .unwrap()
+            .decision_cards
+            .is_empty());
+    }
+
+    #[test]
+    fn keeps_recent_decisions_and_drops_expired_answered_history() {
+        let mut records: BTreeMap<_, _> = (0..=MAX_DECISIONS)
+            .map(|n| {
+                (
+                    format!("card-{n}"),
+                    DecisionRecord {
+                        answers: vec!["Yes".into()],
+                        updated_at: Some(n as u64 + ANSWER_RETENTION_MS),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        records.insert(
+            "old-answer".into(),
+            DecisionRecord {
+                answers: vec!["No".into()],
+                updated_at: Some(0),
+                ..Default::default()
+            },
+        );
+        records.insert("old-pending".into(), DecisionRecord::default());
+        prune_decisions(&mut records, ANSWER_RETENTION_MS + MAX_DECISIONS as u64);
+        assert_eq!(records.len(), MAX_DECISIONS);
+        assert!(!records.contains_key("old-answer"));
+        assert!(!records.contains_key("card-0"));
+        assert!(records.contains_key("old-pending"));
+        assert!(records.contains_key(&format!("card-{MAX_DECISIONS}")));
+    }
     #[test]
     fn cards_validate_fields_and_do_not_accept_arbitrary_links_or_commands() {
         assert!(parse(&json!({"type":"pr","repo":"owner/repo;echo x","number":1})).is_err());

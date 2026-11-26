@@ -472,13 +472,16 @@ impl Monos {
         let record = mono.decision_cards.entry(id.to_owned()).or_insert_with(|| {
             mono::cards::DecisionRecord {
                 question: question.clone(),
-                answers: Vec::new(),
+                ..Default::default()
             }
         });
         if !record.answers.is_empty() {
             return Ok(());
         }
         record.answers = answers;
+        let now = monocode_core::time::now_ms();
+        record.updated_at = Some(now);
+        mono.prune_decisions(now);
         let mono_id = mono.id.clone();
         // The same roster save holds the answer and its queued user message.
         self.enqueue(&mono_id, text, Vec::new(), false, cx);

@@ -51,6 +51,12 @@ pub fn update<T>(root: &Path, id: &str, change: impl Fn(&mut State) -> T) -> Res
             .and_then(|t| serde_json::from_str(t).ok())
             .unwrap_or_default();
         let result = change(&mut state);
+        for snapshot in [&mut state.patrol, &mut state.pending_patrol]
+            .into_iter()
+            .flatten()
+        {
+            snapshot.exclude_archived();
+        }
         let text = serde_json::to_string_pretty(&state).map_err(|e| e.to_string())? + "\n";
         match files::save(root, id, None, "heartbeat.json", &text, Some(&file.hash)) {
             Ok(_) => return Ok(result),
@@ -61,7 +67,11 @@ pub fn update<T>(root: &Path, id: &str, change: impl Fn(&mut State) -> T) -> Res
     Err("Heartbeat state kept changing; try again".into())
 }
 impl State {
-    pub fn observe_patrol(&mut self, snapshot: patrol::Snapshot) -> Vec<patrol::Change> {
+    pub fn observe_patrol(&mut self, mut snapshot: patrol::Snapshot) -> Vec<patrol::Change> {
+        snapshot.exclude_archived();
+        if let Some(previous) = &mut self.patrol {
+            previous.exclude_archived();
+        }
         let Some(previous) = &self.patrol else {
             self.patrol = Some(snapshot);
             return Vec::new();
@@ -543,6 +553,33 @@ mod tests {
             text: text.into(),
             first,
             sent_at: None,
+        }
+    }
+
+    #[test]
+    fn heartbeat_file_never_keeps_archived_patrol_sessions() {
+        let root = tempfile::tempdir().unwrap();
+        let mut snapshot = patrol::Snapshot::default();
+        let mut archived = patrol::Session {
+            title: "Archived".into(),
+            project: "/repo".into(),
+            worktree: None,
+            state: patrol::State::Completed,
+            completed_at: None,
+            summary: None,
+            archived: true,
+        };
+        snapshot.sessions.insert(1, archived.clone());
+        archived.archived = false;
+        snapshot.sessions.insert(2, archived);
+        update(root.path(), "mono", |state| {
+            state.patrol = Some(snapshot.clone());
+            state.pending_patrol = Some(snapshot.clone());
+        })
+        .unwrap();
+        let restored = load(root.path(), "mono").unwrap();
+        for snapshot in [restored.patrol.unwrap(), restored.pending_patrol.unwrap()] {
+            assert_eq!(snapshot.sessions.keys().copied().collect::<Vec<_>>(), [2]);
         }
     }
 

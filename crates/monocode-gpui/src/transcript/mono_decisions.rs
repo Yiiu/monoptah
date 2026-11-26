@@ -56,7 +56,7 @@ fn legacy_records(
                 .entry(card.id.clone())
                 .or_insert_with(|| DecisionRecord {
                     question: card.title.clone(),
-                    answers: Vec::new(),
+                    ..Default::default()
                 });
             offers.push(card);
         } else if row.is_prompt() && row.first && !offers.is_empty() {

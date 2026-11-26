@@ -1280,12 +1280,15 @@ impl Monos {
                     } else if let Some(decision) = decision
                         && let Some(mono) = self.roster.get_mut(id)
                     {
+                        let now = monocode_core::time::now_ms();
                         mono.decision_cards.entry(decision.id).or_insert(
                             mono::cards::DecisionRecord {
                                 question: decision.title,
                                 answers: Vec::new(),
+                                updated_at: Some(now),
                             },
                         );
+                        mono.prune_decisions(now);
                     } else if let Some(body) = body {
                         let session = view.read(cx).summary.id;
                         cx.emit(NotificationPosted { session, body });

@@ -86,6 +86,10 @@ pub enum Change {
 }
 
 impl Snapshot {
+    pub(super) fn exclude_archived(&mut self) {
+        self.sessions.retain(|_, session| !session.archived);
+    }
+
     pub fn changes_from(&self, previous: &Self) -> Vec<Change> {
         let mut changes = Vec::new();
         for (&id, session) in &self.sessions {

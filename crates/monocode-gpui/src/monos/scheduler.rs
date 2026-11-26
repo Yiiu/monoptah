@@ -1507,7 +1507,9 @@ impl Monos {
             .map(|m| {
                 let sessions = views
                     .iter()
-                    .filter(|view| m.works_on(&view.project) && !skip.contains(&view.id))
+                    .filter(|view| {
+                        !view.archived && m.works_on(&view.project) && !skip.contains(&view.id)
+                    })
                     .map(|view| {
                         let at = match view.activity {
                             monocode_core::agent_status::Activity::Done { at, .. } => Some(at),
