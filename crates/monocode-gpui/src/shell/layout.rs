@@ -183,6 +183,9 @@ impl Shell {
         if layout == self.workspace.navigation_layout() {
             return;
         }
+        if self.workspace.tree_layout() {
+            self.settle_tree_unread_now();
+        }
         // Someone leaving the original layout before answering the new-layout
         // notice has never picked a frame, so they land on the boxy default.
         // Those who already went through it keep the frame they had.
@@ -1151,7 +1154,14 @@ mod tests {
         for classic in [false, true] {
             window
                 .update(visual, |shell, _, cx| {
-                    shell.workspace.classic_layout = classic;
+                    shell.set_navigation_layout(
+                        if classic {
+                            NavigationLayout::Classic
+                        } else {
+                            NavigationLayout::Focused
+                        },
+                        cx,
+                    );
                     assert!(
                         !shell.workspace.right_panel_open,
                         "opening a Mono respects the session's closed sidebar"
