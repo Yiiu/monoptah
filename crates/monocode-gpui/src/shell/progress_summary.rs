@@ -188,19 +188,24 @@ struct ArchiveTarget {
 }
 
 impl Shell {
-    pub(super) fn start_worktree_archive_watch(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn sync_worktree_archive_watch(&mut self, cx: &mut Context<Self>) {
+        if !self.window_active {
+            self.worktree_archive.watcher = None;
+            return;
+        }
         if cfg!(test) || self.worktree_archive.watcher.is_some() {
             return;
         }
+        self.check_worktree_archives(cx);
         self.worktree_archive.watcher = Some(cx.spawn(async move |shell, cx| {
-            let mut delay = Duration::from_secs(3);
             loop {
-                cx.background_executor().timer(delay).await;
+                cx.background_executor()
+                    .timer(WORKTREE_ARCHIVE_INTERVAL)
+                    .await;
                 let alive = shell.update(cx, |this, cx| this.check_worktree_archives(cx));
                 if alive.is_err() {
                     break;
                 }
-                delay = WORKTREE_ARCHIVE_INTERVAL;
             }
         }));
     }
@@ -235,8 +240,12 @@ impl Shell {
         })
     }
 
+    fn can_probe_worktree_archives(&self) -> bool {
+        self.window_active && self.workspace.tree_layout() && !self.worktree_archive.probing
+    }
+
     fn check_worktree_archives(&mut self, cx: &mut Context<Self>) {
-        if !self.workspace.tree_layout() || self.worktree_archive.probing {
+        if !self.can_probe_worktree_archives() {
             return;
         }
         let mut projects = HashMap::<String, Vec<ArchiveTarget>>::new();
@@ -463,5 +472,28 @@ impl Shell {
             });
         })
         .detach();
+    }
+}
+
+#[cfg(test)]
+mod worktree_watch_tests {
+    #[gpui::test]
+    fn the_tree_worktree_watcher_pauses_while_the_window_is_inactive(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, _, _) = crate::shell::tests::window(cx);
+        window
+            .update(cx, |shell, _, _| {
+                shell
+                    .workspace
+                    .set_navigation_layout(crate::workspace::NavigationLayout::Tree);
+                shell.window_active = false;
+                assert!(!shell.can_probe_worktree_archives());
+                shell.window_active = true;
+                assert!(shell.can_probe_worktree_archives());
+                shell.worktree_archive.probing = true;
+                assert!(!shell.can_probe_worktree_archives());
+            })
+            .unwrap();
     }
 }

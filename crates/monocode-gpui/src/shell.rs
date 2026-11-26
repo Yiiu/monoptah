@@ -865,7 +865,7 @@ pub(crate) struct Shell {
     live_marks: HashMap<i64, Entity<SessionMark>>,
     live_agents_expanded: bool,
     /// Repaints the live agents card when one of its elapsed times changes.
-    live_tick: Option<gpui::Task<()>>,
+    live_tick: Option<(std::time::Instant, gpui::Task<()>)>,
     busy_sessions: HashSet<i64>,
     notification_state: notifications::State,
     github_star: github_star::State,
@@ -1669,7 +1669,6 @@ impl Shell {
             }));
         this.monos = Some(monos);
         this.bind_notices(cx);
-        this.start_worktree_archive_watch(cx);
         this.init_app_bridge(cx);
         let telegram_dir = locked(&this.store)
             .ok()
@@ -9734,6 +9733,7 @@ impl Render for Shell {
                     window.focus(&target, cx);
                 }));
             self.window_active = window.is_window_active();
+            self.sync_worktree_archive_watch(cx);
             self.sync_cloud_chip_window(cx);
             let chip = self.usage_footer.read(cx).cloud_chip().clone();
             // The chip is an item of the footer's terminal controls group, which the shell lays
@@ -9759,6 +9759,7 @@ impl Render for Shell {
             self.observations
                 .push(cx.observe_window_activation(window, |this, window, cx| {
                     this.window_active = window.is_window_active();
+                    this.sync_worktree_archive_watch(cx);
                     this.sync_cloud_chip_window(cx);
                     if this.window_active {
                         this.refresh_visible_seen(cx);

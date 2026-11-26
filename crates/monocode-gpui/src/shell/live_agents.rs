@@ -5,7 +5,6 @@ use monocode_core::agent_status::Activity;
 
 const LIVE_AGENT_MIN: usize = 2;
 const LIVE_AGENT_CAP: usize = 4;
-const STATUS_TICK: std::time::Duration = std::time::Duration::from_secs(15);
 
 struct LiveAgent {
     id: i64,
@@ -80,29 +79,33 @@ impl Shell {
     }
 
     pub(super) fn sync_agent_status_tick(&mut self, cx: &mut Context<Self>) {
-        if self.live_tick.is_some() || !self.has_running_status() {
+        let Some(delay) = self.status_tick_delay(monocode_core::time::now_ms()) else {
+            self.live_tick = None;
+            return;
+        };
+        let at = std::time::Instant::now() + delay;
+        if self
+            .live_tick
+            .as_ref()
+            .is_some_and(|(pending, _)| *pending <= at)
+        {
             return;
         }
-        self.live_tick = Some(cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor().timer(STATUS_TICK).await;
-                let result = this.update(cx, |this, cx| {
+        self.live_tick = Some((
+            at,
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(delay).await;
+                let _ = this.update(cx, |this, cx| {
+                    this.live_tick = None;
                     this.refresh_status_clocks(cx);
                     if crate::pulse::app_active(cx) {
                         this.invalidate_chrome(cx);
                         cx.notify();
                     }
-                    let ticking = this.has_running_status();
-                    if !ticking {
-                        this.live_tick = None;
-                    }
-                    ticking
+                    this.sync_agent_status_tick(cx);
                 });
-                if !matches!(result, Ok(true)) {
-                    break;
-                }
-            }
-        }));
+            }),
+        ));
     }
 
     pub(super) fn live_agents_preview(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {

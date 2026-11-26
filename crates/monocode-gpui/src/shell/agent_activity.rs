@@ -122,34 +122,20 @@ impl Shell {
         self.progress_summary_jobs.remove(&id);
     }
 
-    pub(super) fn has_running_status(&self) -> bool {
-        self.agent_statuses.values().any(|status| {
-            matches!(
-                status.activity,
-                Activity::Running { stale: false, .. }
-                    | Activity::BackgroundWait {
-                        reason: agent_status::Wait::UsageLimit { .. },
-                        ..
-                    }
-            )
-        })
+    pub(super) fn status_tick_delay(&self, now: u64) -> Option<std::time::Duration> {
+        self.agent_statuses
+            .values()
+            .filter_map(|status| status_tick_ms(&status.activity, now))
+            .min()
+            .map(std::time::Duration::from_millis)
     }
 
     pub(super) fn refresh_status_clocks(&mut self, cx: &mut Context<Self>) {
+        let now = now_ms();
         let running: Vec<_> = self
             .agent_statuses
             .iter()
-            .filter_map(|(&id, status)| {
-                matches!(
-                    status.activity,
-                    Activity::Running { stale: false, .. }
-                        | Activity::BackgroundWait {
-                            reason: agent_status::Wait::UsageLimit { .. },
-                            ..
-                        }
-                )
-                .then_some(id)
-            })
+            .filter_map(|(&id, status)| status_tick_ms(&status.activity, now).map(|_| id))
             .collect();
         for id in running {
             self.refresh_status(id, cx);
@@ -345,7 +331,9 @@ impl Shell {
         let was_unread = self.agent_status(id).unread_done();
         self.tree_note_unread(id, was_unread, &status.activity, cx);
         self.agent_statuses.insert(id, status);
-        self.sync_agent_status_tick(cx);
+        if changed {
+            self.sync_agent_status_tick(cx);
+        }
         if busy_changed || animation_changed {
             self.push_inbox_busy(cx);
         }
@@ -412,5 +400,46 @@ impl Shell {
             .activity_writes
             .try_send(Write::Seen(id, end.at, now_ms().max(end.at)));
         self.update_agent_status(id, None, cx);
+    }
+}
+
+fn status_tick_ms(activity: &Activity, now: u64) -> Option<u64> {
+    match activity {
+        Activity::Running { stale: false, .. } => Some(15_000),
+        Activity::BackgroundWait {
+            reason: agent_status::Wait::UsageLimit { resume_at },
+            ..
+        } => Some(match resume_at.saturating_sub(now) {
+            600_001.. => 60_000,
+            60_000..=600_000 => 15_000,
+            _ => 1_000,
+        }),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn long_usage_limits_wake_by_the_minute_until_the_reset_approaches() {
+        let resume_at = 75 * 60_000;
+        let state = Activity::BackgroundWait {
+            reason: agent_status::Wait::UsageLimit { resume_at },
+            since: 0,
+        };
+        let mut now = 0;
+        let mut long_wakes = 0;
+        while resume_at - now > 600_000 {
+            let delay = status_tick_ms(&state, now).unwrap();
+            assert_eq!(delay, 60_000);
+            now += delay;
+            long_wakes += 1;
+        }
+        assert_eq!(long_wakes, 65);
+        assert_eq!(status_tick_ms(&state, now), Some(15_000));
+        assert_eq!(status_tick_ms(&state, resume_at - 59_000), Some(1_000));
+        assert_eq!(status_tick_ms(&Activity::Idle, now), None);
     }
 }

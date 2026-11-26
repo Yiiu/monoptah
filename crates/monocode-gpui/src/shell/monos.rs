@@ -1,5 +1,11 @@
 use super::*;
 use monocode_core::agent::Settings;
+
+#[cfg(test)]
+std::thread_local! {
+    static MONO_SESSION_VIEW_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub(crate) struct MonoSession {
     pub id: i64,
     pub title: String,
@@ -86,6 +92,8 @@ impl Shell {
         Some(format!("{} {}", mark.kind.title(), mark.codespace))
     }
     pub(crate) fn mono_session_views(&self, cx: &App) -> Vec<MonoSession> {
+        #[cfg(test)]
+        MONO_SESSION_VIEW_BUILDS.with(|count| count.set(count.get() + 1));
         // A Mono's launches are usually hidden from the sidebar, so they are
         // known by summary only, outside the sidebar's order.
         let listed: HashSet<_> = self.order.iter().collect();
@@ -96,35 +104,42 @@ impl Shell {
         self.order
             .iter()
             .chain(hidden)
-            .map(|&id| {
-                let metadata = self.session_metadata(id, cx);
-                let live = self.sessions.get(&id).map(|v| v.read(cx));
-                let launching =
-                    live.is_some_and(|v| v.mono_external_pending() || v.cloud_launch_pending());
-                let status = self.agent_status(id);
-                MonoSession {
-                    id,
-                    title: metadata.summary.title.clone(),
-                    cwd: metadata.summary.cwd.clone(),
-                    project: self.project_of(id, &metadata.summary.cwd).to_owned(),
-                    busy: status.is_busy() || launching,
-                    unsettled: metadata.busy
-                        || launching
-                        || live.is_some_and(Conversation::mono_stopping),
-                    activity: status.activity.clone(),
-                    has_messages: metadata.summary.has_messages,
-                    archived: metadata.summary.archived,
-                    updated_at: metadata.summary.updated_at,
-                    needs_input: status.needs_you(),
-                    start_failed: self.cloud_start_failed(id)
-                        || live.is_some_and(|v| v.cloud_start_failed()),
-                    branch: live.and_then(|v| v.branch_name()).map(str::to_owned),
-                    worktree: self.session_worktrees.get(&id).and_then(Clone::clone),
-                    model: live.map(|v| v.mono_model_label()).unwrap_or_default(),
-                    cloud: self.is_cloud(id),
-                }
-            })
+            .filter_map(|&id| self.mono_session_view(id, cx))
             .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mono_session_view_build_count() -> usize {
+        MONO_SESSION_VIEW_BUILDS.with(std::cell::Cell::get)
+    }
+
+    pub(crate) fn mono_session_view(&self, id: i64, cx: &App) -> Option<MonoSession> {
+        let live = self.sessions.get(&id).map(|v| v.read(cx));
+        if live.is_none() && !self.session_summaries.contains_key(&id) {
+            return None;
+        }
+        let metadata = self.session_metadata(id, cx);
+        let launching = live.is_some_and(|v| v.mono_external_pending() || v.cloud_launch_pending());
+        let status = self.agent_status(id);
+        Some(MonoSession {
+            id,
+            title: metadata.summary.title.clone(),
+            cwd: metadata.summary.cwd.clone(),
+            project: self.project_of(id, &metadata.summary.cwd).to_owned(),
+            busy: status.is_busy() || launching,
+            unsettled: metadata.busy || launching || live.is_some_and(Conversation::mono_stopping),
+            activity: status.activity.clone(),
+            has_messages: metadata.summary.has_messages,
+            archived: metadata.summary.archived,
+            updated_at: metadata.summary.updated_at,
+            needs_input: status.needs_you(),
+            start_failed: self.cloud_start_failed(id)
+                || live.is_some_and(|v| v.cloud_start_failed()),
+            branch: live.and_then(|v| v.branch_name()).map(str::to_owned),
+            worktree: self.session_worktrees.get(&id).and_then(Clone::clone),
+            model: live.map(|v| v.mono_model_label()).unwrap_or_default(),
+            cloud: self.is_cloud(id),
+        })
     }
     /// Load the sessions a Mono launched that the sidebar hides, so its panel
     /// can list and open them. They stay out of the sidebar.
