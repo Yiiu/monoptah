@@ -97,6 +97,10 @@ impl Shell {
         }
         self.sidebar_peek = Some(SidebarPeek::new(open, current, cx.reduce_motion()));
         self.peek_animating = true;
+        if self.workspace.tree_layout() {
+            // Opening with reduced motion can use the cached frame immediately.
+            self.notify_sidebar(cx);
+        }
         cx.notify();
     }
 
@@ -264,9 +268,10 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        // Glass blurs the dimmed workspace under a faint wash; otherwise the
-        // panel takes the window's own surface.
-        let glass = self.window_glass == Some(true) && !is_light();
+        // Tree uses its floating surface in every appearance, including when
+        // the rest of the window is glass. The badge rim takes this same fill.
+        let tree = self.workspace.tree_layout();
+        let glass = !tree && self.window_glass == Some(true) && !is_light();
         // The blur marker carries no alpha for opacity to fade, so the blur
         // itself eases with the panel; at full strength to the last frame it
         // would vanish all at once as the peek closes.
@@ -301,7 +306,7 @@ impl Shell {
                 BoxShadow::new(px(0.), px(2.), rgba(0x00000029).into()).blur_radius(px(6.)),
             ])
             .when(!glass, |d| {
-                d.bg(if self.workspace.tree_layout() {
+                d.bg(if tree {
                     floating_fill()
                 } else {
                     shell_fill()

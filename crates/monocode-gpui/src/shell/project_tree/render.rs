@@ -20,6 +20,7 @@ impl Shell {
             has_requests && !cx.reduce_motion(),
             Instant::now(),
         );
+        let plate = if self.sidebar_peek.is_some() { floating_fill() } else { shell_fill() };
         let lift = self.tree_lift_plate();
         div()
             .id("project-tree-sidebar")
@@ -59,7 +60,7 @@ impl Shell {
                     .child(
                         gpui::list(
                             self.tree.list.clone(),
-                            cx.processor(|this, index, _, cx| this.tree_list_row(index, cx)),
+                            cx.processor(move |this, index, _, cx| this.tree_list_row(index, plate, cx)),
                         )
                         .size_full(),
                     ),
@@ -113,12 +114,12 @@ impl Shell {
         Some(gpui::deferred(plate).with_priority(1).into_any())
     }
 
-    fn tree_list_row(&mut self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+    fn tree_list_row(&mut self, ix: usize, plate: gpui::Hsla, cx: &mut Context<Self>) -> AnyElement {
         let Some(row) = self.tree.rows.get(ix).cloned() else {
             return div().into_any();
         };
         let owner = self.tree.owners.get(ix).cloned().flatten();
-        let row = self.tree_row(row, cx);
+        let row = self.tree_row(row, plate, cx);
         let Some(owner) = owner else {
             return row;
         };
@@ -157,9 +158,10 @@ impl Shell {
         &mut self,
         key: String,
         rows: Vec<TreeRow>,
+        plate: gpui::Hsla,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let rows: Vec<_> = rows.into_iter().map(|row| self.tree_row(row, cx)).collect();
+        let rows: Vec<_> = rows.into_iter().map(|row| self.tree_row(row, plate, cx)).collect();
         self.tree
             .disclosures
             .get(&key)
@@ -167,12 +169,12 @@ impl Shell {
             .map_or_else(|| div().into_any(), IntoElement::into_any_element)
     }
 
-    fn tree_row(&mut self, row: TreeRow, cx: &mut Context<Self>) -> AnyElement {
+    fn tree_row(&mut self, row: TreeRow, plate: gpui::Hsla, cx: &mut Context<Self>) -> AnyElement {
         // A session row's spacing comes from its rail step's own padding, which the
         // rail is drawn through; a gap outside it would break the line between rows.
         let rail_row = matches!(row, TreeRow::Session { .. });
         let row = match row {
-            TreeRow::Reveal { key, rows } => return self.tree_reveal(key, rows, cx),
+            TreeRow::Reveal { key, rows } => return self.tree_reveal(key, rows, plate, cx),
             TreeRow::Monos => self.monos.clone().map_or_else(
                 || div().into_any(),
                 |monos| monos.update(cx, |monos, cx| monos.tree_rail(tree_section_heading("Monos"), cx)),
@@ -210,7 +212,7 @@ impl Shell {
                 orchestration,
                 ..
             } => {
-                let row = self.tree_session_row(id, branch, children, orchestration, cx);
+                let row = self.tree_session_row(id, branch, children, orchestration, plate, cx);
                 div()
                     .ml(px((f32::from(depth) - 1.).max(0.) * 12.))
                     .child(rails::step(last, row))
@@ -808,6 +810,7 @@ impl Shell {
         branch: Option<String>,
         children: usize,
         orchestration: bool,
+        plate: gpui::Hsla,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         if let Some(row) = self.rename_row(&session_groups::RenameTarget::Session(id), cx) {
@@ -890,11 +893,11 @@ impl Shell {
             }),
         };
         let edge_fill = if active || selected {
-            shell_fill().blend(content(0.10))
+            plate.blend(content(0.10))
         } else if hover {
-            shell_fill().blend(content(0.05))
+            plate.blend(content(0.05))
         } else {
-            shell_fill()
+            plate
         };
         let avatar = crate::session_mark::provider_activity_icon(
             &meta.summary.provider,
