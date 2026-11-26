@@ -71,8 +71,9 @@ enum TreeRow {
         open: bool,
     },
     Worktree {
+        project: String,
         path: String,
-        name: String,
+        branch: Option<String>,
         open: bool,
         counts: Counts,
     },
@@ -160,6 +161,10 @@ fn project_key(path: &str) -> String {
     format!("project:{path}")
 }
 
+fn group_key(id: &str) -> String {
+    format!("group:{id}")
+}
+
 fn section_key(project: &str, name: &str) -> String {
     format!("section:{project}:{name}")
 }
@@ -236,6 +241,7 @@ pub(super) struct TreeState {
     rows: Vec<TreeRow>,
     counts: HashMap<String, Counts>,
     requests: Vec<i64>,
+    request_disclosure: Disclosure,
     projects: HashMap<String, bool>,
     worktrees: HashSet<String>,
     sessions: HashSet<i64>,
@@ -274,6 +280,7 @@ impl TreeState {
             rows: Vec::new(),
             counts: HashMap::new(),
             requests: Vec::new(),
+            request_disclosure: Disclosure::new(false),
             projects: HashMap::new(),
             worktrees: HashSet::new(),
             sessions: HashSet::new(),
@@ -293,7 +300,8 @@ impl TreeState {
     /// Something in the tree is moving: a node opening or closing, or a row
     /// changing between unread and read.
     fn animating(&self, now: Instant) -> bool {
-        self.disclosures.values().any(|d| d.animating(now))
+        self.request_disclosure.animating(now)
+            || self.disclosures.values().any(|d| d.animating(now))
             || self.fades.values().any(|fade| fade.running(now))
     }
 
@@ -690,20 +698,30 @@ impl Shell {
         if self.workspace.preferences.monos {
             rows.push(TreeRow::Monos);
         }
-        for entry in self.tree_project_entries(self.tree_filtered()) {
-            let ProjectEntry::Project(path) = &entry else {
-                rows.push(TreeRow::Header(entry));
-                continue;
-            };
-            let ids = catalog.projects.get(path).map_or(&[][..], Vec::as_slice);
-            if ids.is_empty() && self.tree_filtered() {
-                continue;
+        let mut entries = self.tree_project_entries(true).into_iter().peekable();
+        while let Some(entry) = entries.next() {
+            match entry {
+                ProjectEntry::Group(id) => {
+                    let open = self.tree_group_open(&id);
+                    let key = group_key(&id);
+                    rows.push(TreeRow::Header(ProjectEntry::Group(id)));
+                    let mut projects = Vec::new();
+                    while matches!(entries.peek(), Some(ProjectEntry::Project(_))) {
+                        if let Some(ProjectEntry::Project(path)) = entries.next() {
+                            projects.push(path);
+                        }
+                    }
+                    self.tree_children(&mut rows, key, open, |rows| {
+                        for path in projects {
+                            self.tree_project_block(rows, path, catalog, cx);
+                        }
+                    });
+                }
+                ProjectEntry::Project(path) => {
+                    self.tree_project_block(&mut rows, path, catalog, cx)
+                }
+                heading => rows.push(TreeRow::Header(heading)),
             }
-            rows.push(TreeRow::Header(entry.clone()));
-            let open = self.tree_project_open(path);
-            self.tree_children(&mut rows, project_key(path), open, |rows| {
-                self.tree_project_rows(rows, path, ids, catalog, cx)
-            });
         }
         if !catalog.archived.is_empty() {
             rows.push(TreeRow::Archived(catalog.archived.len()));
@@ -716,6 +734,34 @@ impl Shell {
             });
         }
         rows
+    }
+
+    fn tree_group_open(&self, id: &str) -> bool {
+        self.tree_filtered()
+            || self
+                .workspace
+                .project_rail_groups
+                .iter()
+                .any(|group| group.id == id && !group.collapsed)
+    }
+
+    fn tree_project_block(
+        &self,
+        rows: &mut Vec<TreeRow>,
+        path: String,
+        catalog: &TreeCatalog,
+        cx: &App,
+    ) {
+        let ids = catalog.projects.get(&path).map_or(&[][..], Vec::as_slice);
+        if ids.is_empty() && self.tree_filtered() {
+            return;
+        }
+        let open = self.tree_project_open(&path);
+        let key = project_key(&path);
+        rows.push(TreeRow::Header(ProjectEntry::Project(path.clone())));
+        self.tree_children(rows, key, open, |rows| {
+            self.tree_project_rows(rows, &path, ids, catalog, cx);
+        });
     }
 
     /// Adds a node's rows under it. At rest they are list items of their own;
@@ -919,11 +965,22 @@ impl Shell {
                 self.tree_session_rows(rows, &ids, (2, true), Some(&key), catalog, cx)
             });
         }
-        let copies = catalog
+        let mut by_worktree: Vec<(String, Vec<i64>)> = Vec::new();
+        let mut known = HashMap::new();
+        for &id in &split.loose {
+            let copy = self.tree_session_worktree(id, path, cx);
+            let key = path_key(copy);
+            let index = *known.entry(key).or_insert_with(|| {
+                by_worktree.push((copy.to_owned(), Vec::new()));
+                by_worktree.len() - 1
+            });
+            by_worktree[index].1.push(id);
+        }
+        let Some(copies) = catalog
             .worktrees
             .get(path)
-            .filter(|copies| copies.len() > 1);
-        let Some(copies) = copies else {
+            .filter(|_| by_worktree.len() > 1)
+        else {
             self.tree_session_rows(
                 rows,
                 &split.loose,
@@ -935,30 +992,19 @@ impl Shell {
             return;
         };
         let copy_key = path_key(path);
-        let mut by_worktree: Vec<(String, Vec<i64>)> = Vec::new();
-        let mut known = HashMap::new();
-        for id in split.loose {
-            let copy = self.tree_session_worktree(id, path, cx);
-            let key = path_key(copy);
-            let index = *known.entry(key).or_insert_with(|| {
-                by_worktree.push((copy.to_owned(), Vec::new()));
-                by_worktree.len() - 1
-            });
-            by_worktree[index].1.push(id);
-        }
         by_worktree.sort_by_key(|(copy, _)| path_key(copy) != copy_key);
         for (copy, members) in by_worktree {
             let open = !self.tree.worktrees.contains(&copy) || self.tree_filtered();
             let counts = copies.get(&path_key(&copy)).copied().unwrap_or_default();
-            let name = members
+            let branch = members
                 .iter()
                 .filter(|&&id| !self.is_cloud(id))
-                .find_map(|id| self.tree_branch(*id, cx))
-                .unwrap_or_else(|| project_name(&copy));
+                .find_map(|id| self.tree_branch(*id, cx));
             let key = worktree_key(&copy);
             rows.push(TreeRow::Worktree {
+                project: path.to_owned(),
                 path: copy,
-                name,
+                branch,
                 open,
                 counts,
             });
@@ -1301,6 +1347,283 @@ mod tests {
         );
     }
 
+    #[gpui::test]
+    fn only_the_tree_layout_uses_the_tree_mono_heading(cx: &mut TestAppContext) {
+        use gpui::{VisualTestContext, px, size};
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (window, _, _) = crate::shell::tests::window(cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        visual.simulate_resize(size(px(1400.), px(900.)));
+        for (layout, height) in [
+            (NavigationLayout::Tree, 26.),
+            (NavigationLayout::Focused, 28.),
+            (NavigationLayout::Classic, 30.),
+        ] {
+            window
+                .update(visual, |shell, _, cx| {
+                    shell.workspace.project_rail_open = true;
+                    shell.workspace.sidebar_visible = true;
+                    shell.set_navigation_layout(layout, cx);
+                })
+                .unwrap();
+            visual.run_until_parked();
+            let heading = visual
+                .debug_bounds("sidebar-mono-heading")
+                .expect("Mono heading");
+            assert_eq!(heading.size.height, px(height));
+        }
+    }
+
+    #[gpui::test]
+    fn tree_peek_badges_take_the_floating_surface_in_every_appearance(cx: &mut TestAppContext) {
+        let (window, mut visual, _, _) = tree_window(cx);
+        for (theme, opacity) in [("dark", 85), ("dark", 100), ("light", 85)] {
+            window
+                .update(&mut visual, |shell, _, cx| {
+                    shell.workspace.preferences.theme = theme.into();
+                    shell.workspace.preferences.sidebar_opacity = opacity;
+                    shell.invalidate_chrome(cx);
+                    cx.notify();
+                })
+                .unwrap();
+            visual.refresh().unwrap();
+            window
+                .update(&mut visual, |shell, window, cx| {
+                    assert_eq!(shell.tree_badge_plate(), shell_fill());
+                    shell.toggle_primary_sidebar(window, cx);
+                    shell.set_peek(true, cx);
+                    assert!(shell.peek_open());
+                    assert_eq!(shell.tree_badge_plate(), floating_fill());
+                })
+                .unwrap();
+            visual.refresh().unwrap();
+            assert!(visual.debug_bounds("sidebar-peek").is_some());
+            window
+                .update(&mut visual, |shell, window, cx| {
+                    shell.toggle_primary_sidebar(window, cx);
+                    assert_eq!(shell.tree_badge_plate(), shell_fill());
+                })
+                .unwrap();
+        }
+    }
+
+    #[gpui::test]
+    fn tree_group_clicks_disclose_the_group_members(cx: &mut TestAppContext) {
+        let (window, mut visual, _, _) = tree_window(cx);
+        window
+            .update(&mut visual, |shell, _, cx| {
+                shell
+                    .workspace
+                    .project_rail_groups
+                    .push(crate::workspace::ProjectRailGroup {
+                        id: "release".into(),
+                        name: "Release".into(),
+                        ..Default::default()
+                    });
+                shell
+                    .workspace
+                    .project_rail_assignments
+                    .insert("/work/monocode".into(), "release".into());
+                shell.notify_sidebar(cx);
+            })
+            .unwrap();
+        visual.run_until_parked();
+        let header = visual
+            .debug_bounds("tree-group-release")
+            .expect("Tree group");
+        assert_eq!(header.size.height, px(30.));
+        visual.update(|_, cx| cx.set_reduce_motion(false));
+        visual.simulate_click(header.center(), Default::default());
+        window
+            .update(&mut visual, |shell, _, cx| {
+                let key = group_key("release");
+                assert!(!shell.tree_group_open("release"));
+                assert!(shell.tree.disclosing(&key, Instant::now()));
+                let rows = shell.tree_rows(&shell.tree_catalog(cx), cx);
+                assert!(rows.iter().any(|row| matches!(
+                    row, TreeRow::Reveal { key: k, rows } if k == &key && !rows.is_empty()
+                )));
+            })
+            .unwrap();
+        visual.simulate_click(header.center(), Default::default());
+        window
+            .update(&mut visual, |shell, _, _| {
+                assert!(shell.tree_group_open("release"));
+                assert!(shell.tree.disclosing(&group_key("release"), Instant::now()));
+            })
+            .unwrap();
+        visual.update(|_, cx| cx.set_reduce_motion(true));
+        visual.simulate_click(header.center(), Default::default());
+        window
+            .update(&mut visual, |shell, _, _| {
+                assert!(!shell.tree_group_open("release"));
+                assert!(!shell.tree.disclosing(&group_key("release"), Instant::now()));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn classic_group_headers_keep_their_geometry_and_toggle_in_place(cx: &mut TestAppContext) {
+        use gpui::{VisualTestContext, px, size};
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (window, _, _) = crate::shell::tests::window(cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        visual.simulate_resize(size(px(1400.), px(900.)));
+        window
+            .update(visual, |shell, _, cx| {
+                shell.workspace.project_rail_open = true;
+                shell.set_navigation_layout(NavigationLayout::Classic, cx);
+                shell
+                    .workspace
+                    .project_rail_groups
+                    .push(crate::workspace::ProjectRailGroup {
+                        id: "release".into(),
+                        name: "Release".into(),
+                        ..Default::default()
+                    });
+                shell
+                    .workspace
+                    .project_rail_assignments
+                    .insert("/work/monocode".into(), "release".into());
+                shell.projects_frame.update(cx, |_, cx| cx.notify());
+            })
+            .unwrap();
+        visual.run_until_parked();
+        let header = visual
+            .debug_bounds("rail-group-release")
+            .expect("Classic group");
+        assert_eq!(header.size.height, px(32.));
+        visual.simulate_click(header.center(), Default::default());
+        visual.run_until_parked();
+        assert_eq!(visual.debug_bounds("rail-group-release"), Some(header));
+        window
+            .update(visual, |shell, _, _| {
+                assert!(shell.workspace.project_rail_groups[0].collapsed);
+                assert!(shell.tree.disclosures.is_empty());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn needs_you_uses_a_neutral_empty_state_and_discloses_requests(cx: &mut TestAppContext) {
+        use monocode_core::agent_status::Ask;
+        let (window, id, _) = crate::shell::tests::window(cx);
+        window
+            .update(cx, |shell, _, cx| {
+                assert_eq!(render::needs_you_color(0), content(0.4));
+                assert_eq!(render::needs_you_color(1), warning_color());
+                for reduce_motion in [false, true] {
+                    cx.set_reduce_motion(reduce_motion);
+                    shell.agent_statuses.remove(&id);
+                    shell.tree_sidebar(cx);
+                    assert!(shell.tree.requests.is_empty());
+                    assert!(!shell.tree.request_disclosure.mounted(Instant::now()));
+                    shell.agent_statuses.insert(
+                        id,
+                        AgentStatus {
+                            activity: Activity::NeedsYou {
+                                kind: Ask::Question,
+                            },
+                            ..Default::default()
+                        },
+                    );
+                    shell.tree_sidebar(cx);
+                    assert_eq!(shell.tree.requests, [id]);
+                    let now = Instant::now();
+                    assert!(shell.tree.request_disclosure.mounted(now));
+                    assert_eq!(shell.tree.request_disclosure.animating(now), !reduce_motion);
+                }
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn only_loose_sessions_determine_whether_worktree_rows_are_needed(cx: &mut TestAppContext) {
+        let (window, pinned, loose) = crate::shell::tests::window(cx);
+        window
+            .update(cx, |shell, _, cx| {
+                let project = "/work/another-project";
+                shell.tree.projects.insert(project.into(), true);
+                shell.session_summaries.get_mut(&pinned).unwrap().pinned = true;
+                shell.sessions[&pinned]
+                    .clone()
+                    .update(cx, |view, _| view.summary.pinned = true);
+                let rows = shell.tree_rows(&shell.tree_catalog(cx), cx);
+                assert!(rows.iter().any(|row| matches!(
+                    row,
+                    TreeRow::Section {
+                        name: "Pinned",
+                        count: 1,
+                        ..
+                    }
+                )));
+                assert!(
+                    !rows
+                        .iter()
+                        .any(|row| matches!(row, TreeRow::Worktree { .. }))
+                );
+
+                let summary = shell.session_summaries.get_mut(&loose).unwrap();
+                summary.cwd = project.into();
+                summary.has_messages = true;
+                if let Some(view) = shell.sessions.get(&loose).cloned() {
+                    view.update(cx, |view, _| {
+                        view.summary.cwd = project.into();
+                        view.summary.has_messages = true;
+                    });
+                }
+                shell
+                    .session_worktrees
+                    .insert(loose, Some("/work/topic".into()));
+                let catalog = shell.tree_catalog(cx);
+                assert_eq!(catalog.worktrees[project].len(), 2);
+                let rows = shell.tree_rows(&catalog, cx);
+                assert!(rows.iter().any(|row| matches!(
+                    row, TreeRow::Session { id, depth: 1, .. } if *id == loose
+                )));
+                assert!(
+                    !rows
+                        .iter()
+                        .any(|row| matches!(row, TreeRow::Worktree { .. }))
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn tree_project_menus_offer_codespaces_for_the_clicked_project(cx: &mut TestAppContext) {
+        let (window, _, _) = crate::shell::tests::window(cx);
+        window
+            .update(cx, |shell, window, cx| {
+                shell.workspace.set_navigation_layout(NavigationLayout::Tree);
+                let github = "/work/another-project";
+                shell.github_projects.insert(github.into(), true);
+                shell.github_projects.insert("remote://example/project".into(), true);
+                assert_ne!(shell.workspace.project, github);
+                for (path, rail, offered) in [
+                    (github, true, true),
+                    (github, false, false),
+                    ("/work/monocode", true, false),
+                    ("remote://example/project", true, false),
+                ] {
+                    let (_, items, _, _) = shell.menu_items(
+                        &MenuTarget::Project { path: path.into(), rail },
+                        &mut Vec::new(),
+                        window,
+                        cx,
+                    );
+                    assert_eq!(
+                        items.iter().any(|item| matches!(
+                            item, MenuItem::Action(action) if action.id.as_ref() == "new-codespace-session"
+                        )),
+                        offered,
+                        "{path}, rail={rail}",
+                    );
+                }
+            })
+            .unwrap();
+    }
+
     /// A project row's hover "+" starts a session there without the context menu.
     #[gpui::test]
     fn a_project_row_starts_a_session_from_its_hover_button(cx: &mut TestAppContext) {
@@ -1348,6 +1671,62 @@ mod tests {
                     blank || (shell.workspace.active, shell.workspace.tabs.len()) != before,
                     "a new session is started in the clicked project"
                 );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn worktree_hover_button_creates_and_reuses_a_blank_in_that_copy(cx: &mut TestAppContext) {
+        let (window, mut visual, main, topic) = tree_window(cx);
+        let project = "/work/another-project";
+        let copy = "/work/another-project-topic";
+        let before = window
+            .update(&mut visual, |shell, _, cx| {
+                let summary = shell.session_summaries.get_mut(&topic).unwrap();
+                summary.cwd = project.into();
+                summary.has_messages = true;
+                if let Some(view) = shell.sessions.get(&topic).cloned() {
+                    view.update(cx, |view, _| {
+                        view.summary.cwd = project.into();
+                        view.summary.has_messages = true;
+                    });
+                }
+                shell.session_worktrees.insert(topic, Some(copy.into()));
+                shell.notify_sidebar(cx);
+                shell.session_summaries.len()
+            })
+            .unwrap();
+        visual.run_until_parked();
+        let row = visual
+            .debug_bounds("tree-worktree-/work/another-project-topic")
+            .expect("the topic worktree is drawn");
+        visual.simulate_mouse_move(row.center(), None, Default::default());
+        visual.run_until_parked();
+        let button = visual
+            .debug_bounds("tree-worktree-new-session-/work/another-project-topic")
+            .expect("hovering the topic worktree shows the New session button");
+        visual.simulate_click(button.center(), Default::default());
+        visual.run_until_parked();
+
+        let blank = window
+            .update(&mut visual, |shell, _, cx| {
+                assert_eq!(shell.workspace.project, project);
+                assert_eq!(shell.working_copy(), copy);
+                let id = shell.workspace.active.expect("the blank has opened");
+                assert_ne!(id, main);
+                assert_ne!(id, topic);
+                assert_eq!(shell.session_working_copy(id, cx), copy);
+                assert!(shell.is_untouched_project_blank(id, cx));
+                assert_eq!(shell.session_summaries.len(), before + 1);
+                id
+            })
+            .unwrap();
+        visual.simulate_click(button.center(), Default::default());
+        visual.run_until_parked();
+        window
+            .update(&mut visual, |shell, _, _| {
+                assert_eq!(shell.workspace.active, Some(blank));
+                assert_eq!(shell.session_summaries.len(), before + 1);
             })
             .unwrap();
     }

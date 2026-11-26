@@ -1526,7 +1526,10 @@ impl Monos {
         .detach();
     }
     pub(crate) fn rail(&mut self, project: Option<String>, cx: &mut Context<Self>) -> AnyElement {
-        self.rail_impl(project, false, false, cx)
+        self.rail_impl(project, false, false, None, cx)
+    }
+    pub(crate) fn tree_rail(&mut self, heading: gpui::Div, cx: &mut Context<Self>) -> AnyElement {
+        self.rail_impl(None, false, false, Some(heading), cx)
     }
     /// Original navigation lists every Mono, before the projects; the inset
     /// layout continues to list only the current project's Monos.
@@ -1535,13 +1538,14 @@ impl Monos {
         compact: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        self.rail_impl(None, true, compact, cx)
+        self.rail_impl(None, true, compact, None, cx)
     }
     fn rail_impl(
         &mut self,
         project: Option<String>,
         original: bool,
         compact: bool,
+        tree_heading: Option<gpui::Div>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         if !self.prefs.monos {
@@ -1564,7 +1568,10 @@ impl Monos {
             return div().into_any_element();
         }
         let add_project = project.clone();
-        let heading = if original {
+        let tree = tree_heading.is_some();
+        let heading = if let Some(heading) = tree_heading {
+            heading
+        } else if original {
             div()
                 .h(px(30.))
                 .pl(px(10.))
@@ -1597,14 +1604,17 @@ impl Monos {
                     .size(px(20.))
                     // Centred on the sidebar's trailing column, with the
                     // session filter and the navigation hints and counts.
-                    .when(!original, |d| d.mr(px(-3.)))
+                    .when(!original && !tree, |d| d.mr(px(-3.)))
                     .on_click(cx.listener(move |this, _, w, cx| {
                         this.create(add_project.clone().into_iter().collect(), w, cx)
                     })),
             )
-        });
+        })
+        .id("sidebar-mono-heading")
+        .debug_selector(|| "sidebar-mono-heading".into());
         div()
-            .when(!original, |d| d.px_2().pb_3())
+            .when(!original && !tree, |d| d.px_2().pb_3())
+            .when(tree, |d| d.pb_2())
             .when(original && !compact, |d| d.pb_2())
             .when(compact, |d| {
                 d.w_full().flex().flex_col().items_center().gap(px(6.))

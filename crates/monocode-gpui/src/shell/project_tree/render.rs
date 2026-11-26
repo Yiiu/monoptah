@@ -14,6 +14,13 @@ impl Shell {
             self.tree.replace_rows(rows);
         }
         self.tree.clear_anchors();
+        let has_requests = !self.tree.requests.is_empty();
+        self.tree.request_disclosure.set(
+            has_requests,
+            has_requests && !cx.reduce_motion(),
+            Instant::now(),
+        );
+        let plate = self.tree_badge_plate();
         let lift = self.tree_lift_plate();
         div()
             .id("project-tree-sidebar")
@@ -53,13 +60,23 @@ impl Shell {
                     .child(
                         gpui::list(
                             self.tree.list.clone(),
-                            cx.processor(|this, index, _, cx| this.tree_list_row(index, cx)),
+                            cx.processor(move |this, index, _, cx| {
+                                this.tree_list_row(index, plate, cx)
+                            }),
                         )
                         .size_full(),
                     ),
             )
             .child(self.tree_footer(cx))
             .into_any()
+    }
+
+    pub(super) fn tree_badge_plate(&self) -> gpui::Hsla {
+        if self.sidebar_peek.is_some() {
+            floating_fill()
+        } else {
+            shell_fill()
+        }
     }
 
     /// The tree's own way into Settings: Focused reached it through the project
@@ -107,12 +124,17 @@ impl Shell {
         Some(gpui::deferred(plate).with_priority(1).into_any())
     }
 
-    fn tree_list_row(&mut self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+    fn tree_list_row(
+        &mut self,
+        ix: usize,
+        plate: gpui::Hsla,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let Some(row) = self.tree.rows.get(ix).cloned() else {
             return div().into_any();
         };
         let owner = self.tree.owners.get(ix).cloned().flatten();
-        let row = self.tree_row(row, cx);
+        let row = self.tree_row(row, plate, cx);
         let Some(owner) = owner else {
             return row;
         };
@@ -151,9 +173,13 @@ impl Shell {
         &mut self,
         key: String,
         rows: Vec<TreeRow>,
+        plate: gpui::Hsla,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let rows: Vec<_> = rows.into_iter().map(|row| self.tree_row(row, cx)).collect();
+        let rows: Vec<_> = rows
+            .into_iter()
+            .map(|row| self.tree_row(row, plate, cx))
+            .collect();
         self.tree
             .disclosures
             .get(&key)
@@ -161,20 +187,22 @@ impl Shell {
             .map_or_else(|| div().into_any(), IntoElement::into_any_element)
     }
 
-    fn tree_row(&mut self, row: TreeRow, cx: &mut Context<Self>) -> AnyElement {
+    fn tree_row(&mut self, row: TreeRow, plate: gpui::Hsla, cx: &mut Context<Self>) -> AnyElement {
         // A session row's spacing comes from its rail step's own padding, which the
         // rail is drawn through; a gap outside it would break the line between rows.
         let rail_row = matches!(row, TreeRow::Session { .. });
         let row = match row {
-            TreeRow::Reveal { key, rows } => return self.tree_reveal(key, rows, cx),
+            TreeRow::Reveal { key, rows } => return self.tree_reveal(key, rows, plate, cx),
             TreeRow::Monos => self.monos.clone().map_or_else(
                 || div().into_any(),
-                |monos| monos.update(cx, |monos, cx| monos.rail(None, cx)),
+                |monos| {
+                    monos.update(cx, |monos, cx| {
+                        monos.tree_rail(tree_section_heading("Monos"), cx)
+                    })
+                },
             ),
             TreeRow::Header(ProjectEntry::Heading(name)) => self.tree_heading(name, cx),
-            TreeRow::Header(ProjectEntry::Group(group)) => {
-                self.project_rail_group_header(group, cx)
-            }
+            TreeRow::Header(ProjectEntry::Group(group)) => self.tree_group_header(group, cx),
             TreeRow::Header(ProjectEntry::Project(path)) => self.tree_project_row(path, cx),
             TreeRow::Section {
                 project,
@@ -189,11 +217,12 @@ impl Shell {
                 open,
             } => self.tree_folder_row(project, id, count, open, cx),
             TreeRow::Worktree {
+                project,
                 path,
-                name,
+                branch,
                 open,
                 counts,
-            } => self.tree_worktree_row(path, name, open, counts, cx),
+            } => self.tree_worktree_row(project, path, branch, open, counts, cx),
             TreeRow::Session {
                 id,
                 depth,
@@ -203,7 +232,7 @@ impl Shell {
                 orchestration,
                 ..
             } => {
-                let row = self.tree_session_row(id, branch, children, orchestration, cx);
+                let row = self.tree_session_row(id, branch, children, orchestration, plate, cx);
                 div()
                     .ml(px((f32::from(depth) - 1.).max(0.) * 12.))
                     .child(rails::step(last, row))
@@ -248,16 +277,7 @@ impl Shell {
     }
 
     fn tree_heading(&mut self, name: &'static str, cx: &mut Context<Self>) -> AnyElement {
-        div()
-            .flex()
-            .items_center()
-            .min_h(px(26.))
-            .pl(px(6.))
-            .gap_1()
-            .text_size(px(10.))
-            .font_weight(FontWeight::SEMIBOLD)
-            .text_color(content(0.45))
-            .child(div().flex_1().child(name.to_uppercase()))
+        tree_section_heading(name)
             .when(name == "Projects", |heading| {
                 heading.child(self.sidebar_filter_button(cx)).child(
                     icon_button("tree-project-add", "Add a project or group", "plus").on_click(
@@ -273,6 +293,118 @@ impl Shell {
                 )
             })
             .into_any()
+    }
+
+    fn tree_group_header(&mut self, id: String, cx: &mut Context<Self>) -> AnyElement {
+        let Some(group) = self
+            .workspace
+            .project_rail_groups
+            .iter()
+            .find(|g| g.id == id)
+        else {
+            return div().into_any();
+        };
+        let name = group.name.clone();
+        let appearance = super::super::project_rail::project_group_appearance(group);
+        let open = self.tree_group_open(&id);
+        let active = self.workspace.project_rail_group(&self.workspace.project)
+            == Some(id.as_str())
+            && !self
+                .workspace
+                .project_rail_pinned
+                .contains(&self.workspace.project)
+            && !self.app_view_open()
+            && !self.mono_active(cx);
+        let key = group_key(&id);
+        let offset = self.rail_item_offset(&id, &RailDragKind::Group);
+        let raised = self.rail_item_raised(&id, &RailDragKind::Group);
+        let anchor = self.project_rail_group_anchor(&id);
+        self.tree.track_anchor(&anchor);
+        let drag = id.clone();
+        let menu = id.clone();
+        let options = id.clone();
+        let selector = format!("tree-group-{id}");
+        let row = div()
+            .id(SharedString::from(selector.clone()))
+            .debug_selector(move || selector.clone())
+            .group("tree-group")
+            .role(Role::Button)
+            .aria_label(name.clone())
+            .aria_expanded(open)
+            .aria_selected(active)
+            .relative()
+            .top(px(offset))
+            .h(px(30.))
+            .px(px(6.))
+            .rounded(px(6.))
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .when(active, |d| d.bg(content(0.10)))
+            .hover(|d| d.bg(content(if active { 0.10 } else { 0.05 })))
+            .child(
+                tree_chevron(self.tree.openness(&key, open, Instant::now()), 12.)
+                    .text_color(content(0.42)),
+            )
+            .child(crate::project_settings::project_icon(&appearance, &id, 12.))
+            .child(tree_heading_text(&name))
+            .child(
+                icon_button("tree-group-options", "Group options", "more-horizontal")
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, e: &gpui::ClickEvent, window, cx| {
+                        cx.stop_propagation();
+                        this.open_menu(
+                            MenuTarget::ProjectRailGroup(options.clone()),
+                            Anchor::Point(e.position()),
+                            window,
+                            cx,
+                        );
+                    }))
+                    .invisible()
+                    .group_hover("tree-group", |d| d.visible()),
+            )
+            .child(anchor.probe())
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, e: &MouseDownEvent, window, cx| {
+                    this.start_project_rail_drag(drag.clone(), true, e, window, cx);
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, e: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.open_menu(
+                        MenuTarget::ProjectRailGroup(menu.clone()),
+                        Anchor::Point(e.position),
+                        window,
+                        cx,
+                    );
+                }),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if this.tree_take_project_drag_click() {
+                    return;
+                }
+                if let Some(group) = this
+                    .workspace
+                    .project_rail_groups
+                    .iter_mut()
+                    .find(|g| g.id == id)
+                {
+                    group.collapsed = !group.collapsed;
+                }
+                if !this.tree_filtered() {
+                    this.tree_disclose(key.clone(), !open, cx);
+                }
+                this.persist(cx);
+                this.notify_sidebar(cx);
+            }));
+        if raised {
+            gpui::deferred(row).with_priority(1).into_any()
+        } else {
+            row.into_any()
+        }
     }
 
     fn tree_project_row(&mut self, path: String, cx: &mut Context<Self>) -> AnyElement {
@@ -542,8 +674,9 @@ impl Shell {
 
     fn tree_worktree_row(
         &mut self,
+        project: String,
         path: String,
-        name: String,
+        branch: Option<String>,
         open: bool,
         counts: Counts,
         cx: &mut Context<Self>,
@@ -551,16 +684,41 @@ impl Shell {
         self.queue_tree_diff(&path, cx);
         let diff = self.tree.diffs.display(&path);
         let key = worktree_key(&path);
+        let title = branch.clone().unwrap_or_else(|| project_name(&path));
+        let new_session = crate::worktree_switcher::WorktreeFocus {
+            path: path.clone(),
+            branch,
+        };
+        let selector = format!("tree-worktree-{path}");
+        let plus_selector = format!("tree-worktree-new-session-{path}");
         tree_node(
-            SharedString::from(format!("tree-worktree-{path}")),
-            name,
+            SharedString::from(selector.clone()),
+            title,
             "git-branch",
             open,
             self.tree.openness(&key, open, Instant::now()),
         )
+        .debug_selector(move || selector.clone())
+        .group("tree-worktree")
         .ml(px(14.))
         .when_some(diff, |d, diff| d.child(tree_caption(diff, content(0.42))))
         .when_some(counts.color(), |d, color| d.child(tree_dot(color)))
+        .child(
+            icon_button("tree-worktree-new-session", "New session", "plus")
+                .debug_selector(move || plus_selector.clone())
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.tree_new_session_in_worktree(
+                        project.clone(),
+                        new_session.clone(),
+                        window,
+                        cx,
+                    );
+                }))
+                .invisible()
+                .group_hover("tree-worktree", |d| d.visible()),
+        )
         .on_click(cx.listener(move |this, _, _, cx| {
             if !this.tree.worktrees.remove(&path) {
                 this.tree.worktrees.insert(path.clone());
@@ -588,8 +746,23 @@ impl Shell {
     }
 
     fn tree_request_queue(&self, ids: &[i64], cx: &mut Context<Self>) -> AnyElement {
+        let queue = div().id("tree-needs-you").mx(px(6.)).mb(px(4.));
+        let color = needs_you_color(ids.len());
+        if ids.is_empty() {
+            return queue
+                .debug_selector(|| "tree-needs-you-empty".into())
+                .h(px(28.))
+                .px(px(6.))
+                .flex()
+                .items_center()
+                .text_size(px(12.))
+                .text_color(color)
+                .child("Nothing needs you")
+                .into_any();
+        }
         let summary = div()
             .id("tree-next-request")
+            .debug_selector(|| "tree-next-request".into())
             .role(Role::Button)
             .aria_label(format!("Open next session needing you, {}", ids.len()))
             .flex()
@@ -598,10 +771,10 @@ impl Shell {
             .h(px(28.))
             .px(px(6.))
             .rounded(px(6.))
-            .text_color(warning_color())
+            .text_color(color)
             .text_size(px(12.))
             .hover(|d| d.bg(content(0.05)))
-            .child(icon("hand", 14.))
+            .child(icon("hand", 14.).text_color(color))
             .child(
                 div()
                     .flex_1()
@@ -610,22 +783,17 @@ impl Shell {
             )
             .child(tree_caption("Ctrl J", content(0.45)))
             .on_click(cx.listener(|this, _, window, cx| this.open_next_tree_request(window, cx)));
-        div()
-            .id("tree-needs-you")
-            .mx(px(6.))
-            .mb(px(4.))
+        let list = div()
+            .id("tree-request-list")
+            .debug_selector(|| "tree-request-list".into())
+            .max_h(px(118.))
+            .overflow_y_scroll()
+            .children(ids.iter().map(|id| self.tree_request_item(*id, cx)));
+        queue
             .rounded(px(6.))
-            .bg(warning_color().opacity(0.055))
+            .bg(color.opacity(0.055))
             .child(summary)
-            .when(!ids.is_empty(), |d| {
-                d.child(
-                    div()
-                        .id("tree-request-list")
-                        .max_h(px(118.))
-                        .overflow_y_scroll()
-                        .children(ids.iter().map(|id| self.tree_request_item(*id, cx))),
-                )
-            })
+            .children(self.tree.request_disclosure.render(list, Instant::now()))
             .into_any()
     }
 
@@ -684,6 +852,7 @@ impl Shell {
         branch: Option<String>,
         children: usize,
         orchestration: bool,
+        plate: gpui::Hsla,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         if let Some(row) = self.rename_row(&session_groups::RenameTarget::Session(id), cx) {
@@ -766,11 +935,11 @@ impl Shell {
             }),
         };
         let edge_fill = if active || selected {
-            shell_fill().blend(content(0.10))
+            plate.blend(content(0.10))
         } else if hover {
-            shell_fill().blend(content(0.05))
+            plate.blend(content(0.05))
         } else {
-            shell_fill()
+            plate
         };
         let avatar = crate::session_mark::provider_activity_icon(
             &meta.summary.provider,
@@ -952,6 +1121,7 @@ impl Shell {
         self.tree_settle_unread(cx);
         let catalog = self.tree_catalog(cx);
         let requests = catalog.requests.len();
+        let request_color = needs_you_color(requests);
         let monos = self
             .monos
             .clone()
@@ -986,7 +1156,7 @@ impl Shell {
                     .role(Role::Button)
                     .aria_label(format!("Needs you {requests}"))
                     .text_size(px(11.))
-                    .text_color(warning_color())
+                    .text_color(request_color)
                     .rounded(px(6.))
                     .h(px(28.))
                     .px(px(3.))
@@ -994,7 +1164,7 @@ impl Shell {
                     .items_center()
                     .gap_px()
                     .hover(|d| d.bg(content(0.05)))
-                    .child(icon("hand", 13.))
+                    .child(icon("hand", 13.).text_color(request_color))
                     .child(requests.to_string())
                     .on_click(
                         cx.listener(|this, _, window, cx| this.open_next_tree_request(window, cx)),
@@ -1157,6 +1327,35 @@ impl Shell {
         })
         .collect()
     }
+}
+
+pub(super) fn needs_you_color(count: usize) -> gpui::Hsla {
+    if count == 0 {
+        content(0.4)
+    } else {
+        warning_color()
+    }
+}
+
+fn tree_section_heading(name: &str) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .min_h(px(26.))
+        .pl(px(6.))
+        .gap_1()
+        .child(tree_heading_text(name))
+}
+
+fn tree_heading_text(name: &str) -> gpui::Div {
+    div()
+        .flex_1()
+        .min_w_0()
+        .truncate()
+        .text_size(px(10.))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(content(0.45))
+        .child(name.to_uppercase())
 }
 
 fn tree_caption(text: impl Into<SharedString>, color: gpui::Hsla) -> gpui::Div {
