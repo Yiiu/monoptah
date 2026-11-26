@@ -5292,7 +5292,11 @@ impl Shell {
                 .sessions
                 .get(&id)
                 .is_none_or(|v| v.read(cx).input.read(cx).content.is_empty())
-            && self.workspace.reviews.get(&id).is_none_or(|r| r.tabs.is_empty())
+            && self
+                .workspace
+                .reviews
+                .get(&id)
+                .is_none_or(|r| r.tabs.is_empty())
     }
     fn open_project(&mut self, cx: &mut Context<Self>) {
         let picker = cx.prompt_for_paths(PathPromptOptions {
@@ -7648,14 +7652,17 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         self.select_project(path.clone(), window, cx);
-        let blank_prefix = format!("{path}\0");
-        if !self
-            .pending_project_blanks
-            .iter()
-            .any(|key| key.starts_with(&blank_prefix))
-        {
+        if !self.tree_has_pending_blank(&path, None) {
             self.new_chat(cx);
         }
+    }
+
+    fn tree_has_pending_blank(&self, project: &str, copy: Option<&str>) -> bool {
+        self.pending_project_blanks.iter().any(|key| {
+            key.split_once('\0').is_some_and(|(cwd, worktree)| {
+                cwd == project && copy.is_none_or(|scope| worktree == scope)
+            })
+        })
     }
 
     pub(super) fn tree_new_session_in_worktree(
@@ -7673,11 +7680,11 @@ impl Shell {
             self.worktree_focus.insert(project.clone(), focus);
         }
         self.select_project(project.clone(), window, cx);
-        let pending = format!(
-            "{project}\0{}",
-            self.worktree_focus.get(&project).map_or("", |f| f.path.as_str())
-        );
-        if self.pending_project_blanks.contains(&pending) {
+        let copy = self
+            .worktree_focus
+            .get(&project)
+            .map_or("", |f| f.path.as_str());
+        if self.tree_has_pending_blank(&project, Some(copy)) {
             return;
         }
         if self.workspace.active.is_some_and(|pane| {
@@ -7685,7 +7692,12 @@ impl Shell {
         }) {
             return;
         }
-        if let Some(id) = self.order.iter().copied().find(|id| self.is_untouched_project_blank(*id, cx)) {
+        if let Some(id) = self
+            .order
+            .iter()
+            .copied()
+            .find(|id| self.is_untouched_project_blank(*id, cx))
+        {
             self.activate_session(id, window, cx);
         } else {
             self.new_chat(cx);

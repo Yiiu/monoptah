@@ -717,7 +717,9 @@ impl Shell {
                         }
                     });
                 }
-                ProjectEntry::Project(path) => self.tree_project_block(&mut rows, path, catalog, cx),
+                ProjectEntry::Project(path) => {
+                    self.tree_project_block(&mut rows, path, catalog, cx)
+                }
                 heading => rows.push(TreeRow::Header(heading)),
             }
         }
@@ -735,11 +737,21 @@ impl Shell {
     }
 
     fn tree_group_open(&self, id: &str) -> bool {
-        self.tree_filtered() || self.workspace.project_rail_groups.iter()
-            .any(|group| group.id == id && !group.collapsed)
+        self.tree_filtered()
+            || self
+                .workspace
+                .project_rail_groups
+                .iter()
+                .any(|group| group.id == id && !group.collapsed)
     }
 
-    fn tree_project_block(&self, rows: &mut Vec<TreeRow>, path: String, catalog: &TreeCatalog, cx: &App) {
+    fn tree_project_block(
+        &self,
+        rows: &mut Vec<TreeRow>,
+        path: String,
+        catalog: &TreeCatalog,
+        cx: &App,
+    ) {
         let ids = catalog.projects.get(&path).map_or(&[][..], Vec::as_slice);
         if ids.is_empty() && self.tree_filtered() {
             return;
@@ -964,7 +976,11 @@ impl Shell {
             });
             by_worktree[index].1.push(id);
         }
-        let Some(copies) = catalog.worktrees.get(path).filter(|_| by_worktree.len() > 1) else {
+        let Some(copies) = catalog
+            .worktrees
+            .get(path)
+            .filter(|_| by_worktree.len() > 1)
+        else {
             self.tree_session_rows(
                 rows,
                 &split.loose,
@@ -1351,8 +1367,43 @@ mod tests {
                 })
                 .unwrap();
             visual.run_until_parked();
-            let heading = visual.debug_bounds("sidebar-mono-heading").expect("Mono heading");
+            let heading = visual
+                .debug_bounds("sidebar-mono-heading")
+                .expect("Mono heading");
             assert_eq!(heading.size.height, px(height));
+        }
+    }
+
+    #[gpui::test]
+    fn tree_peek_badges_take_the_floating_surface_in_every_appearance(cx: &mut TestAppContext) {
+        let (window, mut visual, _, _) = tree_window(cx);
+        for (theme, opacity) in [("dark", 85), ("dark", 100), ("light", 85)] {
+            window
+                .update(&mut visual, |shell, _, cx| {
+                    shell.workspace.preferences.theme = theme.into();
+                    shell.workspace.preferences.sidebar_opacity = opacity;
+                    shell.invalidate_chrome(cx);
+                    cx.notify();
+                })
+                .unwrap();
+            visual.refresh().unwrap();
+            window
+                .update(&mut visual, |shell, window, cx| {
+                    assert_eq!(shell.tree_badge_plate(), shell_fill());
+                    shell.toggle_primary_sidebar(window, cx);
+                    shell.set_peek(true, cx);
+                    assert!(shell.peek_open());
+                    assert_eq!(shell.tree_badge_plate(), floating_fill());
+                })
+                .unwrap();
+            visual.refresh().unwrap();
+            assert!(visual.debug_bounds("sidebar-peek").is_some());
+            window
+                .update(&mut visual, |shell, window, cx| {
+                    shell.toggle_primary_sidebar(window, cx);
+                    assert_eq!(shell.tree_badge_plate(), shell_fill());
+                })
+                .unwrap();
         }
     }
 
@@ -1361,19 +1412,27 @@ mod tests {
         let (window, mut visual, _, _) = tree_window(cx);
         window
             .update(&mut visual, |shell, _, cx| {
-                shell.workspace.project_rail_groups.push(crate::workspace::ProjectRailGroup {
-                    id: "release".into(),
-                    name: "Release".into(),
-                    ..Default::default()
-                });
-                shell.workspace.project_rail_assignments.insert("/work/monocode".into(), "release".into());
+                shell
+                    .workspace
+                    .project_rail_groups
+                    .push(crate::workspace::ProjectRailGroup {
+                        id: "release".into(),
+                        name: "Release".into(),
+                        ..Default::default()
+                    });
+                shell
+                    .workspace
+                    .project_rail_assignments
+                    .insert("/work/monocode".into(), "release".into());
                 shell.notify_sidebar(cx);
             })
             .unwrap();
         visual.run_until_parked();
-        let header = visual.debug_bounds("tree-group-release").expect("Tree group");
+        let header = visual
+            .debug_bounds("tree-group-release")
+            .expect("Tree group");
         assert_eq!(header.size.height, px(30.));
-        visual.update(|cx| cx.set_reduce_motion(false));
+        visual.update(|_, cx| cx.set_reduce_motion(false));
         visual.simulate_click(header.center(), Default::default());
         window
             .update(&mut visual, |shell, _, cx| {
@@ -1393,7 +1452,7 @@ mod tests {
                 assert!(shell.tree.disclosing(&group_key("release"), Instant::now()));
             })
             .unwrap();
-        visual.update(|cx| cx.set_reduce_motion(true));
+        visual.update(|_, cx| cx.set_reduce_motion(true));
         visual.simulate_click(header.center(), Default::default());
         window
             .update(&mut visual, |shell, _, _| {
@@ -1414,17 +1473,25 @@ mod tests {
             .update(visual, |shell, _, cx| {
                 shell.workspace.project_rail_open = true;
                 shell.set_navigation_layout(NavigationLayout::Classic, cx);
-                shell.workspace.project_rail_groups.push(crate::workspace::ProjectRailGroup {
-                    id: "release".into(),
-                    name: "Release".into(),
-                    ..Default::default()
-                });
-                shell.workspace.project_rail_assignments.insert("/work/monocode".into(), "release".into());
+                shell
+                    .workspace
+                    .project_rail_groups
+                    .push(crate::workspace::ProjectRailGroup {
+                        id: "release".into(),
+                        name: "Release".into(),
+                        ..Default::default()
+                    });
+                shell
+                    .workspace
+                    .project_rail_assignments
+                    .insert("/work/monocode".into(), "release".into());
                 shell.projects_frame.update(cx, |_, cx| cx.notify());
             })
             .unwrap();
         visual.run_until_parked();
-        let header = visual.debug_bounds("rail-group-release").expect("Classic group");
+        let header = visual
+            .debug_bounds("rail-group-release")
+            .expect("Classic group");
         assert_eq!(header.size.height, px(32.));
         visual.simulate_click(header.center(), Default::default());
         visual.run_until_parked();
@@ -1454,7 +1521,9 @@ mod tests {
                     shell.agent_statuses.insert(
                         id,
                         AgentStatus {
-                            activity: Activity::NeedsYou { kind: Ask::Question },
+                            activity: Activity::NeedsYou {
+                                kind: Ask::Question,
+                            },
                             ..Default::default()
                         },
                     );
@@ -1476,23 +1545,47 @@ mod tests {
                 let project = "/work/another-project";
                 shell.tree.projects.insert(project.into(), true);
                 shell.session_summaries.get_mut(&pinned).unwrap().pinned = true;
+                shell.sessions[&pinned]
+                    .clone()
+                    .update(cx, |view, _| view.summary.pinned = true);
                 let rows = shell.tree_rows(&shell.tree_catalog(cx), cx);
                 assert!(rows.iter().any(|row| matches!(
-                    row, TreeRow::Section { name: "Pinned", count: 1, .. }
+                    row,
+                    TreeRow::Section {
+                        name: "Pinned",
+                        count: 1,
+                        ..
+                    }
                 )));
-                assert!(!rows.iter().any(|row| matches!(row, TreeRow::Worktree { .. })));
+                assert!(
+                    !rows
+                        .iter()
+                        .any(|row| matches!(row, TreeRow::Worktree { .. }))
+                );
 
                 let summary = shell.session_summaries.get_mut(&loose).unwrap();
                 summary.cwd = project.into();
                 summary.has_messages = true;
-                shell.session_worktrees.insert(loose, Some("/work/topic".into()));
+                if let Some(view) = shell.sessions.get(&loose).cloned() {
+                    view.update(cx, |view, _| {
+                        view.summary.cwd = project.into();
+                        view.summary.has_messages = true;
+                    });
+                }
+                shell
+                    .session_worktrees
+                    .insert(loose, Some("/work/topic".into()));
                 let catalog = shell.tree_catalog(cx);
                 assert_eq!(catalog.worktrees[project].len(), 2);
                 let rows = shell.tree_rows(&catalog, cx);
                 assert!(rows.iter().any(|row| matches!(
                     row, TreeRow::Session { id, depth: 1, .. } if *id == loose
                 )));
-                assert!(!rows.iter().any(|row| matches!(row, TreeRow::Worktree { .. })));
+                assert!(
+                    !rows
+                        .iter()
+                        .any(|row| matches!(row, TreeRow::Worktree { .. }))
+                );
             })
             .unwrap();
     }
@@ -1592,6 +1685,12 @@ mod tests {
                 let summary = shell.session_summaries.get_mut(&topic).unwrap();
                 summary.cwd = project.into();
                 summary.has_messages = true;
+                if let Some(view) = shell.sessions.get(&topic).cloned() {
+                    view.update(cx, |view, _| {
+                        view.summary.cwd = project.into();
+                        view.summary.has_messages = true;
+                    });
+                }
                 shell.session_worktrees.insert(topic, Some(copy.into()));
                 shell.notify_sidebar(cx);
                 shell.session_summaries.len()

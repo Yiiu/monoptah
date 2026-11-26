@@ -1703,7 +1703,11 @@ impl Shell {
     }
 
     pub(super) fn project_rail_group_anchor(&mut self, id: &str) -> AnchorSlot {
-        self.project_rail_list.group_bounds.entry(id.to_owned()).or_default().clone()
+        self.project_rail_list
+            .group_bounds
+            .entry(id.to_owned())
+            .or_default()
+            .clone()
     }
 
     pub(super) fn tree_take_project_drag_click(&mut self) -> bool {

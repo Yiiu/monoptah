@@ -306,11 +306,7 @@ impl Shell {
                 BoxShadow::new(px(0.), px(2.), rgba(0x00000029).into()).blur_radius(px(6.)),
             ])
             .when(!glass, |d| {
-                d.bg(if tree {
-                    floating_fill()
-                } else {
-                    shell_fill()
-                })
+                d.bg(if tree { floating_fill() } else { shell_fill() })
             })
             .when(glass, |d| {
                 d.child(

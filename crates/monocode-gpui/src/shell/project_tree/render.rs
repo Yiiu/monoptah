@@ -20,7 +20,7 @@ impl Shell {
             has_requests && !cx.reduce_motion(),
             Instant::now(),
         );
-        let plate = if self.sidebar_peek.is_some() { floating_fill() } else { shell_fill() };
+        let plate = self.tree_badge_plate();
         let lift = self.tree_lift_plate();
         div()
             .id("project-tree-sidebar")
@@ -60,13 +60,23 @@ impl Shell {
                     .child(
                         gpui::list(
                             self.tree.list.clone(),
-                            cx.processor(move |this, index, _, cx| this.tree_list_row(index, plate, cx)),
+                            cx.processor(move |this, index, _, cx| {
+                                this.tree_list_row(index, plate, cx)
+                            }),
                         )
                         .size_full(),
                     ),
             )
             .child(self.tree_footer(cx))
             .into_any()
+    }
+
+    pub(super) fn tree_badge_plate(&self) -> gpui::Hsla {
+        if self.sidebar_peek.is_some() {
+            floating_fill()
+        } else {
+            shell_fill()
+        }
     }
 
     /// The tree's own way into Settings: Focused reached it through the project
@@ -114,7 +124,12 @@ impl Shell {
         Some(gpui::deferred(plate).with_priority(1).into_any())
     }
 
-    fn tree_list_row(&mut self, ix: usize, plate: gpui::Hsla, cx: &mut Context<Self>) -> AnyElement {
+    fn tree_list_row(
+        &mut self,
+        ix: usize,
+        plate: gpui::Hsla,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let Some(row) = self.tree.rows.get(ix).cloned() else {
             return div().into_any();
         };
@@ -161,7 +176,10 @@ impl Shell {
         plate: gpui::Hsla,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let rows: Vec<_> = rows.into_iter().map(|row| self.tree_row(row, plate, cx)).collect();
+        let rows: Vec<_> = rows
+            .into_iter()
+            .map(|row| self.tree_row(row, plate, cx))
+            .collect();
         self.tree
             .disclosures
             .get(&key)
@@ -177,12 +195,14 @@ impl Shell {
             TreeRow::Reveal { key, rows } => return self.tree_reveal(key, rows, plate, cx),
             TreeRow::Monos => self.monos.clone().map_or_else(
                 || div().into_any(),
-                |monos| monos.update(cx, |monos, cx| monos.tree_rail(tree_section_heading("Monos"), cx)),
+                |monos| {
+                    monos.update(cx, |monos, cx| {
+                        monos.tree_rail(tree_section_heading("Monos"), cx)
+                    })
+                },
             ),
             TreeRow::Header(ProjectEntry::Heading(name)) => self.tree_heading(name, cx),
-            TreeRow::Header(ProjectEntry::Group(group)) => {
-                self.tree_group_header(group, cx)
-            }
+            TreeRow::Header(ProjectEntry::Group(group)) => self.tree_group_header(group, cx),
             TreeRow::Header(ProjectEntry::Project(path)) => self.tree_project_row(path, cx),
             TreeRow::Section {
                 project,
@@ -276,14 +296,23 @@ impl Shell {
     }
 
     fn tree_group_header(&mut self, id: String, cx: &mut Context<Self>) -> AnyElement {
-        let Some(group) = self.workspace.project_rail_groups.iter().find(|g| g.id == id) else {
+        let Some(group) = self
+            .workspace
+            .project_rail_groups
+            .iter()
+            .find(|g| g.id == id)
+        else {
             return div().into_any();
         };
         let name = group.name.clone();
         let appearance = super::super::project_rail::project_group_appearance(group);
         let open = self.tree_group_open(&id);
-        let active = self.workspace.project_rail_group(&self.workspace.project) == Some(id.as_str())
-            && !self.workspace.project_rail_pinned.contains(&self.workspace.project)
+        let active = self.workspace.project_rail_group(&self.workspace.project)
+            == Some(id.as_str())
+            && !self
+                .workspace
+                .project_rail_pinned
+                .contains(&self.workspace.project)
             && !self.app_view_open()
             && !self.mono_active(cx);
         let key = group_key(&id);
@@ -357,7 +386,12 @@ impl Shell {
                 if this.tree_take_project_drag_click() {
                     return;
                 }
-                if let Some(group) = this.workspace.project_rail_groups.iter_mut().find(|g| g.id == id) {
+                if let Some(group) = this
+                    .workspace
+                    .project_rail_groups
+                    .iter_mut()
+                    .find(|g| g.id == id)
+                {
                     group.collapsed = !group.collapsed;
                 }
                 if !this.tree_filtered() {
@@ -651,7 +685,10 @@ impl Shell {
         let diff = self.tree.diffs.display(&path);
         let key = worktree_key(&path);
         let title = branch.clone().unwrap_or_else(|| project_name(&path));
-        let new_session = crate::worktree_switcher::WorktreeFocus { path: path.clone(), branch };
+        let new_session = crate::worktree_switcher::WorktreeFocus {
+            path: path.clone(),
+            branch,
+        };
         let selector = format!("tree-worktree-{path}");
         let plus_selector = format!("tree-worktree-new-session-{path}");
         tree_node(
@@ -672,7 +709,12 @@ impl Shell {
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(move |this, _, window, cx| {
                     cx.stop_propagation();
-                    this.tree_new_session_in_worktree(project.clone(), new_session.clone(), window, cx);
+                    this.tree_new_session_in_worktree(
+                        project.clone(),
+                        new_session.clone(),
+                        window,
+                        cx,
+                    );
                 }))
                 .invisible()
                 .group_hover("tree-worktree", |d| d.visible()),
@@ -732,7 +774,7 @@ impl Shell {
             .text_color(color)
             .text_size(px(12.))
             .hover(|d| d.bg(content(0.05)))
-            .child(icon("hand", 14.))
+            .child(icon("hand", 14.).text_color(color))
             .child(
                 div()
                     .flex_1()
@@ -1079,6 +1121,7 @@ impl Shell {
         self.tree_settle_unread(cx);
         let catalog = self.tree_catalog(cx);
         let requests = catalog.requests.len();
+        let request_color = needs_you_color(requests);
         let monos = self
             .monos
             .clone()
@@ -1113,7 +1156,7 @@ impl Shell {
                     .role(Role::Button)
                     .aria_label(format!("Needs you {requests}"))
                     .text_size(px(11.))
-                    .text_color(needs_you_color(requests))
+                    .text_color(request_color)
                     .rounded(px(6.))
                     .h(px(28.))
                     .px(px(3.))
@@ -1121,7 +1164,7 @@ impl Shell {
                     .items_center()
                     .gap_px()
                     .hover(|d| d.bg(content(0.05)))
-                    .child(icon("hand", 13.))
+                    .child(icon("hand", 13.).text_color(request_color))
                     .child(requests.to_string())
                     .on_click(
                         cx.listener(|this, _, window, cx| this.open_next_tree_request(window, cx)),
@@ -1287,7 +1330,11 @@ impl Shell {
 }
 
 pub(super) fn needs_you_color(count: usize) -> gpui::Hsla {
-    if count == 0 { content(0.4) } else { warning_color() }
+    if count == 0 {
+        content(0.4)
+    } else {
+        warning_color()
+    }
 }
 
 fn tree_section_heading(name: &str) -> gpui::Div {
