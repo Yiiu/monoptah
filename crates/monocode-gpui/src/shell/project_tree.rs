@@ -71,8 +71,9 @@ enum TreeRow {
         open: bool,
     },
     Worktree {
+        project: String,
         path: String,
-        name: String,
+        branch: Option<String>,
         open: bool,
         counts: Counts,
     },
@@ -979,15 +980,15 @@ impl Shell {
         for (copy, members) in by_worktree {
             let open = !self.tree.worktrees.contains(&copy) || self.tree_filtered();
             let counts = copies.get(&path_key(&copy)).copied().unwrap_or_default();
-            let name = members
+            let branch = members
                 .iter()
                 .filter(|&&id| !self.is_cloud(id))
-                .find_map(|id| self.tree_branch(*id, cx))
-                .unwrap_or_else(|| project_name(&copy));
+                .find_map(|id| self.tree_branch(*id, cx));
             let key = worktree_key(&copy);
             rows.push(TreeRow::Worktree {
+                project: path.to_owned(),
                 path: copy,
-                name,
+                branch,
                 open,
                 counts,
             });
@@ -1577,6 +1578,56 @@ mod tests {
                     blank || (shell.workspace.active, shell.workspace.tabs.len()) != before,
                     "a new session is started in the clicked project"
                 );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn worktree_hover_button_creates_and_reuses_a_blank_in_that_copy(cx: &mut TestAppContext) {
+        let (window, mut visual, main, topic) = tree_window(cx);
+        let project = "/work/another-project";
+        let copy = "/work/another-project-topic";
+        let before = window
+            .update(&mut visual, |shell, _, cx| {
+                let summary = shell.session_summaries.get_mut(&topic).unwrap();
+                summary.cwd = project.into();
+                summary.has_messages = true;
+                shell.session_worktrees.insert(topic, Some(copy.into()));
+                shell.notify_sidebar(cx);
+                shell.session_summaries.len()
+            })
+            .unwrap();
+        visual.run_until_parked();
+        let row = visual
+            .debug_bounds("tree-worktree-/work/another-project-topic")
+            .expect("the topic worktree is drawn");
+        visual.simulate_mouse_move(row.center(), None, Default::default());
+        visual.run_until_parked();
+        let button = visual
+            .debug_bounds("tree-worktree-new-session-/work/another-project-topic")
+            .expect("hovering the topic worktree shows the New session button");
+        visual.simulate_click(button.center(), Default::default());
+        visual.run_until_parked();
+
+        let blank = window
+            .update(&mut visual, |shell, _, cx| {
+                assert_eq!(shell.workspace.project, project);
+                assert_eq!(shell.working_copy(), copy);
+                let id = shell.workspace.active.expect("the blank has opened");
+                assert_ne!(id, main);
+                assert_ne!(id, topic);
+                assert_eq!(shell.session_working_copy(id, cx), copy);
+                assert!(shell.is_untouched_project_blank(id, cx));
+                assert_eq!(shell.session_summaries.len(), before + 1);
+                id
+            })
+            .unwrap();
+        visual.simulate_click(button.center(), Default::default());
+        visual.run_until_parked();
+        window
+            .update(&mut visual, |shell, _, _| {
+                assert_eq!(shell.workspace.active, Some(blank));
+                assert_eq!(shell.session_summaries.len(), before + 1);
             })
             .unwrap();
     }

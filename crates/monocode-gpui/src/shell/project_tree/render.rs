@@ -195,11 +195,12 @@ impl Shell {
                 open,
             } => self.tree_folder_row(project, id, count, open, cx),
             TreeRow::Worktree {
+                project,
                 path,
-                name,
+                branch,
                 open,
                 counts,
-            } => self.tree_worktree_row(path, name, open, counts, cx),
+            } => self.tree_worktree_row(project, path, branch, open, counts, cx),
             TreeRow::Session {
                 id,
                 depth,
@@ -637,8 +638,9 @@ impl Shell {
 
     fn tree_worktree_row(
         &mut self,
+        project: String,
         path: String,
-        name: String,
+        branch: Option<String>,
         open: bool,
         counts: Counts,
         cx: &mut Context<Self>,
@@ -646,16 +648,33 @@ impl Shell {
         self.queue_tree_diff(&path, cx);
         let diff = self.tree.diffs.display(&path);
         let key = worktree_key(&path);
+        let title = branch.clone().unwrap_or_else(|| project_name(&path));
+        let new_session = crate::worktree_switcher::WorktreeFocus { path: path.clone(), branch };
+        let selector = format!("tree-worktree-{path}");
+        let plus_selector = format!("tree-worktree-new-session-{path}");
         tree_node(
-            SharedString::from(format!("tree-worktree-{path}")),
-            name,
+            SharedString::from(selector.clone()),
+            title,
             "git-branch",
             open,
             self.tree.openness(&key, open, Instant::now()),
         )
+        .debug_selector(move || selector.clone())
+        .group("tree-worktree")
         .ml(px(14.))
         .when_some(diff, |d, diff| d.child(tree_caption(diff, content(0.42))))
         .when_some(counts.color(), |d, color| d.child(tree_dot(color)))
+        .child(
+            icon_button("tree-worktree-new-session", "New session", "plus")
+                .debug_selector(move || plus_selector.clone())
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.tree_new_session_in_worktree(project.clone(), new_session.clone(), window, cx);
+                }))
+                .invisible()
+                .group_hover("tree-worktree", |d| d.visible()),
+        )
         .on_click(cx.listener(move |this, _, _, cx| {
             if !this.tree.worktrees.remove(&path) {
                 this.tree.worktrees.insert(path.clone());

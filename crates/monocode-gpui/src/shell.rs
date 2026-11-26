@@ -5263,25 +5263,7 @@ impl Shell {
             return;
         }
         if let Some(id) = self.order.iter().copied().find(|id| {
-            let s = self.session_metadata(*id, cx);
-            self.project_of(*id, &s.summary.cwd) == self.workspace.project
-                && monocode_core::files::path_key(self.session_working_copy(*id, cx))
-                    == monocode_core::files::path_key(self.working_copy())
-                && !s.summary.archived
-                && !s.summary.has_messages
-                && !self.is_terminal(*id)
-                && !s.busy
-                && !s.has_saved_draft()
-                && self
-                    .sessions
-                    .get(id)
-                    .is_none_or(|v| v.read(cx).input.read(cx).content.is_empty())
-                && self.workspace.tab_of(*id).is_none()
-                && self
-                    .workspace
-                    .reviews
-                    .get(id)
-                    .is_none_or(|r| r.tabs.is_empty())
+            self.workspace.tab_of(*id).is_none() && self.is_untouched_project_blank(*id, cx)
         }) {
             self.activate_session(id, window, cx);
         } else {
@@ -5294,6 +5276,23 @@ impl Shell {
             };
             self.create_session_target(choice, true, None, surface, cx);
         }
+    }
+
+    fn is_untouched_project_blank(&self, id: i64, cx: &App) -> bool {
+        let s = self.session_metadata(id, cx);
+        self.project_of(id, &s.summary.cwd) == self.workspace.project
+            && monocode_core::files::path_key(self.session_working_copy(id, cx))
+                == monocode_core::files::path_key(self.working_copy())
+            && !s.summary.archived
+            && !s.summary.has_messages
+            && !self.is_terminal(id)
+            && !s.busy
+            && !s.has_saved_draft()
+            && self
+                .sessions
+                .get(&id)
+                .is_none_or(|v| v.read(cx).input.read(cx).content.is_empty())
+            && self.workspace.reviews.get(&id).is_none_or(|r| r.tabs.is_empty())
     }
     fn open_project(&mut self, cx: &mut Context<Self>) {
         let picker = cx.prompt_for_paths(PathPromptOptions {
@@ -7655,6 +7654,40 @@ impl Shell {
             .iter()
             .any(|key| key.starts_with(&blank_prefix))
         {
+            self.new_chat(cx);
+        }
+    }
+
+    pub(super) fn tree_new_session_in_worktree(
+        &mut self,
+        project: String,
+        focus: crate::worktree_switcher::WorktreeFocus,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Set the intended scope before selecting the project, which would
+        // otherwise restore or create a blank in its previously focused copy.
+        if monocode_core::files::path_key(&focus.path) == monocode_core::files::path_key(&project) {
+            self.worktree_focus.remove(&project);
+        } else {
+            self.worktree_focus.insert(project.clone(), focus);
+        }
+        self.select_project(project.clone(), window, cx);
+        let pending = format!(
+            "{project}\0{}",
+            self.worktree_focus.get(&project).map_or("", |f| f.path.as_str())
+        );
+        if self.pending_project_blanks.contains(&pending) {
+            return;
+        }
+        if self.workspace.active.is_some_and(|pane| {
+            self.is_untouched_project_blank(self.workspace.session_for_pane(pane), cx)
+        }) {
+            return;
+        }
+        if let Some(id) = self.order.iter().copied().find(|id| self.is_untouched_project_blank(*id, cx)) {
+            self.activate_session(id, window, cx);
+        } else {
             self.new_chat(cx);
         }
     }
