@@ -446,7 +446,7 @@ impl Conversation {
             }
             if self.settings.new_worktree && self.settings.worktree_cwd.is_none() {
                 self.mobile_no_wake = outer;
-                self.prepare_worktree(cx);
+                self.prepare_worktree(Some(message.id), cx);
                 return;
             }
             self.follow_ups.sending = Some(message.id.clone());
@@ -1083,6 +1083,46 @@ mod tests {
                     view.follow_ups.state.messages[0].error.as_deref(),
                     Some("Rejected by provider")
                 );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn worktree_failure_belongs_to_the_sendable_message(cx: &mut TestAppContext) {
+        let window = conversation(cx);
+        let project = tempfile::tempdir().unwrap();
+        window
+            .update(cx, |view, _, cx| {
+                view.summary.cwd = project
+                    .path()
+                    .join("missing-repo")
+                    .to_string_lossy()
+                    .into_owned();
+                view.settings.new_worktree = true;
+                view.follow_ups.state.messages.extend([
+                    Message {
+                        id: "unconfirmed".into(),
+                        error: Some(monocode_core::follow_up::DELIVERY_UNCONFIRMED.into()),
+                        ..Default::default()
+                    },
+                    Message {
+                        id: "sendable".into(),
+                        text: "next turn".into(),
+                        ..Default::default()
+                    },
+                ]);
+                view.pump_follow_ups(cx);
+                assert!(view.preparing_worktree);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |view, _, _| {
+                let messages = &view.follow_ups.state.messages;
+                assert!(!view.preparing_worktree);
+                assert!(messages[0].delivery_unconfirmed());
+                assert_eq!(messages[1].error.as_deref(), Some(view.status.as_str()));
+                assert!(view.follow_ups.state.paused);
             })
             .unwrap();
     }

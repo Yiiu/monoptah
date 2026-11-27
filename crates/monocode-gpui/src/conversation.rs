@@ -2390,7 +2390,7 @@ impl Conversation {
         })
         .detach();
     }
-    fn prepare_worktree(&mut self, cx: &mut Context<Self>) {
+    fn prepare_worktree(&mut self, queued_message_id: Option<String>, cx: &mut Context<Self>) {
         self.preparing_worktree = true;
         self.status = "Creating worktree…".into();
         let cwd = self.summary.cwd.clone();
@@ -2406,30 +2406,34 @@ impl Conversation {
             .spawn(async move { monocode_core::git::create_worktree(Path::new(&cwd), &base, id) });
         cx.spawn(async move |this, cx| {
             let result = work.await;
-            let _ = this.update(cx, |this, cx| {
-                this.preparing_worktree = false;
-                match result {
-                    Ok(path) => {
-                        this.settings.worktree_cwd = Some(path.to_string_lossy().into_owned());
-                        this.settings.new_worktree = false;
-                        this.save_settings(cx);
-                        this.refresh_git(cx);
-                        if this.follow_ups.state.messages.is_empty() {
-                            this.send(cx);
-                        } else {
-                            this.pump_follow_ups(cx);
+            let _ =
+                this.update(cx, |this, cx| {
+                    this.preparing_worktree = false;
+                    match result {
+                        Ok(path) => {
+                            this.settings.worktree_cwd = Some(path.to_string_lossy().into_owned());
+                            this.settings.new_worktree = false;
+                            this.save_settings(cx);
+                            this.refresh_git(cx);
+                            if this.follow_ups.state.messages.is_empty() {
+                                this.send(cx);
+                            } else {
+                                this.pump_follow_ups(cx);
+                            }
+                        }
+                        Err(error) => {
+                            this.status = error.clone();
+                            if let Some(id) = queued_message_id
+                                && this.follow_ups.state.messages.iter().any(|message| {
+                                    message.id == id && !message.delivery_unconfirmed()
+                                })
+                            {
+                                this.fail_follow_up(&id, error, cx);
+                            }
+                            cx.notify();
                         }
                     }
-                    Err(error) => {
-                        this.status = error.clone();
-                        if let Some(message) = this.follow_ups.state.messages.first() {
-                            let id = message.id.clone();
-                            this.fail_follow_up(&id, error, cx);
-                        }
-                        cx.notify();
-                    }
-                }
-            });
+                });
         })
         .detach();
         cx.notify();

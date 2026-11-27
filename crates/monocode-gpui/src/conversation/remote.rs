@@ -835,7 +835,14 @@ impl Conversation {
         }
         if self.settings.new_worktree && self.settings.worktree_cwd.is_none() {
             if !self.preparing_worktree {
-                self.prepare_worktree(cx);
+                let queued_message_id = self
+                    .follow_ups
+                    .state
+                    .messages
+                    .iter()
+                    .find(|message| !message.delivery_unconfirmed())
+                    .map(|message| message.id.clone());
+                self.prepare_worktree(queued_message_id, cx);
             }
             return true;
         }
