@@ -3,6 +3,9 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Persisted in the shared queue's existing error field.
+pub const DELIVERY_UNCONFIRMED: &str = "Delivery unconfirmed";
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Message {
@@ -21,6 +24,10 @@ pub struct Message {
     pub steer: bool,
 }
 impl Message {
+    pub fn delivery_unconfirmed(&self) -> bool {
+        self.error.as_deref() == Some(DELIVERY_UNCONFIRMED)
+    }
+
     pub fn label(&self) -> String {
         if self.text.trim().is_empty() {
             format!(

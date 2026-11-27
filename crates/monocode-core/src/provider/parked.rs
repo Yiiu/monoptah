@@ -5,9 +5,21 @@ use std::sync::{atomic::AtomicUsize, OnceLock};
 type WriteRequest = (Vec<u8>, mpsc::Sender<std::io::Result<()>>);
 pub(super) struct Input {
     sender: Option<mpsc::Sender<WriteRequest>>,
+    pub(super) write_deadline: Option<Instant>,
 }
 impl Write for Input {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let timeout = self
+            .write_deadline
+            .map_or(Duration::from_secs(15), |deadline| {
+                deadline.saturating_duration_since(Instant::now())
+            });
+        if timeout.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Provider stdin write timed out",
+            ));
+        }
         let (reply, result) = mpsc::channel();
         self.sender
             .as_ref()
@@ -18,18 +30,16 @@ impl Write for Input {
             .map_err(|_| {
                 std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Provider input closed")
             })?;
-        result
-            .recv_timeout(Duration::from_secs(15))
-            .map_err(|error| {
-                std::io::Error::new(
-                    if error == mpsc::RecvTimeoutError::Timeout {
-                        std::io::ErrorKind::TimedOut
-                    } else {
-                        std::io::ErrorKind::BrokenPipe
-                    },
-                    "Provider stdin write failed or timed out",
-                )
-            })??;
+        result.recv_timeout(timeout).map_err(|error| {
+            std::io::Error::new(
+                if error == mpsc::RecvTimeoutError::Timeout {
+                    std::io::ErrorKind::TimedOut
+                } else {
+                    std::io::ErrorKind::BrokenPipe
+                },
+                "Provider stdin write failed or timed out",
+            )
+        })??;
         Ok(bytes.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -44,6 +54,7 @@ pub(super) struct Wire {
     reader: Option<thread::JoinHandle<()>>,
     stderr_reader: Option<thread::JoinHandle<()>>,
     writer: Option<thread::JoinHandle<()>>,
+    terminated: bool,
     /// `process::session_epoch` when the turn took this process; it is parked
     /// for reuse only while that is unchanged (see `provider::retire_session`).
     pub epoch: u64,
@@ -137,16 +148,26 @@ impl Wire {
             child,
             stdin: Input {
                 sender: Some(writes),
+                write_deadline: None,
             },
             rx,
             tail,
             reader: Some(reader),
             stderr_reader: Some(stderr_reader),
             writer: Some(writer),
+            terminated: false,
             epoch: process::turn_epoch(),
             _registration: Some(registration),
             _account: Some(account),
         })
+    }
+
+    /// A bounded Codex Stop that could not prove the old turn ended retires the
+    /// isolated child before the session can launch another writer.
+    pub(super) fn terminate_and_wait(mut self) {
+        self.stdin.sender.take();
+        process::terminate(&mut self.child);
+        self.terminated = true;
     }
 }
 impl Drop for Wire {
@@ -166,18 +187,26 @@ impl Drop for Wire {
             self.stderr_reader.take(),
         ];
         let held = (self._registration.take(), self._account.take());
+        let terminated = self.terminated;
         thread::spawn(move || {
-            process::retire_pid(pid, || {
+            let join = || {
                 for t in threads.into_iter().flatten() {
                     let _ = t.join();
                 }
-            });
+            };
+            if terminated {
+                join();
+            } else {
+                process::retire_pid(pid, join);
+            }
             drop(held);
         });
     }
     #[cfg(not(unix))]
     fn drop(&mut self) {
-        process::terminate(&mut self.child);
+        if !self.terminated {
+            process::terminate(&mut self.child);
+        }
         self.stdin.sender.take();
         if let Some(writer) = self.writer.take() {
             let _ = writer.join();
@@ -223,6 +252,17 @@ fn idle_pool() -> &'static Mutex<Vec<Parked>> {
     static POOL: OnceLock<Mutex<Vec<Parked>>> = OnceLock::new();
     POOL.get_or_init(Default::default)
 }
+
+/// Return the removed entries so callers can release their locks before reaping.
+pub(super) fn remove_idle_entries<T>(
+    pool: &Mutex<Vec<T>>,
+    remove: impl FnMut(&mut T) -> bool,
+) -> Vec<T> {
+    pool.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .extract_if(.., remove)
+        .collect()
+}
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct Binding {
     kind: Kind,
@@ -253,7 +293,7 @@ pub fn configure(limit: usize) {
 /// Serialize eviction decisions, but never hold either pool while reaping.
 pub(super) fn enforce_idle_limit() {
     static EVICT: OnceLock<Mutex<()>> = OnceLock::new();
-    let _evict = EVICT.get_or_init(Default::default).lock().unwrap();
+    let evict = EVICT.get_or_init(Default::default).lock().unwrap();
     let mut entries: Vec<_> = idle_pool()
         .lock()
         .unwrap()
@@ -277,21 +317,10 @@ pub(super) fn enforce_idle_limit() {
     if retire.is_empty() {
         return;
     }
-    let retired = {
-        let mut pool = idle_pool().lock().unwrap();
-        let mut retired = Vec::new();
-        let mut index = 0;
-        while index < pool.len() {
-            if retire.contains(&pool[index].wire.child.id()) {
-                retired.push(pool.remove(index));
-            } else {
-                index += 1;
-            }
-        }
-        retired
-    };
-    drop(retired);
-    opencode::retire_idle(&retire);
+    let retired = remove_idle_entries(idle_pool(), |entry| retire.contains(&entry.wire.child.id()));
+    let retired_opencode = opencode::remove_idle(&retire);
+    drop(evict);
+    drop((retired, retired_opencode));
 }
 /// The key under the Settings → Agents launch as saved now. Live paths key a process by
 /// the launch it was started with (`key_for`).
@@ -336,9 +365,9 @@ pub(super) fn take(key: &str) -> Option<Parked> {
     let mut pool = idle_pool().lock().unwrap();
     let ix = pool.iter().position(|p| p.key == key)?;
     let mut parked = pool.remove(ix);
+    drop(pool);
     if parked.wire.epoch != epoch {
         // Parked before its session was retired: never reuse it.
-        drop(pool);
         thread::spawn(move || drop(parked));
         return None;
     }
@@ -350,16 +379,23 @@ pub(super) fn take(key: &str) -> Option<Parked> {
     process::mark_idle(parked.wire.child.id(), false);
     Some(parked)
 }
-pub(super) fn put(wire: Wire, mut protocol: Protocol) {
+pub(super) fn put(wire: Wire, protocol: Protocol) {
+    if insert_parked(wire, protocol).is_none() {
+        maintain_idle_pool();
+    }
+}
+
+/// Return ownership of any wire that cannot be parked for the caller to retire.
+fn insert_parked(wire: Wire, mut protocol: Protocol) -> Option<Wire> {
     // A prompt still queued in the CLI would answer into the next turn.
     if LIMIT.load(Ordering::Relaxed) == 0
         || protocol.request.provider_id.is_none()
         || !protocol.claude_unstarted_steers.is_empty()
     {
-        return;
+        return Some(wire);
     }
     if !process::may_park(wire.epoch) {
-        return;
+        return Some(wire);
     }
     let key = key_for(&protocol.request, &protocol.launch);
     protocol.emitted.clear();
@@ -373,7 +409,7 @@ pub(super) fn put(wire: Wire, mut protocol: Protocol) {
     let mut pool = idle_pool().lock().unwrap();
     // Checked under the pool lock so `retire_session` cannot miss this entry.
     if !process::may_park(wire.epoch) {
-        return;
+        return Some(wire);
     }
     pool.push(Parked {
         wire,
@@ -382,26 +418,22 @@ pub(super) fn put(wire: Wire, mut protocol: Protocol) {
         at: Instant::now(),
         owner: process::owner(),
     });
-    drop(pool);
+    None
+}
+
+fn maintain_idle_pool() {
     enforce_idle_limit();
     static WATCH: OnceLock<()> = OnceLock::new();
     WATCH.get_or_init(|| {
         thread::spawn(|| loop {
             thread::sleep(Duration::from_secs(1));
-            let mut pool = idle_pool().lock().unwrap();
             let limit = LIMIT.load(Ordering::Relaxed);
-            let mut ix = 0;
-            while ix < pool.len() {
-                if limit == 0
-                    || pool[ix].at.elapsed() >= Duration::from_secs(180)
-                    || pool[ix].wire.child.try_wait().ok().flatten().is_some()
-                {
-                    pool.remove(ix);
-                } else {
-                    ix += 1;
-                }
-            }
-            drop(pool);
+            let retired = remove_idle_entries(idle_pool(), |entry| {
+                limit == 0
+                    || entry.at.elapsed() >= Duration::from_secs(180)
+                    || entry.wire.child.try_wait().ok().flatten().is_some()
+            });
+            drop(retired);
             enforce_idle_limit();
         });
     });
@@ -533,27 +565,23 @@ pub(super) fn settle_cancelled(mut wire: Wire, mut protocol: Protocol) {
 fn park_cancelled(wire: Wire, protocol: Protocol, binding: &Binding, epoch: u64) {
     // Hold the invalidation lock through insertion: a cold replacement or a
     // forgotten binding must not race an old retirement back into the pool.
-    let epochs = epochs().lock().unwrap();
-    if epochs.get(binding).copied().unwrap_or_default() == epoch {
-        put(wire, protocol);
+    let unparked = {
+        let epochs = epochs().lock().unwrap();
+        if epochs.get(binding).copied().unwrap_or_default() == epoch {
+            insert_parked(wire, protocol)
+        } else {
+            Some(wire)
+        }
+    };
+    if unparked.is_none() {
+        maintain_idle_pool();
     }
 }
 
 /// Remove and return the warm processes owned by `session`, and the pids of
 /// those entries. Dropping the entries retires them gracefully.
 pub(super) fn retire_session(session: i64) -> Vec<u32> {
-    let mut retired = Vec::new();
-    {
-        let mut pool = idle_pool().lock().unwrap_or_else(|e| e.into_inner());
-        let mut ix = 0;
-        while ix < pool.len() {
-            if pool[ix].owner == Some(session) {
-                retired.push(pool.remove(ix));
-            } else {
-                ix += 1;
-            }
-        }
-    }
+    let retired = remove_idle_entries(idle_pool(), |entry| entry.owner == Some(session));
     let pids = retired.iter().map(|p| p.wire.child.id()).collect();
     if !retired.is_empty() {
         thread::spawn(move || drop(retired));
@@ -563,14 +591,19 @@ pub(super) fn retire_session(session: i64) -> Vec<u32> {
 
 pub fn discard_worktree(path: &Path) {
     let root = path.to_string_lossy();
-    idle_pool().lock().unwrap().retain(|p| {
-        !crate::files::is_equal_or_inside(&p.protocol.request.cwd.to_string_lossy(), &root)
-    });
-    for (binding, epoch) in epochs().lock().unwrap().iter_mut() {
-        if crate::files::is_equal_or_inside(&binding.cwd.to_string_lossy(), &root) {
-            *epoch += 1;
+    let in_worktree = |cwd: &Path| crate::files::is_equal_or_inside(&cwd.to_string_lossy(), &root);
+    let retired = {
+        let mut epochs = epochs().lock().unwrap();
+        for (binding, epoch) in epochs.iter_mut() {
+            if in_worktree(&binding.cwd) {
+                *epoch += 1;
+            }
         }
-    }
+        remove_idle_entries(idle_pool(), |entry| {
+            in_worktree(&entry.protocol.request.cwd)
+        })
+    };
+    drop(retired);
 }
 
 pub(super) fn forget_session(kind: Kind, session: &str, account: &str, cwd: &Path) {
@@ -580,20 +613,7 @@ pub(super) fn forget_session(kind: Kind, session: &str, account: &str, cwd: &Pat
         account: account.into(),
         cwd: cwd.into(),
     };
-    *epochs().lock().unwrap().entry(binding.clone()).or_default() += 1;
-    let retired = {
-        let mut pool = idle_pool().lock().unwrap();
-        let mut retired = Vec::new();
-        let mut ix = 0;
-        while ix < pool.len() {
-            if Binding::request(&pool[ix].protocol.request) == binding {
-                retired.push(pool.remove(ix));
-            } else {
-                ix += 1;
-            }
-        }
-        retired
-    };
+    let retired = invalidate_binding(binding);
     if !retired.is_empty() {
         thread::spawn(move || drop(retired));
     }
@@ -603,18 +623,49 @@ pub(super) fn forget_session(kind: Kind, session: &str, account: &str, cwd: &Pat
 /// Evict every warm configuration for that binding, including an older model
 /// or permission mode which the exact launch-key lookup would miss.
 pub(super) fn discard_session(request: &Request) {
-    *epochs()
-        .lock()
-        .unwrap()
-        .entry(Binding::request(request))
-        .or_default() += 1;
-    idle_pool().lock().unwrap().retain(|parked| {
-        let old = &parked.protocol.request;
-        !(old.kind == request.kind
-            && old.provider_id == request.provider_id
-            && old.cwd == request.cwd
-            && old.settings.account.id == request.settings.account.id)
+    drop(invalidate_binding(Binding::request(request)));
+}
+
+fn invalidate_binding(binding: Binding) -> Vec<Parked> {
+    let mut epochs = epochs().lock().unwrap();
+    *epochs.entry(binding.clone()).or_default() += 1;
+    remove_idle_entries(idle_pool(), |entry| {
+        Binding::request(&entry.protocol.request) == binding
+    })
+}
+
+#[test]
+fn idle_entries_are_reaped_after_the_pool_is_unlocked() {
+    struct SlowChild {
+        reaping: mpsc::Sender<()>,
+        resume: mpsc::Receiver<()>,
+    }
+    impl Drop for SlowChild {
+        fn drop(&mut self) {
+            self.reaping.send(()).unwrap();
+            let _ = self.resume.recv_timeout(Duration::from_secs(5));
+        }
+    }
+
+    let (reaping, started) = mpsc::channel();
+    let (resume, suspended) = mpsc::channel();
+    let pool = Arc::new(Mutex::new(vec![SlowChild {
+        reaping,
+        resume: suspended,
+    }]));
+    let worker_pool = pool.clone();
+    let worker = thread::spawn(move || {
+        drop(remove_idle_entries(&worker_pool, |_| true));
     });
+
+    started.recv_timeout(Duration::from_secs(5)).unwrap();
+    let accessible = pool.try_lock().is_ok_and(|entries| entries.is_empty());
+    let _ = resume.send(());
+    worker.join().unwrap();
+    assert!(
+        accessible,
+        "an unrelated session can access the pool during child cleanup"
+    );
 }
 
 #[cfg(all(test, unix))]

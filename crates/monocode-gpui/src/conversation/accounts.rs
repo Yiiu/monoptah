@@ -314,7 +314,9 @@ impl Conversation {
         self.status = "Ready".into();
         self.follow_ups.state.paused = false;
         for message in &mut self.follow_ups.state.messages {
-            message.error = None;
+            if !message.delivery_unconfirmed() {
+                message.error = None;
+            }
         }
         self.save_settings(cx);
         self.save_follow_ups(cx);

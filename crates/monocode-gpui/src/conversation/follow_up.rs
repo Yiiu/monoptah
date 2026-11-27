@@ -2,6 +2,12 @@
 use super::*;
 use monocode_core::follow_up::{Message, State};
 
+fn trace(session: i64, message: &str, stage: &str) {
+    if std::env::var_os("MONOCODE_NATIVE_TRACE").is_some() {
+        eprintln!("follow-up session={session} message={message} stage={stage}");
+    }
+}
+
 #[derive(Default)]
 pub(super) struct FollowUps {
     pub state: State,
@@ -107,12 +113,19 @@ impl Conversation {
                                 .update(cx, |view, cx| view.set_saved_draft(draft, cx));
                         }
                         this.follow_ups.persisted = this.follow_ups.persisted.max(revision);
+                        if let Some(id) = &this.follow_ups.requested
+                            && this.follow_ups.persisted >= this.follow_ups.state.revision
+                        {
+                            trace(this.summary.id, id, "queue-saved");
+                        }
                         this.pump_follow_ups(cx);
                     }
                     Err(error) if this.follow_ups.state.revision == revision => {
                         this.follow_ups.state.paused = true;
                         this.status = format!("Could not save messages: {error}");
-                        if let Some(head) = this.follow_ups.state.messages.first_mut() {
+                        if let Some(head) = this.follow_ups.state.messages.first_mut()
+                            && !head.delivery_unconfirmed()
+                        {
                             head.error = Some(this.status.clone());
                         }
                     }
@@ -287,6 +300,7 @@ impl Conversation {
             .messages
             .retain(|message| message.id != id);
         if before != self.follow_ups.state.messages.len() {
+            trace(self.summary.id, id, "accepted");
             self.save_follow_ups(cx);
         }
     }
@@ -298,6 +312,15 @@ impl Conversation {
             .iter_mut()
             .find(|m| m.id == id)
         {
+            if message.error.as_deref() == Some(error.as_str()) {
+                return;
+            }
+            let stage = if error == monocode_core::follow_up::DELIVERY_UNCONFIRMED {
+                "delivery-unconfirmed"
+            } else {
+                "rejected"
+            };
+            trace(self.summary.id, id, stage);
             message.error = Some(error);
             self.follow_ups.state.paused = true;
             if self
@@ -332,24 +355,33 @@ impl Conversation {
             || self.settings.mono.is_some()
             || !self.loaded
             || self.preparing_worktree
-            || (self.follow_ups.state.paused && self.follow_ups.requested.is_none())
             || self.follow_ups.sending.is_some()
             || self.follow_ups.resuming
             || self.follow_ups.persisted < self.follow_ups.state.revision
         {
             return;
         }
-        let message = self
+        let mut sendable = self
+            .follow_ups
+            .state
+            .messages
+            .iter()
+            .filter(|message| !message.delivery_unconfirmed());
+        let requested = self
             .follow_ups
             .requested
-            .as_ref()
-            .and_then(|id| self.follow_ups.state.messages.iter().find(|m| &m.id == id))
+            .as_deref()
+            .and_then(|id| sendable.clone().find(|message| message.id == id));
+        if self.follow_ups.state.paused && requested.is_none() {
+            return;
+        }
+        let message = requested
             .or_else(|| {
                 self.busy
-                    .then(|| self.follow_ups.state.messages.iter().find(|m| m.steer))
+                    .then(|| sendable.clone().find(|message| message.steer))
                     .flatten()
             })
-            .or_else(|| self.follow_ups.state.messages.first());
+            .or_else(|| sendable.next());
         let Some(message) = message.cloned() else {
             return;
         };
@@ -383,22 +415,23 @@ impl Conversation {
             {
                 return;
             }
-            if let Some(controls) = &self.controls {
-                if controls
+            let id = message.id.clone();
+            if self.controls.as_ref().is_some_and(|controls| {
+                controls
                     .send(Control {
-                        id: message.id.clone(),
-                        decision: Decision::Steer(message.clone()),
+                        id: id.clone(),
+                        decision: Decision::Steer(message),
                     })
                     .is_ok()
-                {
-                    self.follow_ups.sending = Some(message.id);
-                } else {
-                    self.fail_follow_up(
-                        &message.id,
-                        "The provider disconnected before accepting this message".into(),
-                        cx,
-                    );
-                }
+            }) {
+                trace(self.summary.id, &id, "dispatched-to-runner");
+                self.follow_ups.sending = Some(id);
+            } else {
+                self.fail_follow_up(
+                    &id,
+                    "The provider disconnected before accepting this message".into(),
+                    cx,
+                );
             }
         } else {
             // A message a remote device queued without consent to wake runs without waking.
@@ -462,7 +495,15 @@ impl Conversation {
             self.defer_history_action(|this, cx| this.resume_queue(cx), cx);
             return;
         }
-        if self.busy || !self.follow_ups.state.paused || self.follow_ups.state.messages.is_empty() {
+        if self.busy
+            || !self.follow_ups.state.paused
+            || self
+                .follow_ups
+                .state
+                .messages
+                .iter()
+                .all(Message::delivery_unconfirmed)
+        {
             return;
         }
         if self.is_remote() {
@@ -470,7 +511,9 @@ impl Conversation {
             // sent to it as a real message. Retry just releases the queue.
             self.follow_ups.state.paused = false;
             for message in &mut self.follow_ups.state.messages {
-                message.error = None;
+                if !message.delivery_unconfirmed() {
+                    message.error = None;
+                }
             }
             self.save_follow_ups(cx);
             self.pump_follow_ups(cx);
@@ -495,7 +538,7 @@ impl Conversation {
             .state
             .messages
             .iter()
-            .find(|message| message.id == id)
+            .find(|message| message.id == id && !message.delivery_unconfirmed())
         else {
             return;
         };
@@ -599,19 +642,33 @@ impl Conversation {
             .state
             .messages
             .iter()
-            .any(|m| m.error.is_some());
+            .any(|m| m.error.is_some() && !m.delivery_unconfirmed());
+        let has_sendable = self
+            .follow_ups
+            .state
+            .messages
+            .iter()
+            .any(|m| !m.delivery_unconfirmed());
         let card = composer_shelf::card("message-queue-card", self.classic_layout)
             .debug_selector(|| "message-queue-card".into())
             .when(self.follow_ups.state.paused && !self.follow_ups.resuming, |d| d.child(
                 div().h(px(28.)).flex().items_center().gap_2().border_b_1().border_color(content(0.1))
                     .child(icon("queue-pause", 14.))
-                    .child(div().flex_1().min_w_0().truncate().child(if failed { "A message couldn't be sent" } else { "Queue paused because you interrupted" }))
-                    .child(queue_button("queue-resume", if failed { "Retry queue" } else { "Resume queue" }, "queue-play").w_auto().px(px(6.)).gap(px(6.)).child(if failed { "Retry" } else { "Resume" }).on_click(cx.listener(|this, _, _, cx| this.resume_queue(cx))))
+                    .child(div().flex_1().min_w_0().truncate().child(if failed { "A message couldn't be sent" } else { "Queue paused" }))
+                    .when(has_sendable, |d| d.child(queue_button("queue-resume", if failed { "Retry queue" } else { "Resume queue" }, "queue-play").w_auto().px(px(6.)).gap(px(6.)).child(if failed { "Retry" } else { "Resume" }).on_click(cx.listener(|this, _, _, cx| this.resume_queue(cx)))))
             ))
             .children(self.follow_ups.state.messages.iter().enumerate().map(|(index, message)| {
                 let id = message.id.clone();
                 let editing = self.follow_ups.edit.as_ref().filter(|edit| edit.id == id);
                 let sending = self.follow_ups.sending.as_ref() == Some(&id);
+                let unconfirmed = message.delivery_unconfirmed();
+                let waiting = if sending {
+                    Some("Waiting for agent confirmation…")
+                } else if self.follow_ups.requested.as_ref() == Some(&id) && message.error.is_none() {
+                    Some("Waiting to send…")
+                } else {
+                    None
+                };
                 div().id(SharedString::from(format!("queued-{id}"))).role(Role::Group).aria_label(format!("Queued message: {}", message.label())).min_h(px(32.)).flex().items_center().gap(px(10.)).when(index > 0, |d| d.border_t_1().border_color(content(0.05)))
                     .child(icon("queue-list", 14.).text_color(content(0.35)))
                     .map(|row| if let Some(edit) = editing {
@@ -620,17 +677,45 @@ impl Conversation {
                             .child(queue_button("queue-cancel", "Cancel queued message edit", "close").on_click(cx.listener(|this, _, window, cx| this.finish_queue_edit(false, window, cx))))
                     } else {
                         let (steer, edit, remove) = (id.clone(), id.clone(), id);
-                        row.child(div().flex_1().min_w_0().py_1().child(div().id("queued-message-text").role(Role::Label).aria_label(message.label()).truncate().text_color(content(0.75)).child(message.label())).when_some(message.error.clone(), |d, error| d.child(div().id("queue-error").role(Role::Alert).text_color(gpui::rgb(0xf87171)).child(error))))
-                            .when(Kind::from_id(&self.summary.provider).can_steer() && !self.is_remote(), |d| d.child(queue_button("queue-steer", "Steer queued message", "queue-steer").w_auto().px_2().gap(px(6.)).opacity(if sending { 0.4 } else { 1. }).child("Steer").on_click(cx.listener(move |this, _, _, cx| {
-                                if !sending && let Some(message) = this.follow_ups.state.messages.iter_mut().find(|m| m.id == steer) {
-                                    if !message.can_steer() && this.busy { return; }
-                                    message.steer = true;
-                                    message.error = None;
-                                    this.follow_ups.requested = Some(steer.clone());
-                                    this.save_follow_ups(cx);
-                                }
-                            }))))
-                            .child(queue_button("queue-edit", "Edit queued message", "pencil-edit").opacity(if sending { 0.4 } else { 1. }).on_click(cx.listener(move |this, _, window, cx| { if !sending { this.edit_queued(edit.clone(), window, cx); } })))
+                        let label = message.label();
+                        let can_steer = !unconfirmed
+                            && Kind::from_id(&self.summary.provider).can_steer()
+                            && !self.is_remote();
+                        let description = div()
+                            .flex_1()
+                            .min_w_0()
+                            .py_1()
+                            .child(
+                                div().id("queued-message-text").role(Role::Label)
+                                    .aria_label(label.clone()).truncate()
+                                    .text_color(content(0.75)).child(label),
+                            )
+                            .when_some(message.error.clone(), |d, error| {
+                                d.child(div().id("queue-error").role(Role::Alert)
+                                    .text_color(gpui::rgb(0xf87171)).child(error))
+                            })
+                            .when_some(waiting, |d, label| {
+                                d.child(
+                                    div().id("queue-status").role(Role::Status)
+                                        .text_color(content(0.55)).child(label),
+                                )
+                            });
+                        row.child(description)
+                            .when(can_steer, |d| {
+                                d.child(queue_button("queue-steer", "Steer queued message", "queue-steer")
+                                    .w_auto().px_2().gap(px(6.)).opacity(if sending { 0.4 } else { 1. })
+                                    .child("Steer")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if !sending { this.request_steer(&steer, cx); }
+                                    })))
+                            })
+                            .when(!unconfirmed, |d| {
+                                d.child(queue_button("queue-edit", "Edit queued message", "pencil-edit")
+                                    .opacity(if sending { 0.4 } else { 1. })
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        if !sending { this.edit_queued(edit.clone(), window, cx); }
+                                    })))
+                            })
                             .child(queue_button("queue-remove", "Remove queued message", "trash").opacity(if sending { 0.4 } else { 1. }).on_click(cx.listener(move |this, _, _, cx| {
                                 if !sending {
                                     this.follow_ups.state.messages.retain(|m| m.id != remove);
@@ -645,6 +730,26 @@ impl Conversation {
         composer_shelf::shelf("message-queue")
             .child(self.follow_ups.motion.card(card, card_width, window))
             .into_any_element()
+    }
+
+    fn request_steer(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(message) = self
+            .follow_ups
+            .state
+            .messages
+            .iter_mut()
+            .find(|message| message.id == id && !message.delivery_unconfirmed())
+        else {
+            return;
+        };
+        if self.busy && !message.can_steer() {
+            return;
+        }
+        trace(self.summary.id, id, "requested");
+        message.steer = true;
+        message.error = None;
+        self.follow_ups.requested = Some(id.to_owned());
+        self.save_follow_ups(cx);
     }
 }
 
@@ -934,6 +1039,7 @@ mod tests {
                 view.send(cx);
                 view.stop(cx);
                 assert!(view.stopping);
+                assert_eq!(view.status, "Stopping…");
                 assert!(view.follow_ups.state.paused);
                 assert!(!view.follow_ups.ready);
                 assert!(view.controls.is_none());
@@ -976,6 +1082,38 @@ mod tests {
                 assert_eq!(
                     view.follow_ups.state.messages[0].error.as_deref(),
                     Some("Rejected by provider")
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn an_unconfirmed_steer_cannot_dispatch_again(cx: &mut TestAppContext) {
+        let window = conversation(cx);
+        let (controls, received) = std::sync::mpsc::channel();
+        window
+            .update(cx, |view, _, cx| {
+                view.busy = true;
+                view.controls = Some(controls);
+                view.follow_ups.ready = true;
+                view.follow_ups.state.messages.push(Message {
+                    id: "unconfirmed".into(),
+                    text: "retained".into(),
+                    error: Some(monocode_core::follow_up::DELIVERY_UNCONFIRMED.into()),
+                    steer: true,
+                    ..Default::default()
+                });
+                view.follow_ups.requested = Some("unconfirmed".into());
+                view.pump_follow_ups(cx);
+                assert!(
+                    received.try_recv().is_err(),
+                    "a missing receipt must not cause another write"
+                );
+                assert_eq!(view.follow_ups.state.messages.len(), 1);
+                view.follow_up_delivered("unconfirmed", cx);
+                assert!(
+                    view.follow_ups.state.messages.is_empty(),
+                    "a late receipt still settles the message"
                 );
             })
             .unwrap();

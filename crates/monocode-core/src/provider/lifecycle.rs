@@ -1,8 +1,105 @@
 //! Lifecycle rules from the desktop adapters. An idle stream is not a failed turn.
 use super::*;
 static CONTROL_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+const CODEX_INTERRUPT_ACK_TIMEOUT: Duration = Duration::from_secs(3);
+const CODEX_INTERRUPT_TERMINAL_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl Protocol {
+    /// An RPC reply confirms only that the interrupt request was handled.
+    /// Keep the old writer until its exact turn ends or it is retired.
+    pub(super) fn settle_codex_stop(
+        &mut self,
+        wire: &mut parked::Wire,
+        pending: &mut Vec<Event>,
+    ) -> bool {
+        let trace = |phase: &str, turn: Option<&str>| {
+            if std::env::var_os("MONOCODE_NATIVE_TRACE").is_some() {
+                eprintln!("provider-stop phase={phase} turn_id={}", turn.unwrap_or(""));
+            }
+        };
+        let mut deadline = Instant::now() + CODEX_INTERRUPT_ACK_TIMEOUT;
+        wire.stdin.write_deadline = Some(deadline);
+        let interrupted = self.interrupt(&mut wire.stdin);
+        wire.stdin.write_deadline = None;
+        if interrupted != Ok(true) {
+            if interrupted.is_err() && Instant::now() >= deadline {
+                pending.push(Event::StopTimedOut {
+                    stage: "acknowledgement",
+                });
+            }
+            trace("interrupt_not_written", self.active_turn.as_deref());
+            return false;
+        }
+        trace("interrupt_written", self.active_turn.as_deref());
+
+        let mut stage = "acknowledgement";
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let result = if remaining.is_zero() {
+                Err(mpsc::RecvTimeoutError::Timeout)
+            } else {
+                wire.rx.recv_timeout(remaining)
+            };
+            let bytes = match result {
+                Ok(Ok(bytes)) => bytes,
+                Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    trace("disconnected", self.active_turn.as_deref());
+                    return false;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    trace(stage, self.active_turn.as_deref());
+                    pending.push(Event::StopTimedOut { stage });
+                    return false;
+                }
+            };
+            let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+                continue;
+            };
+            if value["id"].as_str() == self.interrupt_id.as_deref() && stage == "acknowledgement" {
+                let rejected = value.get("error").is_some_and(|error| !error.is_null());
+                if rejected || value.get("result").is_some() {
+                    trace(
+                        if rejected {
+                            "interrupt_rejected"
+                        } else {
+                            "interrupt_acknowledged"
+                        },
+                        self.active_turn.as_deref(),
+                    );
+                    stage = "terminal";
+                    deadline = Instant::now() + CODEX_INTERRUPT_TERMINAL_TIMEOUT;
+                }
+                continue;
+            }
+            if let Some(events) = self.steer_response(&value) {
+                pending.extend(events);
+            }
+            let params = &value["params"];
+            match value["method"].as_str() {
+                Some("item/started" | "item/completed") => {
+                    pending.extend(self.codex_steer_echo(params, &params["item"]));
+                }
+                Some("turn/completed" | "turn/aborted") => {
+                    let turn = params["turnId"]
+                        .as_str()
+                        .or_else(|| params["turn"]["id"].as_str());
+                    if turn.is_some()
+                        && turn == self.active_turn.as_deref()
+                        && params["threadId"].as_str().is_none_or(|thread| {
+                            Some(thread) == self.request.provider_id.as_deref()
+                        })
+                    {
+                        pending.extend(self.codex_terminal_steers(&value));
+                        self.done = true;
+                        trace("terminal_received", turn);
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     pub(super) fn codex_elicitation(
         &mut self,
         wire: Value,

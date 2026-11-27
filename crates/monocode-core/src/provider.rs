@@ -28,6 +28,8 @@ mod discovery;
 mod follow_up;
 mod goal;
 pub use goal::recover_claude_goal;
+#[cfg(all(test, any(unix, windows)))]
+mod codex_stop_tests;
 mod kind;
 mod lifecycle;
 mod limits;
@@ -99,6 +101,13 @@ pub enum Event {
     FollowUpFailed {
         id: String,
         error: String,
+    },
+    /// A write was attempted without evidence of acceptance or refusal.
+    FollowUpUnknown {
+        id: String,
+    },
+    StopTimedOut {
+        stage: &'static str,
     },
     SessionId(String),
     TurnId(String),
@@ -289,7 +298,7 @@ struct Protocol {
     claude_usage_limit: Option<crate::usage::Limit>,
     claude_resume_at: Option<Instant>,
     follow_up_ready: bool,
-    steering: HashMap<String, (crate::follow_up::Message, Instant)>,
+    steering: HashMap<String, follow_up::PendingSteer>,
     request: Request,
     emitted: HashMap<String, String>,
     claude_message: usize,
@@ -512,6 +521,18 @@ impl Protocol {
         }
         if let Some(events) = self.steer_response(&v) {
             return Ok(events);
+        }
+        if self.request.kind == Kind::Codex
+            && matches!(
+                v["method"].as_str(),
+                Some("item/started" | "item/completed")
+            )
+            && v["params"]["item"]["type"] == "userMessage"
+        {
+            return Ok(self
+                .codex_steer_echo(&v["params"], &v["params"]["item"])
+                .into_iter()
+                .collect());
         }
         let mut started_turn = None;
         if self.request.kind == Kind::Codex {
@@ -1899,6 +1920,9 @@ fn run_operation(
         let mut interrupted = false;
         loop {
             if cancel.load(Ordering::Relaxed) && !interrupted {
+                if protocol.request.kind == Kind::Codex {
+                    return Err("Stopped".into());
+                }
                 interrupted = true;
                 if !protocol.interrupt(&mut stdin)? {
                     return Err("Stopped".into());
@@ -1974,30 +1998,7 @@ fn run_operation(
                             );
                         }
                     }
-                    if interrupted {
-                        let reply_id = value["id"].as_str();
-                        let turn_id = value["params"]["turnId"]
-                            .as_str()
-                            .or_else(|| value["params"]["turn"]["id"].as_str());
-                        let terminal = matches!(
-                            value["method"].as_str(),
-                            Some("turn/completed" | "turn/aborted")
-                        ) && (turn_id.is_some()
-                            && turn_id == protocol.active_turn.as_deref()
-                            || turn_id.is_none() && protocol.previous_turn.is_none());
-                        let codex_ack = protocol.request.kind == Kind::Codex
-                            && (reply_id.is_some() && reply_id == protocol.interrupt_id.as_deref()
-                                || terminal);
-                        let claude_end =
-                            protocol.request.kind == Kind::Claude && claude_turn_result(&value);
-                        if codex_ack || claude_end {
-                            stop_confirmed = value.get("error").is_none_or(Value::is_null);
-                            if terminal || claude_end {
-                                protocol.done = true;
-                            }
-                            return Err("Stopped".into());
-                        }
-                    }
+                    pending.extend(protocol.codex_terminal_steers(&value));
                     let events = match protocol.frame(value, &mut stdin) {
                         Ok(events) => events,
                         Err(_) if interrupted => return Err("Stopped".into()),
@@ -2093,36 +2094,48 @@ fn run_operation(
             }
         }
     })();
-    // Cancellation can arrive while publishing an event batch. Its callback
-    // then returns Stopped before the next receive-loop iteration can interrupt.
-    if cancel.load(Ordering::Relaxed) && protocol.interrupt_id.is_none() {
-        let _ = protocol.interrupt(&mut wire.stdin);
+    let cancelled = cancel.load(Ordering::Relaxed);
+    let codex_stop = cancelled && protocol.request.kind == Kind::Codex;
+    // A cancellation can arrive while the caller is publishing a batch.
+    // Settle it here as well as when the receive loop sees it directly.
+    if codex_stop {
+        stop_confirmed = protocol.done || protocol.settle_codex_stop(&mut wire, &mut pending);
+    } else if cancelled {
+        if protocol.interrupt_id.is_none() {
+            let _ = protocol.interrupt(&mut wire.stdin);
+        }
+        stop_confirmed |= protocol.done;
     }
-    if cancel.load(Ordering::Relaxed) && protocol.done {
-        stop_confirmed = true;
-    }
-    if result.is_err() && !cancel.load(Ordering::Relaxed) {
+    if result.is_err() && !cancelled {
         if let Some(limit) = protocol.claude_usage_limit.take() {
             pending.push(Event::UsageLimited(limit));
         }
     }
+    pending.extend(protocol.unconfirmed_codex_steering(true));
     if !pending.is_empty() {
         let _ = emit(std::mem::take(&mut pending));
     }
-    if eligible
-        && cancel.load(Ordering::Relaxed)
+    if codex_stop && !stop_confirmed {
+        wire.terminate_and_wait();
+    } else if eligible
+        && cancelled
+        && !codex_stop
         && !protocol.done
         && protocol.request.kind != Kind::Antigravity
         && protocol.interrupt_id.is_some()
     {
         parked::settle_cancelled(wire, protocol);
     } else if eligible
-        && ((result.is_ok() && !cancel.load(Ordering::Relaxed))
+        && ((result.is_ok() && !cancelled)
             || (stop_confirmed && protocol.request.kind != Kind::Antigravity))
     {
         parked::put(wire, protocol);
     }
-    result
+    if codex_stop {
+        Err("Stopped".into())
+    } else {
+        result
+    }
 }
 
 #[cfg(test)]

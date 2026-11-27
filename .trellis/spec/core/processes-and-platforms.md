@@ -93,6 +93,40 @@ session's environment, the account (`settings.account.apply(kind, &mut command)?
 `provider/opencode.rs`, `provider/acp.rs`, `provider/rewind.rs`. Blocking provider work runs on a
 worker thread, never in a GPUI render/input handler (`provider.rs` header).
 
+### Native Codex control receipts and idle process retirement
+
+- **Scope** — Local Codex Steer and Stop share a provider wire with turn output.
+  A stalled child or a lost receipt can otherwise hold the conversation queue.
+  The warm pool is shared by sessions, so a blocking destructor under its lock
+  can also stall unrelated sessions.
+- **Entry points** — `Protocol::steer` sends `turn/steer` with the current
+  `expectedTurnId`, a per-attempt JSON-RPC ID, and the queue item's stable
+  `clientUserMessageId`. `Protocol::settle_codex_stop` sends `turn/interrupt`
+  on the old wire and waits for that wire's active turn to end.
+- **Delivery contract** — A matching RPC success or a user-message echo with the
+  matching message and turn identity produces `Event::FollowUp`. The runtime
+  commits the receipt with the transcript rows before removing the queue item.
+  `clientUserMessageId` correlates delivery evidence. The provider may still
+  execute repeated requests that carry that ID.
+- **Outcomes** — An explicit Steer rejection produces `Event::FollowUpFailed`.
+  Missing evidence after 15 seconds produces `Event::FollowUpUnknown`. Keep
+  the request for late evidence while the turn owns the wire and hold the
+  queue item from automatic dispatch. Stop budgets 3 seconds for sending the
+  interrupt and receiving its reply, then 5 seconds for the matching terminal
+  event. At timeout, `Event::StopTimedOut` identifies the stage and the worker
+  retires its own child.
+- **Cases** — A successful interrupt reply leaves the wire in use until its
+  matching terminal event. A terminal event for a different thread cannot
+  settle it. An unconfirmed stop retires the wire before the session reopens.
+- **Regression checks** — `provider::codex_stop_tests` covers both timeout
+  stages, a late receipt and concurrent delivery in another session.
+  `provider::parked::idle_entries_are_reaped_after_the_pool_is_unlocked` checks
+  lock access during a blocked destructor.
+- **Lock lifetime** — Removing an entry with `pool.retain(...)` drops it under
+  the guard. Use `remove_idle_entries` to move out owned entries and release the
+  shared locks before dropping them. On Windows the destructor can wait for
+  the child and its pipe threads.
+
 ## Platform differences you must handle
 
 - Use `#[cfg(unix)]`, `#[cfg(windows)]`, `#[cfg(target_os = "macos")]` blocks inside one function

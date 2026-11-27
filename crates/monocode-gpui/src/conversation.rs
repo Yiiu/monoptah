@@ -1949,7 +1949,9 @@ impl Conversation {
                                 if !stopping && this.status == "Ready" {
                                     this.follow_ups.state.paused = false;
                                     for message in &mut this.follow_ups.state.messages {
-                                        message.error = None;
+                                        if !message.delivery_unconfirmed() {
+                                            message.error = None;
+                                        }
                                     }
                                     this.save_follow_ups(cx);
                                 }
@@ -3291,7 +3293,7 @@ impl Conversation {
         self.approvals.clear();
         self.cancel_questions(cx);
         self.controls = None;
-        self.status = "Ready".into();
+        self.status = "Stopping…".into();
         self.transcript
             .update(cx, |view, cx| view.stop_streaming(cx));
         self.review

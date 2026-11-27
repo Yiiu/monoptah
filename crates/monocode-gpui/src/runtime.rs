@@ -242,6 +242,8 @@ fn run_turn_using(
     pending.own_context(&summary.provider, &source_account);
     let mut initial_delivery = None;
     let mut accepted_messages = Vec::new();
+    let mut follow_up_issues = std::collections::BTreeMap::new();
+    let mut stop_timeout = None;
     let mut provider_id = summary.provider_id.clone();
     let mut turn_start = 0;
     let mut turn_receipt: Option<(usize, monocode_core::agent::TurnInfo)> = None;
@@ -819,18 +821,43 @@ fn run_turn_using(
         };
         // The running-work list attributes the provider and its tools to this session.
         let result = monocode_core::process::owned_by(summary.id, || {
-            provider::run_with_controls(request, cancel.clone(), Some(controls), |events| {
-                // Cancellation freezes the transcript, even while the native
-                // provider drains its interrupt acknowledgement.
-                if cancel.load(Ordering::Relaxed) {
-                    return Err("Stopped".into());
-                }
-                let publications = visual_bridge
-                    .as_ref()
-                    .map(|bridge| bridge.drain())
-                    .unwrap_or_default();
+            provider::run_with_controls(request, cancel.clone(), Some(controls), |mut events| {
+                // Freeze streaming after Stop, while still committing any delivery
+                // evidence the retiring provider can supply.
+                let stopping = cancel.load(Ordering::Relaxed);
+                let publications = if stopping {
+                    events.retain(|event| {
+                        matches!(
+                            event,
+                            Event::FollowUp(_)
+                                | Event::FollowUpFailed { .. }
+                                | Event::FollowUpUnknown { .. }
+                                | Event::StopTimedOut { .. }
+                        )
+                    });
+                    Vec::new()
+                } else {
+                    visual_bridge
+                        .as_ref()
+                        .map(|bridge| bridge.drain())
+                        .unwrap_or_default()
+                };
                 if events.is_empty() && publications.is_empty() {
-                    return Ok(());
+                    return if stopping {
+                        Err("Stopped".into())
+                    } else {
+                        Ok(())
+                    };
+                }
+                // A failed receipt transaction can end this batch early. Hold
+                // every accepted ID until its transcript receipt commits.
+                for event in &events {
+                    if let Event::FollowUp(message) = event {
+                        follow_up_issues.insert(
+                            message.id.clone(),
+                            monocode_core::follow_up::DELIVERY_UNCONFIRMED.into(),
+                        );
+                    }
                 }
                 let mut start = transcript.rows.len();
                 let mut status = "Streaming…".to_string();
@@ -907,6 +934,9 @@ fn run_turn_using(
                                 Some(&message.id),
                                 std::time::Instant::now(),
                             )?;
+                            follow_up_issues.remove(&message.id);
+                            accepted_messages.push(message.id.clone());
+                            follow_up_delivered.push(message.id);
                             if let Some((root_turn, root)) = &turn_receipt {
                                 // A steer keeps its send time and model identity,
                                 // while timing/metrics belong to the original run.
@@ -920,10 +950,17 @@ fn run_turn_using(
                                 };
                                 persistence::save_turn_receipt(&store, summary.id, turn, steer)?;
                             }
-                            accepted_messages.push(message.id.clone());
-                            follow_up_delivered.push(message.id);
                         }
-                        Event::FollowUpFailed { id, error } => follow_up_errors.push((id, error)),
+                        Event::FollowUpFailed { id, error } => {
+                            follow_up_issues.insert(id.clone(), error.clone());
+                            follow_up_errors.push((id, error));
+                        }
+                        Event::FollowUpUnknown { id } => {
+                            let error = monocode_core::follow_up::DELIVERY_UNCONFIRMED.to_owned();
+                            follow_up_issues.insert(id.clone(), error.clone());
+                            follow_up_errors.push((id, error));
+                        }
+                        Event::StopTimedOut { stage } => stop_timeout = Some(stage),
                         Event::BeginAssistant => {
                             if transcript
                                 .rows
@@ -1099,6 +1136,9 @@ fn run_turn_using(
                             boundary = true;
                         }
                     }
+                }
+                if stopping {
+                    return Err("Stopped".into());
                 }
                 for publication in &publications {
                     let document =
@@ -1341,6 +1381,13 @@ fn run_turn_using(
     if let Err(error) = handoff_save {
         status = format!("{status} · Saving handoff failed: {error}");
     }
+    if cancelled && status == "Ready" {
+        match stop_timeout {
+            Some("acknowledgement") => status = "Stopped after the agent failed to respond".into(),
+            Some("terminal") => status = "Stopped after waiting for the turn to end".into(),
+            _ => {}
+        }
+    }
     // Final status must still arrive after cancellation. Dropping a window closes
     // the receiver, so the worker never keeps a closed viewport alive.
     let _ = tx.send_blocking(Update {
@@ -1351,7 +1398,7 @@ fn run_turn_using(
         provider_turn_id: None,
         turn_ready: false,
         follow_up_delivered: accepted_messages,
-        follow_up_errors: Vec::new(),
+        follow_up_errors: follow_up_issues.into_iter().collect(),
         delivered: initial_delivery,
         start,
         rows,
