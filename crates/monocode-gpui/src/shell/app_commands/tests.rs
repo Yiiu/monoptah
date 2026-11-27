@@ -2398,3 +2398,4 @@ fn a_remote_or_cloud_session_gets_no_terminals(cx: &mut TestAppContext) {
     let error = call(window, 987_654, "rc-u", "terminals.list", json!({}), cx).unwrap_err();
     assert!(error.contains("Unknown session"), "{error}");
 }
+mod completions;

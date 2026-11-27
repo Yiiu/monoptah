@@ -60,6 +60,7 @@ pub(crate) mod new_chat_choice;
 #[cfg(test)]
 mod new_chat_choice_tests;
 mod notifications;
+mod operator_completions;
 mod orchestration;
 mod picker_preferences;
 mod pinned_tabs;
@@ -700,6 +701,10 @@ pub(crate) struct Shell {
     orchestrations: HashMap<i64, orchestration::Run>,
     /// Each lead's last orchestration, whose agents hang under it in the sidebar.
     orchestration_summaries: HashMap<i64, monocode_core::orchestration::Summary>,
+    operator_subscriptions: HashMap<i64, Vec<monocode_core::store::OperatorSubscription>>,
+    operator_subscription_error: Option<String>,
+    operator_completion_work: HashSet<(i64, monocode_core::store::OperatorCompletionGroup)>,
+    operator_writes: operator_completions::Writes,
     /// Sessions an /operator thread started, by the session that started them.
     started_by: HashMap<i64, i64>,
     /// Ticket id of the inbox item a session was started from, which Telegram questions name.
@@ -1088,9 +1093,13 @@ impl Shell {
         if !projects.contains(&workspace.project) {
             projects.push(workspace.project);
         }
-        let metadata = locked(&store)
-            .map(|db| db.session_sidebar_metadata(&projects))
-            .unwrap_or_default();
+        let metadata = match locked(&store) {
+            Ok(db) => db.session_sidebar_metadata(&projects),
+            Err(error) => monocode_core::store::SessionSidebarMetadata {
+                operator_subscriptions: Err(error),
+                ..Default::default()
+            },
+        };
         let activity = locked(&store)
             .and_then(|db| db.restore_session_activity(monocode_core::time::now_ms()))
             .unwrap_or_default();
@@ -1283,6 +1292,17 @@ impl Shell {
             }
         });
         let worktree_focus = workspace.worktree_focus.clone();
+        let (operator_subscriptions, operator_subscription_error) = match sidebar_metadata
+            .operator_subscriptions
+        {
+            Ok(subscriptions) => (subscriptions, None),
+            Err(error) => (
+                HashMap::new(),
+                Some(format!(
+                    "Could not load Operator completion subscriptions: {error}. Completion changes are disabled until the saved state is repaired and the app restarts."
+                )),
+            ),
+        };
         let session_worktrees = sidebar_metadata.worktrees;
         let agent_statuses = agent_activity::restored(&session_activity);
         let notification_state = notifications::State::new(&workspace, store.clone(), cx);
@@ -1306,6 +1326,10 @@ impl Shell {
             app_pending: HashSet::new(),
             orchestrations: HashMap::new(),
             orchestration_summaries: sidebar_metadata.orchestrations,
+            operator_subscriptions,
+            operator_subscription_error: operator_subscription_error.clone(),
+            operator_completion_work: HashSet::new(),
+            operator_writes: Default::default(),
             started_by: sidebar_metadata.started_by,
             session_tickets: HashMap::new(),
             telegram: telegram::Telegram::new(),
@@ -1526,7 +1550,7 @@ impl Shell {
             spaces_nudge: None,
             hovered_space: None,
             space_anchor: AnchorSlot::default(),
-            error: None,
+            error: operator_subscription_error,
             notice: None,
             tab_scroll: ScrollHandle::new(),
             tab_scroll_task: None,
@@ -1716,6 +1740,7 @@ impl Shell {
         this.poll_reminders(cx);
         this.initialize_automations(cx);
         this.init_contributors(cx);
+        this.restore_operator_completions(cx);
         if this.workspace.active.is_none() {
             cx.spawn(async move |this, cx| {
                 let _ = this.update_in(cx, |this, window, cx| {
@@ -1977,6 +2002,7 @@ impl Shell {
                 }
                 this.sync_search_session(id, cx);
                 this.orchestration_session_changed(id, cx);
+                this.check_operator_completions(cx);
                 this.automation_session_changed(id, cx);
                 this.sync_review_locks(cx);
                 this.refresh_status(id, cx);
@@ -2026,6 +2052,7 @@ impl Shell {
             .push(cx.subscribe(&view, move |this, _, _: &AgentProgress, cx| {
                 this.refresh_status(id, cx)
             }));
+        self.observe_operator_completions(&view, id, cx);
         self.observe_orchestration(&view, id, cx);
         self.observe_session_folders(&view, id, cx);
         self.observe_telegram(&view, id, cx);
@@ -2101,6 +2128,7 @@ impl Shell {
             let (written, error) = work.await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.finish_archive(&ids, &written, error.is_none(), archived, window, cx);
+                this.check_operator_completions(cx);
                 if let Some(error) = error {
                     this.error = Some(format!("Could not update archive: {error}"));
                     this.invalidate_chrome(cx);

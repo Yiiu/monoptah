@@ -48,8 +48,11 @@ pub fn validate_operator(action: &str, input: &Value) -> Result<(), String> {
         return Err("Unknown Operator action. Run app help for project actions; memory, habits and artifacts require a Mono.".into());
     }
     crate::mono::api::validate(action, input)?;
-    if input["notifyOnComplete"] == true {
-        return Err("Completion notifications are only available in a Mono's chat".into());
+    if input["notifyOnComplete"] == true && input.get("target").is_some() {
+        return Err("Operator completion notifications require a local session".into());
+    }
+    if input.get("completionDelivery").is_some() {
+        return Err("completionDelivery is only available to Monos".into());
     }
     if matches!(action, "sessions.archive" | "sessions.delete") && input["cloud"] == "delete" {
         return Err("Deleting a cloud instance is only available to a Mono".into());
