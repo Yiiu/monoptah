@@ -54,7 +54,7 @@ impl Drop for Server {
         process::terminate(&mut self.child);
     }
 }
-struct Idle {
+pub(super) struct Idle {
     server: Server,
     session: String,
     account_id: String,
@@ -80,21 +80,8 @@ pub(super) fn idle_entries() -> Vec<(u32, Instant, Option<i64>)> {
         .map(|entry| (entry.server.child.id(), entry.at, entry.owner))
         .collect()
 }
-pub(super) fn retire_idle(pids: &std::collections::HashSet<u32>) {
-    let retired = {
-        let mut pool = idle().lock().unwrap_or_else(|e| e.into_inner());
-        let mut retired = Vec::new();
-        let mut index = 0;
-        while index < pool.len() {
-            if pids.contains(&pool[index].server.child.id()) {
-                retired.push(pool.remove(index));
-            } else {
-                index += 1;
-            }
-        }
-        retired
-    };
-    drop(retired);
+pub(super) fn remove_idle(pids: &std::collections::HashSet<u32>) -> Vec<Idle> {
+    parked::remove_idle_entries(idle(), |entry| pids.contains(&entry.server.child.id()))
 }
 /// Remove the idle servers owned by `session`; returns their pids.
 pub(super) fn retire_session(session: i64) -> Vec<u32> {

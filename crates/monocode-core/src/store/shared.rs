@@ -2949,6 +2949,8 @@ fn update_follow_up(value: &mut Value, message: &crate::follow_up::Message) {
     }
     if let Some(error) = &message.error {
         value["error"] = json!(error);
+    } else if let Some(fields) = value.as_object_mut() {
+        fields.remove("error");
     }
     if value["attachments"].is_null() {
         value["attachments"]=json!(message.attachments.iter().map(|p|json!({"id":p.to_string_lossy(),"path":p,"name":p.file_name().unwrap_or_default().to_string_lossy(),

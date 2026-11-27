@@ -3,6 +3,25 @@ use super::*;
 use crate::follow_up::Message;
 
 static STEER_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+const CODEX_STEER_ACK_TIMEOUT: Duration = Duration::from_secs(15);
+
+pub(super) struct PendingSteer {
+    message: Message,
+    sent_at: Instant,
+    turn_id: Option<String>,
+    reported_unknown: bool,
+}
+
+fn trace_codex_steer(phase: &str, wire: &str, pending: &PendingSteer) {
+    if std::env::var_os("MONOCODE_NATIVE_TRACE").is_some() {
+        eprintln!(
+            "provider-steer phase={phase} message_id={} turn_id={} request_id={wire} elapsed_ms={}",
+            pending.message.id,
+            pending.turn_id.as_deref().unwrap_or(""),
+            pending.sent_at.elapsed().as_millis(),
+        );
+    }
+}
 
 impl Kind {
     pub fn can_steer(self) -> bool {
@@ -47,18 +66,48 @@ impl Protocol {
             &request.cwd.to_string_lossy(),
             &message.attachments,
         )?;
-        // A retained message can be retried after its acknowledgement deadline.
-        // Never let a late reply from that attempt acknowledge the retry.
+        // Keep a unique wire ID for each attempt, even when a message's
+        // persistent ID stays the same after an explicit rejection and retry.
         let wire = format!(
             "native-steer-{}-{}",
             message.id,
             STEER_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         );
         match request.kind {
-            Kind::Codex => write_json(
-                stdin,
-                json!({"id":wire,"method":"turn/steer","params":{"threadId":self.request.provider_id,"expectedTurnId":self.active_turn,"input":request.codex_input()}}),
-            )?,
+            Kind::Codex => {
+                let frame = json!({
+                    "id": wire,
+                    "method": "turn/steer",
+                    "params": {
+                        "threadId": self.request.provider_id,
+                        "expectedTurnId": self.active_turn,
+                        "clientUserMessageId": message.id,
+                        "input": request.codex_input(),
+                    },
+                });
+                let mut pending = PendingSteer {
+                    message,
+                    sent_at: Instant::now(),
+                    turn_id: self.active_turn.clone(),
+                    reported_unknown: false,
+                };
+                trace_codex_steer("dispatch", &wire, &pending);
+                let mut events = Vec::new();
+                match write_json(stdin, frame) {
+                    Ok(()) => trace_codex_steer("written", &wire, &pending),
+                    Err(_) => {
+                        // The write may have reached Codex before the pipe
+                        // acknowledgement failed. Allow a subsequent echo.
+                        trace_codex_steer("write_unconfirmed", &wire, &pending);
+                        pending.reported_unknown = true;
+                        events.push(Event::FollowUpUnknown {
+                            id: pending.message.id.clone(),
+                        });
+                    }
+                }
+                self.steering.insert(wire, pending);
+                return Ok(events);
+            }
             Kind::Claude => {
                 let prompt = if request.settings.effort.as_deref() == Some("ultrathink") {
                     if request.prompt.is_empty() {
@@ -120,7 +169,15 @@ impl Protocol {
             )?,
             _ => unreachable!(),
         }
-        self.steering.insert(wire, (message, Instant::now()));
+        self.steering.insert(
+            wire,
+            PendingSteer {
+                message,
+                sent_at: Instant::now(),
+                turn_id: None,
+                reported_unknown: false,
+            },
+        );
         Ok(Vec::new())
     }
     pub(super) fn steer_response(&mut self, value: &Value) -> Option<Vec<Event>> {
@@ -139,7 +196,27 @@ impl Protocol {
         if wire.starts_with("native-steer-") && !self.steering.contains_key(wire) {
             return Some(Vec::new());
         }
-        let (message, _) = self.steering.remove(wire)?;
+        let pending = self.steering.get(wire)?;
+        if self.request.kind == Kind::Codex
+            && value["result"]["turnId"]
+                .as_str()
+                .is_some_and(|turn| Some(turn) != pending.turn_id.as_deref())
+        {
+            return Some(Vec::new());
+        }
+        let pending = self.steering.remove(wire)?;
+        if self.request.kind == Kind::Codex {
+            trace_codex_steer(
+                if error.is_some() {
+                    "rejected"
+                } else {
+                    "accepted"
+                },
+                wire,
+                &pending,
+            );
+        }
+        let message = pending.message;
         if error.is_some() || (self.request.kind.is_pi() && value["success"] != true) {
             let error = value["error"]["message"]
                 .as_str()
@@ -155,9 +232,10 @@ impl Protocol {
         }
     }
     pub(super) fn expire_steering(&mut self) -> Vec<Event> {
-        // These are acknowledgement deadlines, not turn deadlines. Codex's
-        // JSON-RPC steer request deliberately waits without a response timer.
+        // These deadlines report input acceptance. The current turn keeps
+        // running, and Codex can still confirm a message with a later reply.
         let timeout = match self.request.kind {
+            Kind::Codex => return self.unconfirmed_codex_steering(false),
             Kind::Pi | Kind::Omp => Duration::from_secs(15),
             Kind::Hermes => Duration::from_secs(20),
             Kind::OpenCode => Duration::from_secs(30),
@@ -166,16 +244,85 @@ impl Protocol {
         let expired: Vec<_> = self
             .steering
             .iter()
-            .filter(|(_, (_, at))| at.elapsed() > timeout)
+            .filter(|(_, pending)| pending.sent_at.elapsed() > timeout)
             .map(|(id, _)| id.clone())
             .collect();
         expired
             .into_iter()
             .filter_map(|id| self.steering.remove(&id))
-            .map(|(message, _)| Event::FollowUpFailed {
-                id: message.id,
+            .map(|pending| Event::FollowUpFailed {
+                id: pending.message.id,
                 error: "Timed out waiting for the provider to accept this follow-up".into(),
             })
+            .collect()
+    }
+
+    pub(super) fn unconfirmed_codex_steering(&mut self, turn_closed: bool) -> Vec<Event> {
+        if self.request.kind != Kind::Codex {
+            return Vec::new();
+        }
+        self.steering
+            .iter_mut()
+            .filter_map(|(wire, pending)| {
+                if pending.reported_unknown
+                    || (!turn_closed && pending.sent_at.elapsed() < CODEX_STEER_ACK_TIMEOUT)
+                {
+                    return None;
+                }
+                trace_codex_steer(
+                    if turn_closed {
+                        "turn_closed_unconfirmed"
+                    } else {
+                        "ack_timeout"
+                    },
+                    wire,
+                    pending,
+                );
+                pending.reported_unknown = true;
+                Some(Event::FollowUpUnknown {
+                    id: pending.message.id.clone(),
+                })
+            })
+            .collect()
+    }
+
+    pub(super) fn codex_steer_echo(&mut self, params: &Value, item: &Value) -> Option<Event> {
+        if item["type"] != "userMessage"
+            || params["threadId"]
+                .as_str()
+                .is_some_and(|thread| Some(thread) != self.request.provider_id.as_deref())
+        {
+            return None;
+        }
+        let client_id = item["clientId"].as_str()?;
+        let turn = params["turnId"]
+            .as_str()
+            .or_else(|| params["turn"]["id"].as_str())?;
+        let wire = self.steering.iter().find_map(|(wire, pending)| {
+            (pending.message.id == client_id && pending.turn_id.as_deref() == Some(turn))
+                .then(|| wire.clone())
+        })?;
+        let pending = self.steering.remove(&wire)?;
+        trace_codex_steer("echoed", &wire, &pending);
+        self.text_key = None;
+        Some(Event::FollowUp(pending.message))
+    }
+
+    pub(super) fn codex_terminal_steers(&mut self, value: &Value) -> Vec<Event> {
+        if self.request.kind != Kind::Codex
+            || !matches!(
+                value["method"].as_str(),
+                Some("turn/completed" | "turn/aborted")
+            )
+        {
+            return Vec::new();
+        }
+        let params = &value["params"];
+        params["turn"]["items"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|item| self.codex_steer_echo(params, item))
             .collect()
     }
 }
@@ -233,6 +380,83 @@ mod tests {
             p.frame(json!({"id":retry["id"],"result":{}}), &mut out)
                 .unwrap(),
             vec![Event::FollowUp(message)]
+        );
+    }
+
+    #[test]
+    fn codex_reports_a_timed_out_steer_once_and_accepts_its_late_ack() {
+        let mut p = protocol(Kind::Codex);
+        let message = Message {
+            id: "late".into(),
+            text: "follow up".into(),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        p.steer(message.clone(), &mut out).unwrap();
+        let wire: Value = serde_json::from_slice(&out).unwrap();
+        for pending in p.steering.values_mut() {
+            pending.sent_at -= Duration::from_secs(60);
+        }
+        assert_eq!(
+            p.expire_steering(),
+            [Event::FollowUpUnknown { id: "late".into() }],
+        );
+        assert!(p.expire_steering().is_empty(), "one timeout per request");
+        assert_eq!(
+            p.frame(
+                json!({"id":wire["id"],"result":{"turnId":"turn"}}),
+                &mut out
+            )
+            .unwrap(),
+            vec![Event::FollowUp(message)],
+            "the original request remains available for a late response"
+        );
+        assert!(
+            p.frame(
+                json!({"id":wire["id"],"result":{"turnId":"turn"}}),
+                &mut out
+            )
+            .unwrap()
+            .is_empty(),
+            "duplicate acknowledgements do not add transcript rows"
+        );
+    }
+
+    #[test]
+    fn codex_correlates_steer_echoes_by_message_identity_and_turn() {
+        let mut p = protocol(Kind::Codex);
+        let make_message = |id: &str| Message {
+            id: id.into(),
+            text: "same body".into(),
+            ..Default::default()
+        };
+        let first = make_message("first");
+        let second = make_message("second");
+        let mut out = Vec::new();
+        p.steer(first.clone(), &mut out).unwrap();
+        let wire: Value = serde_json::from_slice(&out).unwrap();
+        out.clear();
+        p.steer(second.clone(), &mut out).unwrap();
+        let echo = |turn: &str, id: &str| {
+            json!({"method":"item/started","params":{
+                "threadId":"thread","turnId":turn,
+                "item":{"type":"userMessage","clientId":id}
+            }})
+        };
+        assert!(p
+            .frame(echo("other-turn", &second.id), &mut out)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            p.frame(echo("turn", &second.id), &mut out).unwrap(),
+            vec![Event::FollowUp(second)]
+        );
+        assert_eq!(wire["params"]["clientUserMessageId"], first.id);
+        assert_eq!(
+            p.frame(json!({"id":wire["id"],"result":{}}), &mut out)
+                .unwrap(),
+            vec![Event::FollowUp(first)],
+            "the reply without an echoed client id still settles its own request"
         );
     }
     #[test]

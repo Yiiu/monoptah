@@ -872,6 +872,7 @@ fn drafts_queues_and_receipts_keep_desktop_metadata_and_do_not_replay() {
     assert_eq!(state.messages.len(), 1);
     assert_eq!(state.draft.as_ref().unwrap().text, "Unsent");
     state.messages[0].text = "Edited queued text".into();
+    state.messages[0].error = Some(crate::follow_up::DELIVERY_UNCONFIRMED.into());
     state.revision += 1;
     store.save_follow_ups(id, &state).unwrap();
     let raw: String = store
@@ -885,6 +886,12 @@ fn drafts_queues_and_receipts_keep_desktop_metadata_and_do_not_replay() {
     let queue: Value = parse(&raw).unwrap();
     assert_eq!(queue[0]["futureQueue"], true);
     assert_eq!(queue[0]["attachments"], queued[0]["attachments"]);
+    let mut restored = store.follow_ups(id).unwrap();
+    assert!(restored.messages[0].delivery_unconfirmed());
+    restored.messages[0].error = None;
+    restored.revision += 1;
+    store.save_follow_ups(id, &restored).unwrap();
+    assert!(store.follow_ups(id).unwrap().messages[0].error.is_none());
     assert_eq!(store.shared_blocks(id).unwrap()[1]["futureDraft"], "keep");
     let from = t.begin("user");
     t.append("Edited queued text");
