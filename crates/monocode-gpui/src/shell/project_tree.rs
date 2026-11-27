@@ -1720,7 +1720,7 @@ mod tests {
         visual.simulate_click(second.center(), Default::default());
         visual.run_until_parked();
         window
-            .read_with(&mut visual, |shell, cx| {
+            .read_with(&visual, |shell, cx| {
                 let monos = shell.monos.as_ref().unwrap().read(cx);
                 assert_eq!(monos.current().unwrap().id, ids[1]);
             })
@@ -1777,7 +1777,7 @@ mod tests {
         let member = visual.debug_bounds("tree-project-/work/monocode").unwrap();
         assert_eq!(member.top() - group.bottom(), px(2.));
         window
-            .read_with(&mut visual, |shell, _| {
+            .read_with(&visual, |shell, _| {
                 let block = shell
                     .tree
                     .drag_block_rows(&RailDragKind::Group, "release")
@@ -2742,6 +2742,10 @@ mod tests {
         let selector = "tree-project-/work/motion-project-02";
         let from = visual.debug_bounds(selector).unwrap().center();
         let to = point(from.x, from.y + px(6.));
+        let target = visual
+            .debug_bounds("tree-project-/work/motion-project-08")
+            .unwrap();
+        let scroll_distance = target.center().y - to.y;
         let read = |visual: &mut gpui::VisualTestContext| {
             window
                 .update(visual, |shell, _, _| {
@@ -2756,14 +2760,14 @@ mod tests {
         let before = read(&mut visual);
         visual.simulate_event(ScrollWheelEvent {
             position: to,
-            delta: ScrollDelta::Pixels(point(px(0.), px(-180.))),
+            delta: ScrollDelta::Pixels(point(px(0.), -scroll_distance)),
             ..Default::default()
         });
         visual.run_until_parked();
         visual.refresh().unwrap();
         let after = read(&mut visual);
-        assert_eq!(after.0 - before.0, px(180.));
-        assert_eq!(after.1 - before.1, 180.);
+        assert_eq!(after.0 - before.0, scroll_distance);
+        assert_eq!(after.1 - before.1, scroll_distance.as_f32());
         assert_eq!(visual.debug_bounds(selector).unwrap().center().y, to.y);
         visual.simulate_mouse_up(to, MouseButton::Left, Modifiers::default());
         window
