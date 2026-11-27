@@ -1354,6 +1354,7 @@ impl Shell {
         self.sessions.remove(&id);
         self.stop_tui(id, cx);
         self.session_summaries.remove(&id);
+        self.check_operator_completions(cx);
         self.draft_sessions.remove(&id);
         self.history_recency.remove(&id);
         self.session_marks.remove(&id);

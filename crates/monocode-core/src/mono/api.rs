@@ -35,7 +35,7 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
         "accounts.list"=>"provider",
         "sessions.list"|"folders.list"|"worktrees.list"=>"project",
         "sessions.read"=>"sessionId project before turnId limit maxChars charOffset",
-        "sessions.start"=>"prompt project harness model modelSettings effort runtimeMode title draft reveal workspaceMode worktreeBase worktreeCwd placement besideSessionId notifyOnComplete completionDelivery parentSessionId folderName folderId target account",
+        "sessions.start"=>"prompt project harness model modelSettings effort runtimeMode title draft reveal workspaceMode worktreeBase worktreeCwd placement besideSessionId notifyOnComplete notifyGroup completionDelivery parentSessionId folderName folderId target account",
         action if action.starts_with("cloud.") => {
             cloud_fields = cloud::fields(action).ok_or("Unknown app action. Run app help")?;
             cloud_fields.as_str()
@@ -43,7 +43,7 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
         action if super::move_api::is_move_action(action) => {
             super::move_api::fields(action).ok_or("Unknown app action. Run app help")?
         }
-        "sessions.send"=>"sessionId prompt project notifyOnComplete completionDelivery",
+        "sessions.send"=>"sessionId prompt project notifyOnComplete notifyGroup completionDelivery",
         "sessions.draft"=>"sessionId prompt project",
         "sessions.pullEvidence"=>"sessionId project path taskId",
         "sessions.stop"=>"sessionId project",
@@ -287,6 +287,15 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
             return Err("taskId must be a Today task id or key".into());
         }
     }
+    if let Some(label) = input.get("notifyGroup") {
+        if input["notifyOnComplete"] != true {
+            return Err("notifyGroup requires notifyOnComplete:true".into());
+        }
+        let label = label.as_str().ok_or("notifyGroup must be text")?.trim();
+        if !(1..=64).contains(&label.chars().count()) {
+            return Err("notifyGroup must be from 1 to 64 characters after trimming".into());
+        }
+    }
     if input["draft"] == true && input["notifyOnComplete"] == true {
         return Err("An unsent draft cannot send a completion notification".into());
     }
@@ -330,11 +339,36 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
     }
     Ok(())
 }
+pub fn validate_mono(action: &str, input: &Value) -> Result<(), String> {
+    if input.get("notifyGroup").is_some() {
+        return Err("notifyGroup is only supported for Operator calls, not Monos".into());
+    }
+    validate(action, input)
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn operator_notify_groups_require_short_labels_and_explicit_opt_in() {
+        for label in [json!(""), json!("  "), json!("🦀".repeat(65)), json!(42)] {
+            let input = json!({"notifyOnComplete":true,"notifyGroup":label});
+            assert!(validate("sessions.send", &input)
+                .unwrap_err()
+                .contains("notifyGroup"));
+        }
+        let grouped = json!({"notifyOnComplete":true,"notifyGroup":" review "});
+        assert!(validate("sessions.send", &grouped).is_ok());
+        assert!(validate_mono("sessions.send", &grouped).is_err());
+        assert!(validate("sessions.send", &json!({"notifyGroup":"review"})).is_err());
+        assert!(validate_mono(
+            "sessions.send",
+            &json!({"notifyOnComplete":true,"completionDelivery":"each"})
+        )
+        .is_ok());
+    }
     #[test]
     fn invisible_characters_are_told_from_visible_ones() {
         for c in [

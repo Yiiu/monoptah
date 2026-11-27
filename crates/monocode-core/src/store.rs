@@ -16,6 +16,8 @@ mod monos;
 mod native_chunks;
 pub use native_chunks::{ConversionReport, DirtyBlock, NATIVE_CHUNKS_MODE_VERSION};
 mod notes;
+mod operator_completions;
+pub use operator_completions::{OperatorCompletionGroup, OperatorSubscription, WorkerOutcome};
 mod remote;
 mod remote_legacy;
 pub use remote::{

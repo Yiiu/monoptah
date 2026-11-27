@@ -8,6 +8,7 @@ use monocode_core::{
         bridge::{Call, Server},
         cloud_api::{self, CloudApi},
     },
+    store::OperatorCompletionGroup,
 };
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -20,9 +21,17 @@ pub(crate) const CLOUD_ARCHIVING: &str =
     "This cloud session is being archived; the message would be lost. Nothing was sent.";
 
 type Placement = Option<(i64, Edge)>;
+struct SessionLaunch {
+    summary: Session,
+    settings: Settings,
+    draft: bool,
+    reveal: bool,
+    placement: Placement,
+    group: OperatorCompletionGroup,
+}
 enum Effect {
     None,
-    Start(Box<(Session, Settings, bool, bool, Placement)>),
+    Start(Box<SessionLaunch>),
     /// The sessions an archive covered, those the store saved, and why it stopped.
     Archive(Vec<i64>, Vec<i64>, Option<String>),
     /// A session wrote to its Today task: the page reloads to show it.
@@ -92,6 +101,94 @@ impl Shell {
         })
         .detach();
     }
+    fn install_session_launch(
+        &mut self,
+        caller: i64,
+        start: SessionLaunch,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let SessionLaunch {
+            summary,
+            settings,
+            draft,
+            reveal,
+            placement,
+            group: _,
+        } = start;
+        let id = summary.id;
+        self.draft_sessions.insert(id);
+        self.sidebar_hidden_sessions.remove(&id);
+        self.session_worktrees
+            .insert(id, settings.worktree_cwd.clone());
+        // A cloud session is listed under its local project, not as a
+        // rail project of its own.
+        self.mark_cloud_session(id);
+        self.register_cloud_start(id);
+        if self.is_cloud(id) {
+            self.add_loaded(summary, cx);
+        } else {
+            self.add(summary, cx);
+        }
+        self.started_by.insert(id, caller);
+        if let Some(view) = self.sessions.get(&id) {
+            view.update(cx, |v, cx| v.install_app_launch(settings, !draft, cx));
+        }
+        self.track_cloud_start(id, cx);
+        self.app_place_launch(id, placement, reveal, window, cx);
+    }
+    fn send_with_operator_completion(
+        &mut self,
+        call: Call,
+        group: OperatorCompletionGroup,
+        target: (Entity<Conversation>, String),
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (view, prompt) = target;
+        let child = view.read(cx).summary.clone();
+        let caller = call.session;
+        let id = child.id;
+        self.register_operator_completion(caller, group, &child, window, cx, move |this, saved, _, cx| {
+            let previous = match saved {
+                Ok(previous) => previous,
+                Err(error) => {
+                    this.finish_app_call(call, Err(error), cx);
+                    return;
+                }
+            };
+            let ready = this.authorize_app_call(&call, cx).and_then(|()| {
+                let project = &this.sessions[&caller].read(cx).summary.cwd;
+                let target = this.app_target(&call.input, caller, project, true, cx)?;
+                let child = view.read(cx);
+                if target == id
+                    && !child.is_remote()
+                    && !this.is_cloud(id)
+                    && !child.move_locked()
+                    && !child.auto_stopping
+                    && !child.cloud_locked
+                    && !child.settings.worktree_removed
+                    && child.ready_for_external(cx)
+                    && !child.has_saved_draft()
+                    && !this.archiving.contains(&id)
+                    && !this.deleting.contains(&id)
+                {
+                    Ok(())
+                } else {
+                    Err("Session became unavailable before the completion subscription was saved. Nothing was sent.".into())
+                }
+            });
+            if let Err(error) = ready {
+                this.save_operator_completions(caller, previous, cx, move |this, saved, _, cx| {
+                    this.finish_app_call(call, saved.and(Err(error)), cx);
+                });
+                return;
+            }
+            view.update(cx, |view, cx| view.install_transfer(view.settings.clone(), Some(prompt), cx));
+            this.finish_app_call(call, Ok(json!({"sessionId":id,"submitted":true,"saved":false})), cx);
+        });
+    }
+
     fn app_background<F>(&mut self, call: Call, work: F, cx: &mut Context<Self>)
     where
         F: FnOnce(Database) -> Result<(Value, Effect), String> + Send + 'static,
@@ -101,32 +198,50 @@ impl Shell {
         cx.spawn(async move |this, cx| {
             let result = work.await;
             let _ = this.update_in(cx, |this, window, cx| {
+                let result = match result {
+                    Ok((value, Effect::Start(start))) if call.input["notifyOnComplete"] == true => {
+                        let child = start.summary.clone();
+                        this.register_operator_completion(
+                            call.session,
+                            start.group.clone(),
+                            &child,
+                            window,
+                            cx,
+                            move |this, result, window, cx| {
+                                let previous = match result {
+                                    Ok(previous) => previous,
+                                    Err(error) => {
+                                        this.finish_app_call(call, Err(error), cx);
+                                        return;
+                                    }
+                                };
+                                if let Err(error) = this.authorize_app_call(&call, cx) {
+                                    this.save_operator_completions(
+                                        call.session,
+                                        previous,
+                                        cx,
+                                        move |this, saved, _, cx| {
+                                            this.finish_app_call(call, saved.and(Err(error)), cx);
+                                        },
+                                    );
+                                    return;
+                                }
+                                this.install_session_launch(call.session, *start, window, cx);
+                                this.invalidate_chrome(cx);
+                                cx.notify();
+                                this.finish_app_call(call, Ok(value), cx);
+                            },
+                        );
+                        return;
+                    }
+                    result => result,
+                };
                 let result = result.and_then(|(value, effect)| {
                     let mut failure = None;
                     match effect {
                         Effect::None => (),
                         Effect::Start(start) => {
-                            let (summary, settings, draft, reveal, placement) = *start;
-                            let id = summary.id;
-                            this.draft_sessions.insert(id);
-                            this.sidebar_hidden_sessions.remove(&id);
-                            this.session_worktrees
-                                .insert(id, settings.worktree_cwd.clone());
-                            // A cloud session is listed under its local project, not as a
-                            // rail project of its own.
-                            this.mark_cloud_session(id);
-                            this.register_cloud_start(id);
-                            if this.is_cloud(id) {
-                                this.add_loaded(summary, cx);
-                            } else {
-                                this.add(summary, cx);
-                            }
-                            this.started_by.insert(id, call.session);
-                            if let Some(view) = this.sessions.get(&id) {
-                                view.update(cx, |v, cx| v.install_app_launch(settings, !draft, cx));
-                            }
-                            this.track_cloud_start(id, cx);
-                            this.app_place_launch(id, placement, reveal, window, cx);
+                            this.install_session_launch(call.session, *start, window, cx)
                         }
                         Effect::Today => {
                             if let Some(today) = this.today.clone() {
@@ -142,6 +257,7 @@ impl Shell {
                                 window,
                                 cx,
                             );
+                            this.check_operator_completions(cx);
                             failure = error;
                         }
                     }
@@ -474,6 +590,10 @@ impl Shell {
         let project = caller.summary.cwd.clone();
         let provider = caller.summary.provider.clone();
         let inherited = caller.settings.clone();
+        let group = call.input["notifyGroup"]
+            .as_str()
+            .map(|label| OperatorCompletionGroup::Label(label.trim().to_owned()))
+            .unwrap_or(OperatorCompletionGroup::Turn(caller.mono_turn));
         let input = call.input.clone();
         let action = call.action.clone();
         let result: Result<Value, String> = match action.as_str() {
@@ -655,7 +775,7 @@ impl Shell {
                     if let Some(start)=&startup {
                         crate::cloud_actions::describe_start(&mut value,start);
                     }
-                    Ok((value,if fresh {Effect::Start(Box::new((summary,settings,draft,reveal,placement)))}else{Effect::None}))
+                    Ok((value,if fresh {Effect::Start(Box::new(SessionLaunch { summary, settings, draft, reveal, placement, group }))}else{Effect::None}))
                     })();
                     // An instance created for this start is kept: say so, so a retry targets it.
                     built.map_err(|e| {
@@ -724,6 +844,17 @@ impl Shell {
                     }) {
                     Err(e) => Err(e),
                     Ok((id, view)) => {
+                        if input["notifyOnComplete"] == true
+                            && (view.read(cx).is_remote() || self.is_cloud(id))
+                        {
+                            self.finish_app_call(
+                                call,
+                                Err("Operator completion notifications require a local session"
+                                    .into()),
+                                cx,
+                            );
+                            return;
+                        }
                         if matches!(action.as_str(), "sessions.send" | "sessions.draft")
                             && view.read(cx).move_locked()
                         {
@@ -756,6 +887,23 @@ impl Shell {
                             })
                         {
                             self.finish_app_call(call, Err(error), cx);
+                            return;
+                        }
+                        if matches!(
+                            action.as_str(),
+                            "sessions.stop" | "sessions.archive" | "sessions.delete"
+                        ) && self.has_operator_completion(call.session, id)
+                        {
+                            self.cancel_operator_completion(
+                                call.session,
+                                id,
+                                window,
+                                cx,
+                                move |this, result, window, cx| match result {
+                                    Ok(()) => this.dispatch_app_call(call, window, cx),
+                                    Err(error) => this.finish_app_call(call, Err(error), cx),
+                                },
+                            );
                             return;
                         }
                         if action == "sessions.delete" && input["removeWorktree"] == true {
@@ -892,7 +1040,10 @@ impl Shell {
                                 .detach();
                                 return;
                             }
-                            if !view.read(cx).ready_for_external(cx)
+                            if action == "sessions.send" && view.read(cx).settings.worktree_removed
+                            {
+                                Err("Session's worktree was removed. Select a branch or worktree before sending.".into())
+                            } else if !view.read(cx).ready_for_external(cx)
                                 || view.read(cx).has_saved_draft()
                             {
                                 Err("Session is busy, loading, or has an unsent draft. Its draft was preserved.".into())
@@ -900,6 +1051,16 @@ impl Shell {
                                 match app::prompt(&input) {
                                     Err(e) => Err(e),
                                     Ok(prompt) => {
+                                        if input["notifyOnComplete"] == true {
+                                            self.send_with_operator_completion(
+                                                call,
+                                                group,
+                                                (view, prompt),
+                                                window,
+                                                cx,
+                                            );
+                                            return;
+                                        }
                                         view.update(cx, |v, cx| {
                                             if action == "sessions.draft" {
                                                 v.save_app_draft(prompt, cx)
