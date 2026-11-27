@@ -187,17 +187,26 @@ fn quit_after_saving(cx: &mut App, finish: impl FnOnce(&mut App) + 'static) {
     {
         return;
     }
-    let Some(saver) = ui_store_saves::inbox_saver(cx) else {
+    let savers = ui_store_saves::pending_savers(cx);
+    if savers.is_empty() {
         stop_processes(cx, finish);
         return;
-    };
-    let drained = saver.drain();
+    }
+    let drained: Vec<_> = savers
+        .iter()
+        .map(ui_store_saves::UiStoreSaves::drain)
+        .collect();
     cx.spawn(async move |cx| {
-        if !matches!(drained.recv().await, Ok(Ok(()))) {
+        let mut saved = true;
+        for result in drained {
+            saved &= matches!(result.recv().await, Ok(Ok(())));
+        }
+        if !saved {
+            for saver in savers {
+                saver.resume();
+            }
             cx.update(|cx| cx.global::<QuitGate>().0.store(false, Ordering::SeqCst));
-            // The Inbox keeps showing the save error, and the saver takes saves
-            // again, so the user can retry by quitting once more.
-            eprintln!("Not quitting: saving the inbox state is still failing");
+            eprintln!("Not quitting: saving UI state is still failing");
             return;
         }
         cx.update(|cx| stop_processes(cx, finish));
@@ -820,13 +829,18 @@ mod persistence_safety_tests {
     }
 
     #[gpui::test]
-    fn quit_waits_for_latest_setting(cx: &mut TestAppContext) {
+    fn quit_waits_for_latest_setting_and_pending_composer_draft(cx: &mut TestAppContext) {
         let store = memory_store();
+        let session = store.lock().unwrap().create("codex", "/project").unwrap();
+        let draft = r#"{"text":"latest draft","attachments":[]}"#;
         cx.update(|cx| {
             ui_store_saves::install(store.clone(), cx);
             ui_store_saves::inbox_saver(cx)
                 .unwrap()
                 .save_latest("latest".into())
+                .unwrap();
+            ui_store_saves::composer_saver(&store, session.id, cx)
+                .save_latest(draft.into())
                 .unwrap();
         });
         let held = HeldStore::hold(&store);
@@ -842,11 +856,23 @@ mod persistence_safety_tests {
         );
         assert!(held.release());
         cx.run_until_parked();
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_millis(200));
+        cx.run_until_parked();
         assert!(
             matches!(restarted.try_recv(), Ok(Some(_))),
             "the relaunch happened only after the save"
         );
         assert_eq!(inbox_setting(&store).as_deref(), Some("latest"));
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .read_composer_draft(session.id)
+                .unwrap()
+                .as_deref(),
+            Some(draft),
+        );
     }
 
     #[gpui::test]

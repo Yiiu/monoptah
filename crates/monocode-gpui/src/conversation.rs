@@ -12,10 +12,12 @@ pub(crate) mod cloud_target;
 #[cfg(test)]
 mod cloud_target_tests;
 mod commands;
+mod composer_draft;
 pub(crate) mod composer_features;
 mod composer_shelf;
 mod edit_last_turn;
 mod follow_up;
+pub(crate) use composer_draft::Changed as ComposerDraftChanged;
 pub(crate) mod git_actions;
 #[cfg(test)]
 mod goal_tests;
@@ -234,6 +236,8 @@ pub(crate) struct Conversation {
     _completion_event: Subscription,
     _command_removal: Subscription,
     _draft_observation: Subscription,
+    _attachment_draft_observation: Subscription,
+    composer_draft: composer_draft::State,
     _input_focus: Option<[Subscription; 2]>,
     draft_has_value: bool,
     folder_selected: bool,
@@ -703,7 +707,10 @@ impl Conversation {
                 cx.notify();
             }
             this.open_typed_btw(cx);
+            this.save_composer_draft(cx);
         });
+        let attachment_draft_observation = cx.observe_self(Self::save_composer_draft);
+        composer_draft::restore(&summary, &store, cx);
         input.update(cx, |input, _| input.set_alternate_submit(true));
         let submission = cx.subscribe(&input, |this, _, _: &input::Submitted, cx| {
             this.note_user_input();
@@ -814,6 +821,8 @@ impl Conversation {
             _completion_event: completion_event,
             _command_removal: command_removal,
             _draft_observation: draft_observation,
+            _attachment_draft_observation: attachment_draft_observation,
+            composer_draft: Default::default(),
             _input_focus: None,
             draft_has_value: false,
             folder_selected: false,

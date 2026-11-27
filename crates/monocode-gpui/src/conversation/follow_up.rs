@@ -1396,6 +1396,67 @@ mod tests {
     }
 
     #[gpui::test]
+    fn unsent_composer_draft_survives_reopening_without_changing_manual_drafts(
+        cx: &mut TestAppContext,
+    ) {
+        let file = std::env::current_exe().unwrap();
+        let window = conversation(cx);
+        let (summary, store) = window
+            .update(cx, |view, _, cx| {
+                view.input
+                    .update(cx, |input, cx| input.set_text("first version".into(), cx));
+                view.attachments.push(file.clone());
+                cx.notify();
+                (view.summary.clone(), view.store.clone())
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let stored = || {
+            locked(&store)
+                .unwrap()
+                .read_composer_draft(summary.id)
+                .unwrap()
+        };
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_millis(100));
+        cx.run_until_parked();
+        assert!(stored().is_none());
+        window
+            .update(cx, |view, _, cx| {
+                view.input
+                    .update(cx, |input, cx| input.set_text("unsent text".into(), cx));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_millis(100));
+        cx.run_until_parked();
+        assert!(
+            stored().is_none(),
+            "the pause is measured from the latest edit"
+        );
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_millis(100));
+        cx.run_until_parked();
+        assert!(stored().is_some());
+        let restored = cx.new(|cx| Conversation::new(summary.clone(), store.clone(), cx));
+        cx.run_until_parked();
+        restored.update(cx, |view, cx| {
+            assert_eq!(view.input.read(cx).content, "unsent text");
+            assert_eq!(view.attachments.as_slice(), std::slice::from_ref(&file));
+            assert!(view.follow_ups.state.draft.is_none());
+            view.attachments.clear();
+            view.input
+                .update(cx, |input, cx| input.set_text(String::new(), cx));
+        });
+        cx.run_until_parked();
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_millis(200));
+        cx.run_until_parked();
+        assert!(stored().is_none());
+    }
+
+    #[gpui::test]
     fn sending_a_saved_draft_preserves_the_new_composer(cx: &mut TestAppContext) {
         let window = conversation(cx);
         cx.update(|cx| {

@@ -109,7 +109,7 @@ mod window_chrome;
 mod worktrees;
 
 use crate::{
-    conversation::{AgentProgress, Conversation, SessionChanged},
+    conversation::{AgentProgress, ComposerDraftChanged, Conversation, SessionChanged},
     input,
     notes::Notes,
     pane_layout::{Edge, LayoutLeaf, Rect, SplitDir},
@@ -859,6 +859,7 @@ pub(crate) struct Shell {
     /// Lightweight history index; only opened or previewed chats own GPUI entities.
     session_summaries: HashMap<i64, Session>,
     draft_sessions: HashSet<i64>,
+    composer_draft_sessions: HashSet<i64>,
     history_recency: HashMap<i64, u64>,
     history_clock: u64,
     session_marks: HashMap<i64, Entity<SessionMark>>,
@@ -1410,6 +1411,7 @@ impl Shell {
             tui_events: HashMap::new(),
             session_summaries: HashMap::new(),
             draft_sessions: sidebar_metadata.drafts,
+            composer_draft_sessions: sidebar_metadata.composer_drafts,
             history_recency: HashMap::new(),
             history_clock: 0,
             session_marks: HashMap::new(),
@@ -1961,6 +1963,21 @@ impl Shell {
                     });
                 })
                 .detach();
+            },
+        ));
+        self.observations.push(cx.subscribe(
+            &view,
+            move |this, _, draft: &ComposerDraftChanged, cx| {
+                if !this.session_summaries.contains_key(&id) {
+                    return;
+                }
+                if draft.0 {
+                    this.composer_draft_sessions.insert(id);
+                } else {
+                    this.composer_draft_sessions.remove(&id);
+                }
+                this.notify_sidebar(cx);
+                this.tabs_frame.update(cx, |_, cx| cx.notify());
             },
         ));
         self.observations
@@ -7578,7 +7595,7 @@ impl Shell {
                 .as_ref()
                 .is_some_and(|m| m.read(cx).hidden_session(id))
                 && self.project_of(id, &s.summary.cwd) == self.workspace.project
-                && s.summary.has_messages
+                && (s.summary.has_messages || self.composer_draft_sessions.contains(&id))
                 && !self.orchestration_worker(id)
                 && self.in_sidebar_worktree_scope(id, cx)
         };

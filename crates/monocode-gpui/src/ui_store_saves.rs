@@ -5,7 +5,11 @@
 //! their own paths; this saver only persists latest-value UI state.
 use crate::runtime::{Database, locked};
 use gpui::{App, BackgroundExecutor, Global};
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 /// The setting key `ViewState` reads back on startup (core `inbox.rs`).
 pub(crate) const INBOX_KEY: &str = "native-inbox-state";
@@ -35,6 +39,7 @@ struct Job {
     value: String,
     receipt: Option<async_channel::Sender<Result<SaveOutcome, String>>>,
     error: Option<String>,
+    ready_at: Option<Instant>,
 }
 
 /// The saver's whole state: the committed value, the value the worker is
@@ -57,10 +62,16 @@ fn deliver(job: &Job, outcome: Result<SaveOutcome, String>) {
     }
 }
 
+#[derive(Clone, Copy)]
+enum Target {
+    Setting(&'static str),
+    ComposerDraft(i64),
+}
+
 #[derive(Clone)]
 pub(crate) struct UiStoreSaves {
     store: Database,
-    key: &'static str,
+    target: Target,
     executor: BackgroundExecutor,
     state: Arc<Mutex<Inner>>,
     /// Wakes drain watchers; sends coalesce, and every worker exit is announced.
@@ -70,10 +81,14 @@ pub(crate) struct UiStoreSaves {
 
 impl UiStoreSaves {
     pub(crate) fn new(store: Database, key: &'static str, executor: BackgroundExecutor) -> Self {
+        Self::for_target(store, Target::Setting(key), executor)
+    }
+
+    fn for_target(store: Database, target: Target, executor: BackgroundExecutor) -> Self {
         let (progress, progress_rx) = async_channel::bounded(1);
         Self {
             store,
-            key,
+            target,
             executor,
             state: Arc::new(Mutex::new(Inner::default())),
             progress,
@@ -114,9 +129,25 @@ impl UiStoreSaves {
             value,
             receipt: Some(receipt),
             error: None,
+            ready_at: matches!(self.target, Target::ComposerDraft(_))
+                .then(|| self.executor.now() + Duration::from_millis(150)),
         });
         self.start_worker_if_idle(&mut state);
         Ok(SaveTicket { generation, result })
+    }
+
+    fn latest(&self) -> Option<String> {
+        let state = self.inner();
+        state
+            .pending
+            .as_ref()
+            .or(state.executing.as_ref())
+            .map(|job| job.value.clone())
+            .or_else(|| state.committed.clone())
+    }
+
+    pub(crate) fn resume(&self) {
+        self.inner().closing = false;
     }
 
     /// Stops accepting new values and waits, off the caller's thread, until
@@ -180,24 +211,39 @@ impl UiStoreSaves {
     /// lock is held, and never on the UI thread.
     async fn work(self) {
         loop {
-            let value = {
+            let next = {
                 let mut state = self.inner();
-                if state.executing.is_none()
-                    && let Some(pending) = state.pending.take()
+                if !state.closing
+                    && let Some(delay) = state
+                        .pending
+                        .as_ref()
+                        .and_then(|job| job.ready_at)
+                        .and_then(|time| time.checked_duration_since(self.executor.now()))
+                    && !delay.is_zero()
                 {
+                    Err(delay)
+                } else if let Some(pending) = state.pending.take() {
+                    let value = pending.value.clone();
                     state.executing = Some(pending);
-                }
-                match state.executing.as_ref() {
-                    Some(job) => job.value.clone(),
-                    None => {
-                        state.running = false;
-                        drop(state);
-                        let _ = self.progress.try_send(());
-                        return;
-                    }
+                    Ok(value)
+                } else {
+                    state.running = false;
+                    drop(state);
+                    let _ = self.progress.try_send(());
+                    return;
                 }
             };
-            let saved = locked(&self.store).and_then(|store| store.save_setting(self.key, &value));
+            let value = match next {
+                Ok(value) => value,
+                Err(delay) => {
+                    self.executor.timer(delay).await;
+                    continue;
+                }
+            };
+            let saved = locked(&self.store).and_then(|store| match self.target {
+                Target::Setting(key) => store.save_setting(key, &value),
+                Target::ComposerDraft(session) => store.write_composer_draft(session, &value),
+            });
             let mut state = self.inner();
             // Single worker: the executing slot still holds this job.
             let finished = state
@@ -225,6 +271,7 @@ impl UiStoreSaves {
                             value: finished.value.clone(),
                             receipt: None,
                             error: Some(error),
+                            ready_at: None,
                         });
                         state.running = false;
                         drop(state);
@@ -255,6 +302,40 @@ pub(crate) fn install(store: Database, cx: &mut App) {
 
 pub(crate) fn inbox_saver(cx: &App) -> Option<UiStoreSaves> {
     cx.try_global::<Shared>().map(|shared| shared.0.clone())
+}
+
+#[derive(Default)]
+struct ComposerSaves(HashMap<(usize, i64), UiStoreSaves>);
+impl Global for ComposerSaves {}
+
+fn composer_key(store: &Database, session: i64) -> (usize, i64) {
+    (Arc::as_ptr(store) as usize, session)
+}
+
+pub(crate) fn composer_latest(store: &Database, session: i64, cx: &App) -> Option<String> {
+    cx.try_global::<ComposerSaves>()?
+        .0
+        .get(&composer_key(store, session))?
+        .latest()
+}
+
+pub(crate) fn composer_saver(store: &Database, session: i64, cx: &mut App) -> UiStoreSaves {
+    let executor = cx.background_executor().clone();
+    cx.default_global::<ComposerSaves>()
+        .0
+        .entry(composer_key(store, session))
+        .or_insert_with(|| {
+            UiStoreSaves::for_target(store.clone(), Target::ComposerDraft(session), executor)
+        })
+        .clone()
+}
+
+pub(crate) fn pending_savers(cx: &App) -> Vec<UiStoreSaves> {
+    let drafts = cx
+        .try_global::<ComposerSaves>()
+        .into_iter()
+        .flat_map(|shared| shared.0.values().cloned());
+    inbox_saver(cx).into_iter().chain(drafts).collect()
 }
 
 /// Test seam: holds the Store mutex on a real thread, so anything needing the

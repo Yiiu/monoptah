@@ -8,6 +8,7 @@ pub struct SessionSidebarMetadata {
     pub worktrees: HashMap<i64, Option<String>>,
     pub details: HashMap<i64, MobileSessionMetadata>,
     pub drafts: HashSet<i64>,
+    pub composer_drafts: HashSet<i64>,
     pub sidebar_hidden: HashSet<i64>,
     pub started_by: HashMap<i64, i64>,
     pub orchestrations: HashMap<i64, orchestration::Summary>,
@@ -94,6 +95,7 @@ impl Store {
             worktrees: self.session_worktrees().unwrap_or_default(),
             details: self.mobile_session_metadata().unwrap_or_default(),
             drafts: self.draft_sessions().unwrap_or_default(),
+            composer_drafts: self.composer_draft_sessions().unwrap_or_default(),
             sidebar_hidden: if self.shared.is_some() {
                 self.shared_sidebar_hidden().unwrap_or_default()
             } else {
