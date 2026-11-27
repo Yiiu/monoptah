@@ -90,6 +90,16 @@ fn nested_snapshots_exclude_workspace_edits_outside_the_scope() {
 }
 
 #[test]
+fn unused_global_filters_and_overridden_autocrlf_allow_a_private_index() {
+    assert!(!needs_fresh_index(
+        b"filter.lfs.clean\ngit-lfs clean -- %f\0core.autocrlf\ntrue\0core.autocrlf\nfalse\0",
+    ));
+    assert!(needs_fresh_index(
+        b"core.autocrlf\nfalse\0core.autocrlf\ninput\0",
+    ));
+}
+
+#[test]
 fn changed_attributes_recheck_unchanged_line_endings() {
     let f = Fixture::new();
     f.write("line-endings.txt", "one\r\ntwo\r\n");
@@ -105,6 +115,65 @@ fn changed_attributes_recheck_unchanged_line_endings() {
     assert_eq!(take("normalised"), b"one\ntwo\n");
     std::fs::remove_file(f.repo.join(".gitattributes")).unwrap();
     assert_eq!(take("raw-again"), b"one\r\ntwo\r\n");
+}
+
+#[test]
+fn checkpoint_keeps_the_new_spelling_of_an_untracked_path() {
+    let f = Fixture::new();
+    run_git(&f.repo, &["config", "core.ignorecase", "true"]).unwrap();
+    f.write("Draft/Note.txt", "untracked\n");
+    let indexes = f.store.index_dir().unwrap();
+    capture_workspace(&f.repo, &f.repo, "refs/test/initial", &indexes).unwrap();
+    std::fs::rename(f.repo.join("Draft"), f.repo.join("tmp-folder")).unwrap();
+    std::fs::rename(f.repo.join("tmp-folder"), f.repo.join("draft")).unwrap();
+    let snapshot = capture_workspace(&f.repo, &f.repo, "refs/test/renamed", &indexes).unwrap();
+    let paths = run_git(&f.repo, &["ls-tree", "-r", "-z", "--name-only", &snapshot]).unwrap();
+    assert!(nul_records(&paths).any(|path| path == b"draft/Note.txt"));
+    assert!(!nul_records(&paths).any(|path| path == b"Draft/Note.txt"));
+}
+
+#[test]
+fn a_cache_only_gitlink_can_return_to_an_ordinary_directory() {
+    let f = Fixture::new();
+    f.write("embedded/file.txt", "nested content\n");
+    let embedded = f.repo.join("embedded");
+    run_git(&embedded, &["init"]).unwrap();
+    run_git(&embedded, &["add", "."]).unwrap();
+    run_git(
+        &embedded,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-m",
+            "initial",
+        ],
+    )
+    .unwrap();
+    let indexes = f.store.index_dir().unwrap();
+    capture_workspace(&f.repo, &f.repo, "refs/test/embedded", &indexes).unwrap();
+    std::fs::rename(embedded.join(".git"), f.dir.join("embedded-git")).unwrap();
+    let snapshot = capture_workspace(&f.repo, &f.repo, "refs/test/ordinary", &indexes).unwrap();
+    assert_eq!(
+        run_git(&f.repo, &["show", &format!("{snapshot}:embedded/file.txt")]).unwrap(),
+        b"nested content\n"
+    );
+}
+
+#[test]
+fn interrupted_capture_rotates_before_an_orphan_git_process_opens_its_lock() {
+    let f = Fixture::new();
+    let indexes = f.store.index_dir().unwrap();
+    capture_workspace(&f.repo, &f.repo, "refs/test/old", &indexes).unwrap();
+    let key = index_key(&f.repo);
+    let previous = index_generation(&indexes, &key).unwrap();
+    let active = indexes.join(format!("{key}.active"));
+    std::fs::write(&active, []).unwrap();
+    capture_workspace(&f.repo, &f.repo, "refs/test/new", &indexes).unwrap();
+    assert_eq!(index_generation(&indexes, &key).unwrap(), previous + 1);
+    assert!(!active.exists());
 }
 
 #[test]
@@ -1433,6 +1502,7 @@ fn a_file_named_index_does_not_rebuild_the_index() {
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
     assert!(error.contains("index.html"), "{error}");
     // Rebuilding would replace the file and lose the stat cache.
+    assert_eq!(private_index(&f), index);
     assert_eq!(std::fs::metadata(&index).unwrap().ino(), inode);
 }
 

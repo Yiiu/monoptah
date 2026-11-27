@@ -5,7 +5,8 @@
 //! Shared reviews require successful edit evidence for each displayed file,
 //! without inferring which process owns individual lines. Synchronous: callers
 //! run these on a background executor.
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::ffi::OsString;
 use std::fs::TryLockError;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -95,7 +96,14 @@ impl Store {
     /// Linked worktrees have distinct roots and must not share the cache.
     fn index_dir(&self) -> Result<PathBuf, String> {
         let dir = self.root.join("indexes");
-        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(&dir).map_err(|e| e.to_string())?;
         Ok(dir)
     }
 
@@ -1051,9 +1059,17 @@ fn capture_workspace(
     let basis = format!("{:x}", digest.finalize());
     // Read the generation only after the guard: another process may have
     // published a newer one while this capture waited.
-    let generation = index_generation(indexes, &key)?;
+    let active = indexes.join(format!("{key}.active"));
+    let mut generation = index_generation(indexes, &key)?;
+    if active.try_exists().map_err(|e| e.to_string())? {
+        // A Git child from an interrupted capture may not own index.lock yet.
+        generation = bump_generation(indexes, &key, generation)?;
+    }
+    std::fs::File::create(&active).map_err(|e| e.to_string())?;
+    let _active = ActiveCapture(active);
     let index = index_file(indexes, &key, generation);
-    match capture_workspace_once(repo, reference, &index, head, &basis) {
+    let ignore_case = enabled_config(&config, b"core.ignorecase");
+    match capture_workspace_once(repo, reference, &index, head, &basis, ignore_case) {
         Err(error) if lost_index_lock(&error) || corrupt_index(&error) => {
             // Abandoning the path is the only safe recovery. A `git` child of
             // a killed app renames `<index>.lock` by path, so reusing the name
@@ -1065,6 +1081,7 @@ fn capture_workspace(
                 &index_file(indexes, &key, next),
                 head,
                 &basis,
+                ignore_case,
             )
         }
         result => result,
@@ -1072,16 +1089,67 @@ fn capture_workspace(
 }
 
 fn needs_fresh_index(config: &[u8]) -> bool {
-    nul_records(config).any(|entry| {
-        let mut parts = entry.splitn(2, |byte| *byte == b'\n');
-        let name = parts.next().unwrap_or_default();
-        name.starts_with(b"filter.")
-            || (name == b"core.autocrlf"
-                && !matches!(
-                    parts.next().map(<[u8]>::to_ascii_lowercase).as_deref(),
-                    Some(b"false" | b"off" | b"no" | b"0")
-                ))
+    // A configured clean filter runs only when an attribute selects it.
+    // Inspect those attributes separately and use Git's last autocrlf value.
+    enabled_config(config, b"core.autocrlf")
+}
+
+fn enabled_config(config: &[u8], key: &[u8]) -> bool {
+    let value = nul_records(config)
+        .filter_map(|entry| {
+            let mut parts = entry.splitn(2, |byte| *byte == b'\n');
+            (parts.next()? == key).then(|| parts.next().unwrap_or(b"true"))
+        })
+        .last();
+    value.is_some_and(|value| {
+        !matches!(
+            value.to_ascii_lowercase().as_slice(),
+            b"false" | b"off" | b"no" | b"0"
+        )
     })
+}
+
+struct ActiveCapture(PathBuf);
+impl Drop for ActiveCapture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn has_exact_spelling(
+    root: &Path,
+    bytes: &[u8],
+    directories: &mut HashMap<PathBuf, HashSet<OsString>>,
+) -> bool {
+    #[cfg(unix)]
+    let path = {
+        use std::os::unix::ffi::OsStrExt;
+        Path::new(std::ffi::OsStr::from_bytes(bytes))
+    };
+    #[cfg(not(unix))]
+    let path = match std::str::from_utf8(bytes) {
+        Ok(path) => Path::new(path),
+        Err(_) => return false,
+    };
+    let mut parent = root.to_path_buf();
+    for name in path {
+        let names = directories.entry(parent.clone()).or_insert_with(|| {
+            if !std::fs::symlink_metadata(&parent).is_ok_and(|info| info.file_type().is_dir()) {
+                return HashSet::new();
+            }
+            std::fs::read_dir(&parent)
+                .into_iter()
+                .flatten()
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name())
+                .collect()
+        });
+        if !names.contains(name) {
+            return false;
+        }
+        parent.push(name);
+    }
+    true
 }
 
 fn has_conversion_attributes(repo: &Path, index: &Path) -> Result<bool, String> {
@@ -1282,6 +1350,7 @@ fn capture_workspace_once(
     index: &Path,
     head: Option<&str>,
     basis: &str,
+    ignore_case: bool,
 ) -> Result<String, String> {
     let basis_path = index.with_extension("basis");
     let reseed =
@@ -1289,13 +1358,8 @@ fn capture_workspace_once(
     if reseed {
         seed_index(repo, index, head)?;
     }
-    match has_conversion_attributes(repo, index) {
-        Ok(false) => {}
-        Err(error) if lost_index_lock(&error) || corrupt_index(&error) => return Err(error),
-        _ => return capture_fresh(repo, repo, reference, head),
-    }
     let run = |dir: &Path, args: &[&str]| checked_output(&mut index_command(dir, index, args));
-    let head = if let Some(head) = head {
+    let head_entries = if let Some(head) = head {
         run(
             repo,
             &["ls-tree", "-r", "-z", "--full-name", head, "--", "."],
@@ -1313,7 +1377,7 @@ fn capture_workspace_once(
     let present: HashSet<&[u8]> = indexed.iter().copied().collect();
     let mut head_paths: HashSet<&[u8]> = HashSet::new();
     let mut align = Vec::new();
-    for entry in nul_records(&head) {
+    for entry in nul_records(&head_entries) {
         let path = entry_path(entry)?;
         head_paths.insert(path);
         if !present.contains(path) {
@@ -1349,6 +1413,19 @@ fn capture_workspace_once(
         ],
     )?;
     let mut removals = Vec::new();
+    let mut directories = HashMap::new();
+    for entry in nul_records(&listing) {
+        let path = entry_path(entry)?;
+        if !head_paths.contains(path)
+            && (entry.starts_with(b"160000 ")
+                || (ignore_case && !has_exact_spelling(repo, path, &mut directories)))
+        {
+            // A cache-only gitlink may now be an ordinary directory. An
+            // untracked case-only rename uses its on-disk spelling.
+            removals.extend_from_slice(path);
+            removals.push(0);
+        }
+    }
     for path in nul_records(&ignored) {
         if !head_paths.contains(path) {
             removals.extend_from_slice(path);
@@ -1367,6 +1444,11 @@ fn capture_workspace_once(
         if code != 0 {
             return Err(stdin_failure(code, &stderr));
         }
+    }
+    match has_conversion_attributes(repo, index) {
+        Ok(false) => {}
+        Err(error) if lost_index_lock(&error) || corrupt_index(&error) => return Err(error),
+        _ => return capture_fresh(repo, repo, reference, head),
     }
     let result = finish_workspace_capture(repo, repo, reference, index)?;
     // A missing or partial marker causes the next run to reseed safely.
