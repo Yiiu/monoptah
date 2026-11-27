@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/native/component-guidelines.md", "reason": "Check UI follows native component rules"}
+{"file": ".trellis/spec/native/testing.md", "reason": "Check tests are Linux-portable and use selectors"}
+{"file": ".trellis/spec/core/persistence-and-compat.md", "reason": "Check back-compat of saved state"}
+{"file": ".trellis/spec/core/testing.md", "reason": "Core test conventions"}

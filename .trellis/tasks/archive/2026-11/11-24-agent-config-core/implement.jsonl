@@ -1,0 +1,10 @@
+{"file": ".trellis/spec/native/component-guidelines.md", "reason": "Native UI rules: theme colours, roles, labels, shared widgets"}
+{"file": ".trellis/spec/native/state-and-async.md", "reason": "Preferences flow and adding a preference"}
+{"file": ".trellis/spec/native/directory-structure.md", "reason": "Where settings rows and widgets live"}
+{"file": ".trellis/spec/native/testing.md", "reason": "GPUI test patterns and debug selectors"}
+{"file": ".trellis/spec/core/persistence-and-compat.md", "reason": "Serde tolerance, migration, secrets rule (documented exception)"}
+{"file": ".trellis/spec/core/processes-and-platforms.md", "reason": "Spawning CLIs, env, Windows differences"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "Shared pieces: modal, popover, theme"}
+{"file": ".trellis/tasks/11-24-agent-settings-redesign/research/launch-wiring.md", "reason": "Per-agent launch paths and injection points"}
+{"file": ".trellis/tasks/11-24-agent-settings-redesign/research/preferences-migration.md", "reason": "Fields, call sites, migration"}
+{"file": ".trellis/tasks/11-24-agent-settings-redesign/research/ui-components.md", "reason": "Reuse vs new component map, icons, tests"}

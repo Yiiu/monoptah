@@ -1,0 +1,5 @@
+{"file": ".trellis/spec/core/testing.md", "reason": "按本地模拟 provider 验证迟到确认、进程回收和跨平台行为。"}
+{"file": ".trellis/spec/native/testing.md", "reason": "验证现有会话界面入口和 Windows 构建。"}
+{"file": ".trellis/spec/core/persistence-and-compat.md", "reason": "检查既有队列、接收凭据和跨窗口保护。"}
+{"file": ".trellis/tasks/11-26-native-session-steer-recovery/research/session-controls-comparison.md", "reason": "从同类工具与 Codex 协议核对未确认收据、重复文本和停止终态的验收。"}
+{"file": ".trellis/tasks/11-26-native-session-steer-recovery/research/2026-11-26-multi-session-stall.md", "reason": "保留多会话现场边界并核对 Windows 并发响应验收。"}
