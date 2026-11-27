@@ -290,6 +290,7 @@ fn diff_index_lists_a_staged_rename_as_deleted_and_added() {
         dir,
         &[("old.txt", "one\ntwo\nthree\nfour\n"), ("keep.txt", "k\n")]
     ));
+    assert!(git(dir, &["config", "--local", "diff.renames", "true"]));
     assert!(git(dir, &["mv", "old.txt", "new.txt"]));
     std::fs::write(dir.join("new.txt"), "one\ntwo\nthree\nfour\nfive\n").unwrap();
 
