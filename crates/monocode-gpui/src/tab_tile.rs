@@ -12,12 +12,23 @@ pub(crate) enum Face {
     Neutral,
     /// A solid brand colour, top to bottom, under a white mark.
     Fill(Hsla, Hsla),
+    /// The running outline sits above a flat tile to keep its gap even.
+    FlatFill(Hsla, Hsla),
+    FlatNeutral,
 }
 
 impl Face {
     /// A provider's brand tile, or neutral for a multicolour logo.
     pub(crate) fn provider(provider: &str) -> Self {
         provider_tile(provider).map_or(Self::Neutral, |(top, bottom)| Self::Fill(top, bottom))
+    }
+
+    pub(crate) fn flat(self) -> Self {
+        match self {
+            Self::Fill(top, bottom) => Self::FlatFill(top, bottom),
+            Self::Neutral => Self::FlatNeutral,
+            flat => flat,
+        }
     }
 }
 
@@ -32,6 +43,12 @@ pub(crate) const TAB_TILE: TileSize = TileSize {
     w: 24.,
     h: 20.,
     radius: 5.,
+};
+
+pub(crate) const SIDEBAR_TILE: TileSize = TileSize {
+    w: 16.,
+    h: 14.,
+    radius: 4.,
 };
 
 /// Between a tab's tile and its title.
@@ -63,18 +80,18 @@ fn surface(radius: f32, depth: usize, face: Face, lifted: f32, tilt: f32) -> imp
         move |bounds, _, window, _| {
             let light = is_light();
             let sheen = white(match face {
-                Face::Fill(..) => 0.16,
-                Face::Neutral if light => 0.35,
-                Face::Neutral => 0.05,
+                Face::Fill(..) | Face::FlatFill(..) => 0.16,
+                Face::Neutral | Face::FlatNeutral if light => 0.35,
+                _ => 0.05,
             });
             let rim = match face {
                 // A light rim, as on an app icon.
-                Face::Fill(..) => white(0.14),
-                Face::Neutral => content(if depth == 0 { 0.1 } else { 0.06 }),
+                Face::Fill(..) | Face::FlatFill(..) => white(0.14),
+                _ => content(if depth == 0 { 0.1 } else { 0.06 }),
             };
             let (top, bottom) = match face {
-                Face::Fill(top, bottom) => (top, bottom),
-                Face::Neutral => neutral_shades(depth),
+                Face::Fill(top, bottom) | Face::FlatFill(top, bottom) => (top, bottom),
+                Face::Neutral | Face::FlatNeutral => neutral_shades(depth),
             };
             if tilt.abs() > 0.05 {
                 paint_tilted(
@@ -103,7 +120,7 @@ fn surface(radius: f32, depth: usize, face: Face, lifted: f32, tilt: f32) -> imp
                     .blur_radius(px(2. + 6. * lifted))],
                 );
             }
-            if depth == 0 {
+            if depth == 0 && !matches!(face, Face::FlatFill(..) | Face::FlatNeutral) {
                 let mut lift = bounds;
                 lift.origin.y += px(1.);
                 window.paint_quad(

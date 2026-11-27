@@ -1135,7 +1135,8 @@ impl SettingsView {
                         .border_1()
                         .border_color(content(0.07))
                         .child(pairing_backdrop(
-                            self.ctx.classic || self.ctx.new_layout_boxy,
+                            self.ctx.layout == crate::workspace::NavigationLayout::Classic
+                                || self.ctx.new_layout_boxy,
                         ))
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .child(

@@ -48,8 +48,10 @@ pub(crate) struct Update {
     pub(crate) context: Option<monocode_core::context::Usage>,
     pub(crate) metrics: Option<monocode_core::agent::TurnMetrics>,
     pub(crate) usage_limit: Option<monocode_core::usage::Limit>,
-    /// The tasks a yielded turn still waits on, when that changed.
+    /// The session's background inventory, when it changed.
     pub(crate) background: Option<Vec<provider::BackgroundTask>>,
+    pub(crate) activity: Option<provider::TurnActivity>,
+    pub(crate) provider_event: bool,
     pub(crate) approvals: Vec<Approval>,
     pub(crate) approvals_resolved: Vec<String>,
     pub(crate) questions: Vec<monocode_core::agent::Question>,
@@ -359,6 +361,8 @@ fn run_turn_using(
                 metrics: None,
                 usage_limit: None,
                 background: None,
+                activity: None,
+                provider_event: false,
                 approvals: Vec::new(),
                 approvals_resolved: Vec::new(),
                 questions: Vec::new(),
@@ -414,6 +418,8 @@ fn run_turn_using(
                     metrics: None,
                     usage_limit: None,
                     background: None,
+                    activity: None,
+                    provider_event: false,
                     approvals: Vec::new(),
                     approvals_resolved: Vec::new(),
                     questions: Vec::new(),
@@ -462,6 +468,8 @@ fn run_turn_using(
                     metrics: None,
                     usage_limit: None,
                     background: None,
+                    activity: None,
+                    provider_event: false,
                     approvals: Vec::new(),
                     approvals_resolved: Vec::new(),
                     questions: Vec::new(),
@@ -522,6 +530,8 @@ fn run_turn_using(
                     metrics: None,
                     usage_limit: None,
                     background: None,
+                    activity: None,
+                    provider_event: false,
                     approvals: Vec::new(),
                     approvals_resolved: Vec::new(),
                     questions: Vec::new(),
@@ -819,6 +829,7 @@ fn run_turn_using(
         };
         // The running-work list attributes the provider and its tools to this session.
         let result = monocode_core::process::owned_by(summary.id, || {
+            let mut phase_status = "Streaming…";
             provider::run_with_controls(request, cancel.clone(), Some(controls), |events| {
                 // Cancellation freezes the transcript, even while the native
                 // provider drains its interrupt acknowledgement.
@@ -832,8 +843,9 @@ fn run_turn_using(
                 if events.is_empty() && publications.is_empty() {
                     return Ok(());
                 }
+                let provider_event = !events.is_empty();
                 let mut start = transcript.rows.len();
-                let mut status = "Streaming…".to_string();
+                let mut status = phase_status.to_string();
                 let mut changed_id = None;
                 let mut model = None;
                 let mut config_model = None;
@@ -841,6 +853,7 @@ fn run_turn_using(
                 let mut context_changed = false;
                 let mut metrics = None;
                 let mut background = None;
+                let mut activity = None;
                 let mut approvals = Vec::new();
                 let mut approvals_resolved = Vec::new();
                 let mut questions = Vec::new();
@@ -1093,6 +1106,18 @@ fn run_turn_using(
                         }
                         Event::Status(text) => status = text,
                         Event::Background(tasks) => background = Some(tasks),
+                        Event::TurnActivity(next) => {
+                            activity = Some(next);
+                            phase_status = match next {
+                                provider::TurnActivity::Running => "Streaming…",
+                                provider::TurnActivity::Yielded { .. } => {
+                                    "Waiting for background tasks…"
+                                }
+                                provider::TurnActivity::Completed => "Ready",
+                            };
+                            status = phase_status.into();
+                            boundary = true;
+                        }
                         Event::UsageLimited(limit) => usage_limit = Some(limit),
                         Event::Done => {
                             status = "Ready".into();
@@ -1134,6 +1159,8 @@ fn run_turn_using(
                                 metrics,
                                 usage_limit: None,
                                 background,
+                                activity,
+                                provider_event,
                                 approvals,
                                 approvals_resolved,
                                 questions,
@@ -1364,6 +1391,8 @@ fn run_turn_using(
         metrics: None,
         usage_limit: if cancelled { None } else { usage_limit },
         background: None,
+        activity: None,
+        provider_event: false,
         approvals: Vec::new(),
         approvals_resolved: Vec::new(),
         questions: Vec::new(),

@@ -515,6 +515,12 @@ fn main() {
         projects.push(workspace.project);
     }
     let sidebar_metadata = db.session_sidebar_metadata(&projects);
+    let session_activity = db
+        .restore_session_activity(monocode_core::time::now_ms())
+        .unwrap_or_else(|error| {
+            eprintln!("Cannot restore agent session activity: {error}");
+            Default::default()
+        });
     let db = Arc::new(Mutex::new(db));
     // GPUI reports frame stalls through `log`; keep warnings where a Finder launch can't lose them.
     #[cfg(target_os = "macos")]
@@ -529,6 +535,18 @@ fn main() {
     gpui::Application::with_platform(platform)
         .with_assets(assets::Assets)
         .run(move |cx: &mut App| {
+            #[cfg(windows)]
+            {
+                let installed = std::env::current_exe()
+                    .is_ok_and(|exe| exe.with_file_name("native-install.json").is_file());
+                let mut id = monocode_core::brand::NATIVE_APP_ID.to_owned();
+                let mut name = monocode_core::brand::NATIVE_PRODUCT.to_owned();
+                if !installed {
+                    id.push_str(".dev");
+                    name.push_str(" Dev");
+                }
+                cx.set_app_identity(&id, &name);
+            }
             #[cfg(debug_assertions)]
             dev_reload::install(cx);
             cx.set_global(title_raster);
@@ -635,6 +653,7 @@ fn main() {
                             cwd,
                             saved,
                             sidebar_metadata,
+                            session_activity,
                             cx,
                         )
                     });

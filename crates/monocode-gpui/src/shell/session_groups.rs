@@ -138,6 +138,7 @@ pub(super) enum RenameTarget {
 }
 pub(super) struct Renaming {
     pub(super) target: RenameTarget,
+    pub(super) folder_project: Option<String>,
     input: Entity<input::Input>,
     _events: Vec<Subscription>,
 }
@@ -222,11 +223,13 @@ impl Shell {
         source: i64,
         cx: &App,
     ) -> Option<ListDrop> {
-        if !self.workspace.sidebar_visible || self.reminders.iter().any(|r| r.session_id == source)
+        if (!self.workspace.sidebar_visible && !(self.workspace.tree_layout() && self.peek_open()))
+            || self.reminders.iter().any(|r| r.session_id == source)
         {
             return None;
         }
-        let groups = self.project_groups();
+        let project = self.folder_project_for_session(source, cx);
+        let groups = self.project_groups_for(&project);
         for folder in &groups.folders {
             if self
                 .folder_bounds
@@ -238,7 +241,10 @@ impl Shell {
             }
         }
         for id in self.sidebar_navigation_ids(cx) {
-            if id == source || self.reminders.iter().any(|r| r.session_id == id) {
+            if id == source
+                || self.reminders.iter().any(|r| r.session_id == id)
+                || self.folder_project_for_session(id, cx) != project
+            {
                 continue;
             }
             if self
@@ -262,13 +268,17 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let project = self.folder_project_for_session(source, cx);
+        if self.workspace.tree_layout() {
+            self.tree.folder_project = Some(project.clone());
+        }
         match target {
             ListDrop::Folder(folder) => {
-                self.update_groups(cx, |g| g.add_to_folder(&folder, source))
+                self.update_groups_for(project, cx, |g| g.add_to_folder(&folder, source))
             }
             ListDrop::Session(target) if source != target => {
                 let folder = format!("{:x}-{source}-{target}", monocode_core::time::now_ms());
-                self.update_groups(cx, |g| {
+                self.update_groups_for(project, cx, |g| {
                     g.create_folder(&[source, target], folder.clone());
                 });
                 self.start_rename(RenameTarget::Folder(folder), window, cx);
@@ -305,7 +315,7 @@ impl Shell {
             return;
         }
         if let Some(over) = drag.over {
-            self.update_groups(cx, |g| {
+            self.update_groups_for(self.folder_context_project(), cx, |g| {
                 if let Some((from, to)) = g
                     .folders
                     .iter()
@@ -320,17 +330,39 @@ impl Shell {
         self.notify_sidebar(cx);
     }
     pub(super) fn project_groups(&self) -> Groups {
-        self.groups
-            .get(&self.workspace.project)
-            .cloned()
-            .unwrap_or_default()
+        self.project_groups_for(&self.workspace.project)
+    }
+    pub(super) fn project_groups_for(&self, project: &str) -> Groups {
+        self.groups.get(project).cloned().unwrap_or_default()
+    }
+    fn folder_context_project(&self) -> String {
+        if self.workspace.tree_layout()
+            && let Some(project) = &self.tree.folder_project
+        {
+            return project.clone();
+        }
+        self.workspace.project.clone()
+    }
+    fn folder_project_for_session(&self, id: i64, cx: &App) -> String {
+        if self.workspace.tree_layout() && self.session_summaries.contains_key(&id) {
+            let summary = self.session_metadata(id, cx).summary;
+            return self.project_of(id, &summary.cwd).to_owned();
+        }
+        self.workspace.project.clone()
     }
     pub(super) fn update_groups(
         &mut self,
         cx: &mut Context<Self>,
         change: impl FnOnce(&mut Groups),
     ) {
-        let project = self.workspace.project.clone();
+        self.update_groups_for(self.workspace.project.clone(), cx, change);
+    }
+    pub(super) fn update_groups_for(
+        &mut self,
+        project: String,
+        cx: &mut Context<Self>,
+        change: impl FnOnce(&mut Groups),
+    ) {
         let groups = self.groups.entry(project.clone()).or_default();
         change(groups);
         let groups = groups.clone();
@@ -394,6 +426,9 @@ impl Shell {
     }
     /// The sessions in the order the sidebar shows them, for stepping.
     pub(super) fn sidebar_navigation_ids(&self, cx: &App) -> Vec<i64> {
+        if self.workspace.tree_layout() {
+            return self.tree_session_ids(cx);
+        }
         let ids = self.sidebar_session_ids(cx);
         let groups = self.project_groups();
         let entries: Vec<_> = self
@@ -417,7 +452,12 @@ impl Shell {
         if !self.selected_sessions.contains(&id) {
             return vec![id];
         }
-        self.sidebar_session_ids(cx)
+        let visible = if self.workspace.tree_layout() {
+            self.tree_session_ids(cx)
+        } else {
+            self.sidebar_session_ids(cx)
+        };
+        visible
             .into_iter()
             .filter(|id| self.selected_sessions.contains(id))
             .collect()
@@ -467,7 +507,11 @@ impl Shell {
         } else {
             self.selected_sessions.clear();
             self.selection_anchor = Some(id);
-            self.open(id, window, cx);
+            if self.workspace.tree_layout() {
+                self.open_tree_session(id, window, cx);
+            } else {
+                self.open(id, window, cx);
+            }
         }
         if modifiers.shift || additive {
             window.focus(&self.sidebar_focus, cx);
@@ -479,7 +523,11 @@ impl Shell {
         let summary = self.session_metadata(id, cx).summary;
         let ids = self.session_menu_ids(id, cx);
         let multiple = ids.len() > 1;
-        let groups = self.project_groups();
+        let project = self.folder_project_for_session(id, cx);
+        let groups = self.project_groups_for(&project);
+        let share_project = ids
+            .iter()
+            .all(|&id| self.folder_project_for_session(id, cx) == project);
         let all_pinned = ids
             .iter()
             .all(|id| self.session_metadata(*id, cx).summary.pinned);
@@ -636,9 +684,11 @@ impl Shell {
                 )
                 .into(),
             MenuItem::Separator,
-            MenuAction::new("folder-new", "New folder").into(),
+            MenuAction::new("folder-new", "New folder")
+                .disabled(!share_project)
+                .into(),
         ]);
-        if !groups.folders.is_empty() {
+        if share_project && !groups.folders.is_empty() {
             items.push(MenuItem::Separator);
             items.extend(groups.folders.iter().map(|folder| {
                 MenuAction::new(
@@ -649,7 +699,7 @@ impl Shell {
                 .into()
             }));
         }
-        if ids.iter().any(|id| groups.folder_of(*id).is_some()) {
+        if share_project && ids.iter().any(|id| groups.folder_of(*id).is_some()) {
             items.push(
                 MenuAction::new(
                     "folder-remove",
@@ -688,6 +738,12 @@ impl Shell {
         }
         let summary = self.session_metadata(id, cx).summary.clone();
         let ids = self.session_menu_ids(id, cx);
+        let project = self.folder_project_for_session(id, cx);
+        let folder_ids: Vec<_> = ids
+            .iter()
+            .copied()
+            .filter(|&id| self.folder_project_for_session(id, cx) == project)
+            .collect();
         match action {
             "codespace-restore" => self.restore_codespace_code(id, cx),
             "continue-in-cloud" => self.open_cloud_move(id, window, cx),
@@ -811,27 +867,36 @@ impl Shell {
                     due_at,
                     fired_at: None,
                 }));
-                let project = self.workspace.project.clone();
-                if let Some(groups) = self.groups.get_mut(&project) {
-                    groups.reminders_collapsed = false;
+                let projects: HashSet<_> = ids
+                    .iter()
+                    .map(|&id| self.folder_project_for_session(id, cx))
+                    .collect();
+                for project in projects {
+                    self.update_groups_for(project, cx, |groups| {
+                        groups.reminders_collapsed = false
+                    });
                 }
-                self.update_groups(cx, |_| {});
                 self.store_write("set the reminder", cx, move |s| {
                     s.set_reminders(&ids, due_at)
                 });
             }
             "folder-new" => {
                 let folder = format!("{:x}", monocode_core::time::now_ms() ^ ((id as u64) << 40));
-                self.update_groups(cx, |groups| {
-                    groups.create_folder(&ids, folder.clone());
+                if self.workspace.tree_layout() {
+                    self.tree.folder_project = Some(project.clone());
+                }
+                self.update_groups_for(project, cx, |groups| {
+                    groups.create_folder(&folder_ids, folder.clone());
                 });
                 self.start_rename(RenameTarget::Folder(folder), window, cx);
             }
-            "folder-remove" => self.update_groups(cx, |groups| groups.remove_sessions(&ids)),
+            "folder-remove" => {
+                self.update_groups_for(project, cx, |groups| groups.remove_sessions(&folder_ids))
+            }
             add if add.starts_with("folder-add:") => {
                 let folder = add["folder-add:".len()..].to_string();
-                self.update_groups(cx, |groups| {
-                    for id in &ids {
+                self.update_groups_for(project, cx, |groups| {
+                    for id in &folder_ids {
                         groups.add_to_folder(&folder, *id);
                     }
                 });
@@ -856,8 +921,9 @@ impl Shell {
         events: &mut Vec<Subscription>,
         cx: &mut Context<Self>,
     ) -> Vec<MenuItem> {
+        let project = self.folder_context_project();
         let selected = self
-            .project_groups()
+            .project_groups_for(&project)
             .folder(folder)
             .and_then(|f| f.color_index)
             .unwrap_or(0);
@@ -869,7 +935,7 @@ impl Shell {
         events.push(
             cx.subscribe(&swatches, move |this, _, SwatchPicked(color), cx| {
                 let color = *color;
-                this.update_groups(cx, |groups| groups.set_color(&id, color));
+                this.update_groups_for(project.clone(), cx, |groups| groups.set_color(&id, color));
             }),
         );
         let focus = swatches.read(cx).focus.clone();
@@ -889,7 +955,9 @@ impl Shell {
     ) {
         match action {
             "rename" => self.start_rename(RenameTarget::Folder(folder), window, cx),
-            "ungroup" => self.update_groups(cx, |groups| groups.dissolve(&folder)),
+            "ungroup" => self.update_groups_for(self.folder_context_project(), cx, |groups| {
+                groups.dissolve(&folder)
+            }),
             _ => {}
         }
     }
@@ -1295,7 +1363,7 @@ impl Shell {
         if self.busy_sessions.remove(&id) {
             self.push_inbox_busy(cx);
         }
-        self.unseen_finished.remove(&id);
+        self.forget_agent_status(id);
         self.selected_sessions.remove(&id);
         self.reminders.retain(|r| r.session_id != id);
         self.workspace.project_focus.retain(|_, s| *s != id);
@@ -1348,10 +1416,12 @@ impl Shell {
 
     fn start_rename(&mut self, target: RenameTarget, window: &mut Window, cx: &mut Context<Self>) {
         self.close_preview(cx);
+        let folder_project =
+            matches!(target, RenameTarget::Folder(_)).then(|| self.folder_context_project());
         let text = match &target {
             RenameTarget::Session(id) => self.session_metadata(*id, cx).display_title(),
             RenameTarget::Folder(folder) => self
-                .project_groups()
+                .project_groups_for(&self.folder_context_project())
                 .folder(folder)
                 .map(|f| f.name.clone())
                 .unwrap_or_default(),
@@ -1389,6 +1459,7 @@ impl Shell {
         window.focus(&focus, cx);
         self.renaming = Some(Renaming {
             target,
+            folder_project,
             input,
             _events: events,
         });
@@ -1418,7 +1489,12 @@ impl Shell {
                     }
                 }
                 RenameTarget::Folder(folder) => {
-                    self.update_groups(cx, |groups| groups.rename_folder(&folder, &name))
+                    let project = renaming
+                        .folder_project
+                        .unwrap_or_else(|| self.workspace.project.clone());
+                    self.update_groups_for(project, cx, |groups| {
+                        groups.rename_folder(&folder, &name)
+                    })
                 }
             }
         }
@@ -1499,7 +1575,7 @@ impl Shell {
                 let (active, approval) = match target {
                     RenameTarget::Session(id) => (
                         self.workspace.active == Some(*id),
-                        self.session_metadata(*id, cx).needs_approval(),
+                        self.agent_status(*id).needs_you(),
                     ),
                     _ => (false, false),
                 };
@@ -1684,10 +1760,10 @@ impl Shell {
         if self.workspace.classic_layout {
             return self.classic_group_row(key, name, glyph, color, expanded, sessions, cx);
         }
-        let approval = sessions
+        let approval = sessions.iter().any(|id| self.agent_status(*id).needs_you());
+        let done = sessions
             .iter()
-            .any(|id| self.session_metadata(*id, cx).needs_approval());
-        let done = sessions.iter().any(|id| self.unseen_finished.contains(id));
+            .any(|id| self.agent_status(*id).unread_done());
         let group = SharedString::from(format!("group-row-{key}"));
         let toggle_key = key.to_string();
         let menu_key = key.to_string();
@@ -1871,18 +1947,22 @@ impl Shell {
         sessions: &[i64],
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let approval = sessions
-            .iter()
-            .any(|id| self.session_metadata(*id, cx).needs_approval());
-        let busy = sessions
-            .iter()
-            .any(|id| self.session_metadata(*id, cx).responding());
+        let approval = sessions.iter().any(|id| self.agent_status(*id).needs_you());
         let busy_mark = sessions
             .iter()
-            .find(|id| self.session_metadata(**id, cx).responding())
+            .filter(|id| self.agent_status(**id).is_busy())
+            .max_by_key(|id| {
+                matches!(
+                    self.agent_status(**id).activity,
+                    monocode_core::agent_status::Activity::Running { stale: false, .. }
+                )
+            })
             .and_then(|id| self.session_marks.get(id))
             .cloned();
-        let done = sessions.iter().any(|id| self.unseen_finished.contains(id));
+        let busy = busy_mark.is_some();
+        let done = sessions
+            .iter()
+            .any(|id| self.agent_status(*id).unread_done());
         let group = SharedString::from(format!("classic-group-row-{key}"));
         let toggle_key = key.to_owned();
         let menu_key = key.to_owned();

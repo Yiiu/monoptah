@@ -604,6 +604,9 @@ impl Inbox {
                 let related = self.related_sessions(&item);
                 let sessions = related.len();
                 let running = running::running_in(&related, &self.busy);
+                let animated = related
+                    .iter()
+                    .any(|session| self.animated.contains(&session.id));
                 let related_label = running::related_threads_label(sessions, running);
                 let tracker = model::is_tracker(&item.provider);
                 let kind = item_kind_label(&item);
@@ -651,7 +654,7 @@ impl Inbox {
                                         .items_center()
                                         .gap(px(2.))
                                         .text_color(accent_color())
-                                        .child(if running > 0 {
+                                        .child(if animated {
                                             div()
                                                 .size(px(12.))
                                                 .flex()
@@ -664,6 +667,8 @@ impl Inbox {
                                                     crate::pulse::Rate::Half,
                                                 ))
                                                 .into_any_element()
+                                        } else if running > 0 {
+                                            icon("clock", 12.).into_any_element()
                                         } else {
                                             icon("message-multiple", 12.)
                                                 .text_color(accent_color())
@@ -992,6 +997,7 @@ impl Inbox {
                                 )
                                 .children(related.into_iter().cloned().map(|session| {
                                     let running = self.busy.contains(&session.id);
+                                    let animated = self.animated.contains(&session.id);
                                     let label = if running {
                                         format!("{} (running)", session.title)
                                     } else {
@@ -1002,7 +1008,8 @@ impl Inbox {
                                         .h(px(24.))
                                         .bg(content(0.05))
                                         .max_w(px(256.))
-                                        .when(running, |d| {
+                                        .when(running && !animated, |d| d.child(icon("clock", 12.)))
+                                        .when(animated, |d| {
                                             d.child(
                                                 div()
                                                     .size(px(12.))
@@ -3662,10 +3669,10 @@ mod tests {
                     };
                     inbox.sessions = vec![linked(1, &item), linked(2, &item), linked(3, &other)];
                     assert_eq!(inbox.running_sessions(&item), 0);
-                    inbox.set_busy(HashSet::from([2, 3, 77]), cx);
+                    inbox.set_busy(HashSet::from([2, 3, 77]), HashSet::from([2, 3]), cx);
                     assert_eq!(inbox.running_sessions(&item), 1);
                     assert_eq!(inbox.running_sessions(&other), 1);
-                    inbox.set_busy(HashSet::new(), cx);
+                    inbox.set_busy(HashSet::new(), HashSet::new(), cx);
                     assert_eq!(inbox.running_sessions(&item), 0);
                 })
             })
@@ -3688,7 +3695,7 @@ mod tests {
                     };
                     let (a, b) = (task("a1"), task("b2"));
                     inbox.sessions = vec![linked(1, &a)];
-                    inbox.set_busy(HashSet::from([1]), cx);
+                    inbox.set_busy(HashSet::from([1]), HashSet::from([1]), cx);
                     assert_eq!(inbox.related_sessions(&a).len(), 1);
                     assert_eq!(inbox.running_sessions(&a), 1);
                     assert_eq!(inbox.related_sessions(&b).len(), 0);
@@ -3745,6 +3752,7 @@ mod tests {
                         );
                         view.state.source = "clickup".into();
                         view.busy = HashSet::from([4]);
+                        view.animated = HashSet::from([4]);
                         view
                     });
                     cx.new(|_| ListFixture { inbox })

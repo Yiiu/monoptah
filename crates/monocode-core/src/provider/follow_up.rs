@@ -75,6 +75,9 @@ impl Protocol {
                     json!({"type":"user","uuid":uuid,"session_id":"","parent_tool_use_id":null,"message":{"role":"user","content":request.claude_content(&prompt)?}}),
                 )?;
                 self.claude_unstarted_steers.insert(uuid);
+                if self.claude_result_seen {
+                    self.claude_resume_at = Some(Instant::now() + CLAUDE_CONTINUATION_GRACE);
+                }
                 self.text_key = None;
                 return Ok(vec![Event::FollowUp(message)]);
             }

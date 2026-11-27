@@ -326,6 +326,14 @@ pub(crate) fn is_light() -> bool {
 pub(crate) fn warning_color() -> Hsla {
     rgb(if is_light() { 0xb45309 } else { 0xfbbf24 }).into()
 }
+/// The blue of background activity, legible on both sidebar themes.
+pub(crate) fn agent_running_color() -> Hsla {
+    rgb(if is_light() { 0x2168b7 } else { 0x4da3f5 }).into()
+}
+/// The cyan marker for a completed reply that has yet to be read.
+pub(crate) fn agent_unread_color() -> Hsla {
+    rgb(if is_light() { 0x0f766e } else { 0x2dd4bf }).into()
+}
 /// Green for "done" and "works" marks: darker on light themes so it stays readable.
 pub(crate) fn success_color() -> Hsla {
     rgb(if is_light() { 0x059669 } else { 0x34d399 }).into()

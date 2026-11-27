@@ -31,6 +31,8 @@ fn update(status: impl Into<String>, finished: bool) -> Update {
         metrics: None,
         usage_limit: None,
         background: None,
+        activity: None,
+        provider_event: false,
         approvals: vec![],
         approvals_resolved: vec![],
         questions: vec![],
@@ -882,6 +884,7 @@ pub(crate) fn run_with_client_mirrored(
             let current_question = question(&snapshot);
             let mut next = update(if running { "Working…" } else { "Ready" }, !running);
             next.start = latest_rows.len();
+            next.provider_event = revision != last_revision;
             if revision != last_revision {
                 let mut projected = snapshot.clone();
                 monocode_core::remote::attachments::qualify_snapshot(

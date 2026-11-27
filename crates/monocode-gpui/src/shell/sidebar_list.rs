@@ -646,9 +646,18 @@ impl Shell {
 
     pub(super) fn sidebar_navigation(&mut self, cx: &mut Context<Self>) -> AnyElement {
         // The Focused layout shows Search as an icon beside Sidebar options.
-        let search_field = self.workspace.sidebar_search_visible && self.workspace.classic_layout;
+        let tree = self.workspace.tree_layout();
+        let search_field =
+            self.workspace.sidebar_search_visible && (self.workspace.classic_layout || tree);
         let focused = !self.workspace.classic_layout;
         let blank_session = focused && self.active_session_is_blank(cx);
+        let mut peek_pin = (tree && self.peek_open()).then(|| {
+            icon_button("tree-peek-pin", "Keep sidebar open", "pin")
+                .debug_selector(|| "tree-peek-pin".into())
+                .on_click(
+                    cx.listener(|this, _, window, cx| this.toggle_primary_sidebar(window, cx)),
+                )
+        });
         div()
             .w_full()
             .px_2()
@@ -666,74 +675,93 @@ impl Shell {
             .flex_col()
             .gap_px()
             .when(search_field, |d| {
-                d.child(
+                let row =
                     div()
-                        .id("rail-search")
-                        .debug_selector(|| "sidebar-search-field".into())
-                        .group("rail-search")
-                        .w_full()
-                        .h(px(32.))
+                        .flex()
+                        .items_center()
+                        .gap_2()
                         .mb(px(if self.workspace.classic_layout {
                             2.
                         } else {
                             4.
-                        }))
-                        .px_1p5()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(content(0.08))
-                        // RailSearch's Tailwind shadow-sm, including
-                        // its tighter second layer below the border.
-                        // The vendored shader keeps it outside the
-                        // box, as CSS does.
-                        .shadow(vec![
-                            BoxShadow::new(px(0.), px(1.), rgba(0x0000001a).into())
-                                .blur_radius(px(3.)),
-                            BoxShadow::new(px(0.), px(1.), rgba(0x0000001a).into())
-                                .blur_radius(px(2.))
-                                .spread_radius(px(-1.)),
-                        ])
-                        .text_color(content(if self.sidebar_hover == Some("Search") {
-                            1.
-                        } else {
-                            0.5
-                        }))
-                        .font_weight(FontWeight::MEDIUM)
-                        .hover(|s| s.bg(content(0.1)).text_color(content(1.)))
-                        .on_hover(cx.listener(|this, hovered, _, cx| {
-                            this.sidebar_hover = if *hovered { Some("Search") } else { None };
-                            this.notify_navigation(cx);
-                        }))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, window, cx| {
-                                this.focus_search(window, cx);
-                            }),
-                        )
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .text_size(px(14.))
-                        .child(
-                            icon("search", 16.)
-                                .text_color(content(0.35))
-                                .group_hover("rail-search", |s| s.text_color(content(0.7))),
-                        )
-                        .child(div().flex_1().min_w_0().h(px(20.)).child("Search"))
-                        .child(
-                            // The shortcut span sits outside the label's `font-medium`.
-                            div()
-                                .text_size(px(11.))
-                                .font_weight(FontWeight::NORMAL)
-                                .text_color(content(0.4))
-                                .child(if cfg!(target_os = "macos") {
-                                    "⌘K"
-                                } else {
-                                    "Ctrl K"
+                        }));
+                d.child(
+                    row.child(
+                        div()
+                            .id("rail-search")
+                            .debug_selector(|| "sidebar-search-field".into())
+                            .group("rail-search")
+                            .flex_1()
+                            .min_w_0()
+                            .h(px(32.))
+                            .rounded_md()
+                            .when(tree, |d| d.px_2().bg(content(0.04)))
+                            .when(!tree, |d| {
+                                // Classic RailSearch's two-layer Tailwind shadow-sm.
+                                d.px_1p5()
+                                    .border_1()
+                                    .border_color(content(0.08))
+                                    .shadow(vec![
+                                        BoxShadow::new(px(0.), px(1.), rgba(0x0000001a).into())
+                                            .blur_radius(px(3.)),
+                                        BoxShadow::new(px(0.), px(1.), rgba(0x0000001a).into())
+                                            .blur_radius(px(2.))
+                                            .spread_radius(px(-1.)),
+                                    ])
+                            })
+                            .text_color(content(if self.sidebar_hover == Some("Search") {
+                                1.
+                            } else {
+                                0.5
+                            }))
+                            .font_weight(FontWeight::MEDIUM)
+                            .hover(|s| s.bg(content(0.1)).text_color(content(1.)))
+                            .on_hover(cx.listener(|this, hovered, _, cx| {
+                                this.sidebar_hover = if *hovered { Some("Search") } else { None };
+                                this.notify_navigation(cx);
+                            }))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, window, cx| {
+                                    this.focus_search(window, cx);
                                 }),
-                        ),
+                            )
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_size(px(14.))
+                            .child(
+                                icon("search", 16.)
+                                    .text_color(content(0.35))
+                                    .group_hover("rail-search", |s| s.text_color(content(0.7))),
+                            )
+                            .child(div().flex_1().min_w_0().h(px(20.)).child("Search"))
+                            .child(
+                                // The shortcut span sits outside the label's `font-medium`.
+                                div()
+                                    .debug_selector(|| "sidebar-search-hint".into())
+                                    .flex_shrink_0()
+                                    .text_size(px(11.))
+                                    .font_weight(FontWeight::NORMAL)
+                                    .text_color(content(if tree { 0.35 } else { 0.4 }))
+                                    .child(if tree || cfg!(target_os = "macos") {
+                                        format!("{MOD}K")
+                                    } else {
+                                        "Ctrl K".into()
+                                    }),
+                            ),
+                    )
+                    .children(peek_pin.take()),
                 )
             })
+            .children(peek_pin.map(|pin| {
+                div()
+                    .h(px(32.))
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .child(pin)
+            }))
             .children(
                 [
                     ("Today", "clock"),
@@ -835,18 +863,16 @@ impl Shell {
                                 ),
                                 _ => None,
                             },
-                            // One column for hints, counts and the unread dot,
-                            // centred under the section buttons' icons below.
                             |row, trailing| {
                                 row.child(
                                     div()
                                         .debug_selector(move || {
                                             format!("sidebar-navigation-trailing-{label}")
                                         })
-                                        .w(px(TRAILING_SLOT))
                                         .flex_shrink_0()
                                         .flex()
-                                        .justify_center()
+                                        .when(tree, |d| d.min_w(px(TRAILING_SLOT)).justify_end())
+                                        .when(!tree, |d| d.w(px(TRAILING_SLOT)).justify_center())
                                         .text_size(px(11.))
                                         .font_weight(FontWeight::NORMAL)
                                         .text_color(content(0.35))
@@ -1271,6 +1297,7 @@ mod tests {
             .update(cx, |shell, _, cx| {
                 for id in [a, b] {
                     shell.sessions[&id].update(cx, |session, _| session.busy = true);
+                    shell.refresh_status(id, cx);
                 }
                 shell.invalidate_chrome(cx);
             })

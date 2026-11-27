@@ -180,12 +180,15 @@ impl Shell {
         if notify_changes {
             for change in widened {
                 let tag: String = change.device_id.chars().take(16).collect();
-                let _ = platform::show(platform::Notification {
-                    tag: format!("web-access-{tag}-{}", change.at),
-                    subtitle: "Web app".into(),
-                    body: access_change_body(&change),
-                    sound: sounds,
-                });
+                let _ = platform::show(
+                    platform::Notification {
+                        tag: format!("web-access-{tag}-{}", change.at),
+                        subtitle: "Web app".into(),
+                        body: access_change_body(&change),
+                        sound: sounds,
+                    },
+                    cx,
+                );
             }
         }
         if !notify {
@@ -194,12 +197,15 @@ impl Shell {
         for (name, fingerprint) in fresh {
             let tag: String = fingerprint.chars().take(16).collect();
             // The receiver is dropped: delivery is best effort.
-            let _ = platform::show(platform::Notification {
-                tag: format!("web-pending-{tag}"),
-                subtitle: "Web app".into(),
-                body: format!("Web app: {name} asks for access"),
-                sound: sounds,
-            });
+            let _ = platform::show(
+                platform::Notification {
+                    tag: format!("web-pending-{tag}"),
+                    subtitle: "Web app".into(),
+                    body: format!("Web app: {name} asks for access"),
+                    sound: sounds,
+                },
+                cx,
+            );
         }
     }
 

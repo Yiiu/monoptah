@@ -974,6 +974,36 @@ mod interaction_tests {
     }
 
     #[gpui::test]
+    fn tree_opening_a_cloud_twin_keeps_the_local_tab_scope(cx: &mut TestAppContext) {
+        let (window, _, local) = window(cx);
+        window
+            .update(cx, |shell, _, cx| {
+                let project = shell.workspace.project.clone();
+                let cloud = add_cloud(shell);
+                shell
+                    .workspace
+                    .set_navigation_layout(crate::workspace::NavigationLayout::Tree);
+                shell.worktree_focus.insert(
+                    project.clone(),
+                    crate::worktree_switcher::WorktreeFocus {
+                        path: "/work/feature".into(),
+                        branch: Some("feature".into()),
+                    },
+                );
+                // Exercise the open path's worktree and tab selection without starting
+                // the remote conversation's polling loop in this test window.
+                shell.focus_tree_session_worktree(cloud, cx);
+                shell.workspace.open(cloud);
+                shell.record_worktree_session(cloud, cx);
+                assert_eq!(shell.workspace.active, Some(cloud));
+                assert_eq!(shell.working_copy(), project);
+                assert!(shell.visible_tabs(cx).contains(&TitleTab::Session(local)));
+                assert!(shell.visible_tabs(cx).contains(&TitleTab::Session(cloud)));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
     fn cloud_sessions_are_tabs_of_their_local_project_alone_and_in_a_grid(cx: &mut TestAppContext) {
         let (window, _, local) = window(cx);
         window

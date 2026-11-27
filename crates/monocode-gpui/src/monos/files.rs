@@ -263,6 +263,9 @@ impl Monos {
     }
     /// Takes the Mono off the roster, once confirmed here or on the phone.
     pub(super) fn remove_mono(&mut self, id: &str, cx: &mut Context<Self>) {
+        if let Some(session) = self.roster.get(id).and_then(|mono| mono.session_id) {
+            self.forget_chat_activity(session, cx);
+        }
         if let Some(view) = self.chats.remove(id) {
             view.update(cx, |v, cx| v.mono_stop(cx));
         }

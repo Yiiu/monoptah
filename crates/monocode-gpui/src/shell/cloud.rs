@@ -1069,12 +1069,12 @@ impl Shell {
     /// Whether "New session in Codespace" applies to the project in view: a local
     /// folder whose `origin` is a GitHub repository.
     pub(super) fn offers_codespace(&self) -> bool {
-        self.can_open_codespace(&self.workspace.project)
-            && self
-                .github_projects
-                .get(&self.workspace.project)
-                .copied()
-                .unwrap_or(false)
+        self.offers_codespace_for(&self.workspace.project)
+    }
+
+    pub(super) fn offers_codespace_for(&self, project: &str) -> bool {
+        self.can_open_codespace(project)
+            && self.github_projects.get(project).copied().unwrap_or(false)
     }
 
     /// Marks a session the app or a Mono just created, so it is listed under its local project
@@ -1176,9 +1176,16 @@ impl Shell {
         self.cloud_origins = snapshot.origins;
         self.cloud_located = snapshot.located;
         self.cloud_gone = snapshot.gone;
-        for (id, activity) in &snapshot.activity {
+        let mut activity_changed = false;
+        for (id, activity) in snapshot.activity {
             // Host activity of the project is only polled for remote projects.
-            self.remote_marks.insert(*id, *activity);
+            if self.remote_marks.insert(id, activity) != Some(activity) {
+                self.refresh_status(id, cx);
+                activity_changed = true;
+            }
+        }
+        if activity_changed {
+            self.process_notification_inputs(cx);
         }
         self.github_projects.extend(snapshot.github);
         self.sync_codespace_offers(cx);

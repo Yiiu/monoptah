@@ -8,7 +8,7 @@ use crate::{
     resource_pressure::SessionInfo,
     right_panel::{RightPanel, RightTab},
     theme::*,
-    workspace::TitleTab,
+    workspace::{NavigationLayout, TitleTab},
 };
 use gpui::{
     AnyElement, Context, CursorStyle, Entity, MouseButton, MouseDownEvent, Role, StyleRefinement,
@@ -17,6 +17,7 @@ use gpui::{
 use std::collections::HashMap;
 
 const CARD_RADIUS: f32 = 10.;
+const INSET_PANE_GUTTER: f32 = 6.;
 
 // GPUI overflow clips rectangles. Capture outside the bordered frame so the
 // final mask includes its background, border and children at the outer radius.
@@ -148,6 +149,14 @@ fn panel_button(enabled: bool, dot: bool) -> gpui::Stateful<gpui::Div> {
 }
 
 impl Shell {
+    pub(super) fn session_sidebar_width(&self) -> f32 {
+        self.workspace.sidebar_width * self.sidebar_fraction
+    }
+
+    fn tree_workspace(&self) -> bool {
+        self.workspace.tree_layout() && self.settings.is_none()
+    }
+
     pub(super) fn classic_titlebar_spans_window(&self, cx: &gpui::App) -> bool {
         cfg!(target_os = "macos")
             && self.workspace.classic_layout
@@ -157,8 +166,22 @@ impl Shell {
             && !self.search_page()
             && !self.mono_active(cx)
     }
-    /// Switch navigation layouts without changing the new layout's frame style.
+    /// Cycle through the navigation layouts without changing the workspace style.
     pub(super) fn toggle_layout(&mut self, cx: &mut Context<Self>) {
+        self.set_navigation_layout(self.workspace.navigation_layout().next(), cx);
+    }
+
+    pub(super) fn set_navigation_layout(
+        &mut self,
+        layout: NavigationLayout,
+        cx: &mut Context<Self>,
+    ) {
+        if layout == self.workspace.navigation_layout() {
+            return;
+        }
+        if self.workspace.tree_layout() {
+            self.settle_tree_unread_now();
+        }
         // Someone leaving the original layout before answering the new-layout
         // notice has never picked a frame, so they land on the boxy default.
         // Those who already went through it keep the frame they had.
@@ -166,7 +189,7 @@ impl Shell {
             self.workspace.new_layout_boxy = true;
             self.workspace.new_layout_prompt_dismissed = true;
         }
-        self.workspace.classic_layout = !self.workspace.classic_layout;
+        self.workspace.set_navigation_layout(layout);
         self.project_resize = None;
         self.layout_changed(cx);
         self.sync_settings(cx);
@@ -237,6 +260,12 @@ impl Shell {
                 cx,
             )];
         }
+        let tree_sidebar = self.tree_workspace();
+        let gutter = if tree_sidebar {
+            INSET_PANE_GUTTER
+        } else {
+            INSET_PANE_GUTTER * (1. - self.sidebar_fraction)
+        };
         let card = self.workspace_content(right_shown, right_width, full, window, cx);
         let card = div()
             .id("rounded-main-pane")
@@ -257,8 +286,7 @@ impl Shell {
                     .overflow_hidden()
                     .bg(inset_pane_fill())
                     .rounded(px(CARD_RADIUS))
-                    .border_1()
-                    .border_color(content(0.08))
+                    .when(!tree_sidebar, |d| d.border_1().border_color(content(0.08)))
                     .child(card),
             )
             .child(card_corner_mask(false));
@@ -314,7 +342,7 @@ impl Shell {
                         .flex()
                         .flex_col()
                         .pr_1p5()
-                        .pl(px(6. * (1. - self.sidebar_fraction)))
+                        .pl(px(gutter))
                         .child(
                             div()
                                 .absolute()
@@ -324,14 +352,14 @@ impl Shell {
                                 .w(px(6.))
                                 .bg(inset_chrome_wash()),
                         )
-                        .when(self.sidebar_fraction < 1., |d| {
+                        .when(gutter > 0., |d| {
                             d.child(
                                 div()
                                     .absolute()
                                     .left_0()
                                     .top_0()
                                     .bottom_0()
-                                    .w(px(6. * (1. - self.sidebar_fraction)))
+                                    .w(px(gutter))
                                     .bg(inset_chrome_wash()),
                             )
                         })
@@ -385,6 +413,7 @@ impl Shell {
         let show_navigation = !spans_window;
         let navigation = show_navigation.then(|| self.navigation(cx));
         let corner = (self.settings.is_none() && !original).then(|| self.panel_toggle(window, cx));
+        let tree_sidebar = self.tree_workspace();
         let body = div()
             .flex_1()
             .min_h_0()
@@ -403,7 +432,7 @@ impl Shell {
                         .h_full()
                         .flex_shrink_0()
                         .overflow_hidden()
-                        .border_r_1()
+                        .when(!tree_sidebar, |d| d.border_r_1())
                         .border_color(if original {
                             content(0.07)
                         } else {
@@ -683,12 +712,13 @@ impl Shell {
             && self.workspace.sidebar_visible
             && self.sidebar_slide.is_none())
         .then(|| {
-            // The classic sidebar owns its right rule; the inset workspace
-            // owns the rule just beyond the sidebar's edge.
+            // Aim at the drawn split, including the middle of Tree's inset gutter.
             let border = self.project_rail_drawn_width()
                 + self.workspace.sidebar_width
                 + if self.workspace.boxy_layout() {
                     -0.5
+                } else if self.tree_workspace() {
+                    INSET_PANE_GUTTER / 2.
                 } else {
                     0.5
                 };
@@ -944,6 +974,142 @@ mod tests {
     use gpui::{TestAppContext, WindowHandle};
     use std::time::{Duration, Instant};
 
+    #[gpui::test]
+    fn tree_sidebar_keeps_the_content_gutter_while_closing(cx: &mut TestAppContext) {
+        let (window, _, _) = window(cx);
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.simulate_resize(gpui::size(px(1450.), px(900.)));
+        window
+            .update(visual, |shell, _, cx| {
+                shell.workspace.new_layout_boxy = false;
+                shell.set_navigation_layout(NavigationLayout::Tree, cx);
+            })
+            .unwrap();
+        let gutter = |visual: &mut gpui::VisualTestContext| {
+            visual.debug_bounds("rounded-main-pane").unwrap().left()
+                - visual.debug_bounds("sidebar-frame").unwrap().right()
+        };
+        visual.refresh().unwrap();
+        assert_eq!(gutter(visual), px(6.));
+        for (row, hint) in [
+            ("sidebar-search-field", "sidebar-search-hint"),
+            ("sidebar-navigation-New", "sidebar-navigation-trailing-New"),
+        ] {
+            assert_eq!(
+                visual.debug_bounds(row).unwrap().right()
+                    - visual.debug_bounds(hint).unwrap().right(),
+                px(8.),
+            );
+        }
+
+        window
+            .update(visual, |shell, _, cx| {
+                shell.workspace.sidebar_visible = false;
+                let slide =
+                    crate::pane_motion::PaneSlide::new(0.1, 0., shell.workspace.sidebar_width);
+                slide.freeze_elapsed(Duration::ZERO);
+                shell.sidebar_slide = Some(slide);
+                cx.notify();
+            })
+            .unwrap();
+        visual.refresh().unwrap();
+        assert_eq!(gutter(visual), px(6.));
+
+        window
+            .update(visual, |shell, _, cx| {
+                cx.set_reduce_motion(true);
+                cx.notify();
+                assert!(!shell.workspace.sidebar_visible);
+            })
+            .unwrap();
+        visual.refresh().unwrap();
+        assert!(visual.debug_bounds("sidebar-frame").is_none());
+        assert_eq!(
+            visual.debug_bounds("rounded-main-pane").unwrap().left(),
+            px(6.)
+        );
+        assert!(visual.debug_bounds("project-tree-sidebar").is_none());
+    }
+
+    #[gpui::test]
+    fn tree_shortcuts_hide_the_sidebar_and_allow_peek(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            crate::shell::bind_keys(cx);
+            cx.set_reduce_motion(true);
+        });
+        let (window, _, _) = window(cx);
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.simulate_resize(gpui::size(px(1450.), px(900.)));
+        visual.run_until_parked();
+        visual.simulate_keystrokes("secondary-shift-l");
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        assert!(visual.debug_bounds("project-tree-sidebar").is_some());
+        assert!(visual.debug_bounds("sidebar-project-button").is_none());
+        let navigation_rows = ["sidebar-navigation-Today", "sidebar-navigation-Inbox"];
+        let docked_widths = navigation_rows.map(|row| visual.debug_bounds(row).unwrap().size.width);
+
+        visual.simulate_keystrokes("secondary-b");
+        visual.run_until_parked();
+        for (theme, opacity) in [("dark", 85), ("dark", 100), ("light", 85)] {
+            window
+                .update(visual, |shell, _, cx| {
+                    shell.workspace.preferences.theme = theme.into();
+                    shell.workspace.preferences.sidebar_opacity = opacity;
+                    shell.invalidate_chrome(cx);
+                    cx.notify();
+                })
+                .unwrap();
+            visual.refresh().unwrap();
+            assert!(visual.debug_bounds("sidebar-frame").is_none());
+            assert!(visual.debug_bounds("project-tree-sidebar").is_none());
+            assert_eq!(
+                visual.debug_bounds("main-pane-frame").unwrap().left(),
+                px(0.)
+            );
+        }
+        visual.simulate_mouse_move(
+            gpui::point(px(1.), px(TITLE_BAR_HEIGHT + 50.)),
+            None,
+            Default::default(),
+        );
+        visual.refresh().unwrap();
+        let peek = visual.debug_bounds("sidebar-peek").expect("open Tree peek");
+        assert_eq!(peek.left(), px(6.));
+        let pin = visual.debug_bounds("tree-peek-pin").unwrap();
+        let search = visual.debug_bounds("sidebar-search-field").unwrap();
+        assert!(search.right() < pin.left());
+        assert_eq!(search.center().y, pin.center().y);
+        assert_eq!(
+            navigation_rows.map(|row| visual.debug_bounds(row).unwrap().size.width),
+            docked_widths,
+        );
+        window
+            .update(visual, |shell, _, cx| {
+                shell.workspace.sidebar_search_visible = false;
+                shell.notify_sidebar(cx);
+            })
+            .unwrap();
+        visual.refresh().unwrap();
+        assert!(visual.debug_bounds("sidebar-search-field").is_none());
+        let pin = visual.debug_bounds("tree-peek-pin").unwrap();
+        assert!(visual.debug_bounds(navigation_rows[0]).unwrap().top() >= pin.bottom());
+        assert_eq!(
+            navigation_rows.map(|row| visual.debug_bounds(row).unwrap().size.width),
+            docked_widths,
+        );
+        visual.simulate_mouse_move(peek.center(), None, Default::default());
+        visual.executor().advance_clock(Duration::from_millis(500));
+        visual.run_until_parked();
+        assert!(visual.debug_bounds("sidebar-peek").is_some());
+
+        visual.simulate_keystrokes("secondary-b");
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        assert!(visual.debug_bounds("project-tree-sidebar").is_some());
+        assert!(visual.debug_bounds("sidebar-peek").is_none());
+    }
+
     fn mixed_window(cx: &mut TestAppContext) -> (WindowHandle<Shell>, Entity<Monos>, String, i64) {
         let (window, _, session) = window(cx);
         let (manager, id) = window
@@ -1056,7 +1222,14 @@ mod tests {
         for classic in [false, true] {
             window
                 .update(visual, |shell, _, cx| {
-                    shell.workspace.classic_layout = classic;
+                    shell.set_navigation_layout(
+                        if classic {
+                            NavigationLayout::Classic
+                        } else {
+                            NavigationLayout::Focused
+                        },
+                        cx,
+                    );
                     assert!(
                         !shell.workspace.right_panel_open,
                         "opening a Mono respects the session's closed sidebar"

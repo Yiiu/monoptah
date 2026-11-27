@@ -4155,6 +4155,7 @@ dependencies = [
  "tree-sitter-yaml",
  "tree-sitter-zig",
  "unicode-segmentation",
+ "windows 0.62.2",
  "zeroize",
 ]
 

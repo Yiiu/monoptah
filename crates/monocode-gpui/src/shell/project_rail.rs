@@ -10,6 +10,25 @@ use monocode_core::scm::DiffStats;
 
 const ICON_RAIL_WIDTH: f32 = 48.;
 
+pub(super) fn project_group_appearance(
+    group: &workspace::ProjectRailGroup,
+) -> monocode_core::project_appearance::ProjectAppearance {
+    let color = group
+        .custom_color
+        .as_ref()
+        .and_then(|c| u32::from_str_radix(c.trim_start_matches('#'), 16).ok())
+        .or_else(|| {
+            group
+                .color_index
+                .and_then(|i| monocode_core::project_appearance::COLORS.get(i).copied())
+        });
+    monocode_core::project_appearance::ProjectAppearance {
+        color,
+        mascot: group.mascot.clone(),
+        ..Default::default()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ProjectRailRow {
     Monos,
@@ -25,8 +44,8 @@ pub(super) struct ProjectRailList {
     compact: bool,
     bounds: HashMap<String, AnchorSlot>,
     group_bounds: HashMap<String, AnchorSlot>,
-    shifts: HashMap<String, TabShift>,
-    settling: Option<String>,
+    shifts: HashMap<(RailDragKind, String), TabShift>,
+    settling: Option<RailSettlement>,
     skip_click: bool,
     /// The project the rail's scroll position was last matched to: the one
     /// shown at the last render, or revealed since. `reveal_active_project_rail`
@@ -107,10 +126,64 @@ pub(super) struct ProjectRailStats {
     loading: bool,
     deferred: bool,
 }
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) enum RailDragKind {
+    Project,
+    Group,
+    Folder(String),
+    Session(String),
+}
+
+struct RailSettlement {
+    key: (RailDragKind, String),
+    bounds: Bounds<Pixels>,
+    tree: Option<TreeRailSettlement>,
+}
+
+struct TreeRailSettlement {
+    scroll_top: Pixels,
+    drop_frame: TreeDropFrame,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TreeDropFrame {
+    Pending,
+    Drawing,
+    Finished,
+}
+
+struct TreeRailDrag {
+    viewport: Bounds<Pixels>,
+    press_scroll: Pixels,
+    scroll_delta: Pixels,
+    grab_offset: Pixels,
+    pointer: Point<Pixels>,
+    edge_frame: Option<std::time::Instant>,
+}
+
+impl TreeRailDrag {
+    fn edge_velocity(&self) -> f32 {
+        if !self.viewport.contains(&self.pointer) {
+            return 0.;
+        }
+        let zone = (self.viewport.size.height.as_f32() / 2.).min(32.);
+        if zone <= 0. {
+            return 0.;
+        }
+        let from_top = (self.pointer.y - self.viewport.top()).as_f32();
+        let from_bottom = (self.viewport.bottom() - self.pointer.y).as_f32();
+        let up = (1. - from_top / zone).max(0.);
+        let down = (1. - from_bottom / zone).max(0.);
+        (down - up) * 720.
+    }
+}
+
 pub(super) struct ProjectRailDrag {
     path: String,
-    group: bool,
+    kind: RailDragKind,
+    tree: Option<TreeRailDrag>,
     order: Vec<String>,
+    /// For a Tree drag these bounds stay in the coordinate space at press time.
     bounds: Vec<Bounds<Pixels>>,
     from: usize,
     to: usize,
@@ -119,7 +192,59 @@ pub(super) struct ProjectRailDrag {
     active: bool,
 }
 impl ProjectRailDrag {
+    /// Follows the pointer, `offset` from the press and kept between the first
+    /// and last slot, and aims at the nearest slot. Returns whether that changed.
+    fn follow(&mut self, offset: Pixels) -> bool {
+        let origin = self.bounds[self.from].top();
+        // Tree follows the visible headers, the way tabs follow the strip's
+        // left edges. The final slot of an expanded block can be far from
+        // the header under the pointer, so use it only when settling.
+        let slots: Vec<_> = if self.tree.is_some() {
+            self.bounds.iter().map(|b| b.top() - origin).collect()
+        } else {
+            (0..self.order.len())
+                .map(|to| self.layout(to)[self.from] - origin)
+                .collect()
+        };
+        let (min, max) = self.tree.as_ref().map_or_else(
+            || (slots[0], *slots.last().unwrap()),
+            |tree| {
+                (
+                    tree.viewport.top() + tree.scroll_delta - origin,
+                    tree.viewport.bottom() + tree.scroll_delta - origin,
+                )
+            },
+        );
+        self.offset = offset.clamp(min, max);
+        let to = slots
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| {
+                (a.as_f32() - self.offset.as_f32())
+                    .abs()
+                    .total_cmp(&(b.as_f32() - self.offset.as_f32()).abs())
+            })
+            .map_or(self.from, |(ix, _)| ix);
+        let changed = self.to != to;
+        self.to = to;
+        changed
+    }
+
+    /// How far each item stands aside from its own slot so the dragged one
+    /// has a gap at the current target. The dragged item's own entry is where
+    /// it would drop.
+    fn step_aside(&self) -> Vec<f32> {
+        let starts = self.layout(self.to);
+        starts
+            .iter()
+            .zip(&self.bounds)
+            .map(|(start, bounds)| (*start - bounds.top()).as_f32())
+            .collect()
+    }
+
     /// Variable-height groups keep their full measured block when they move.
+    /// In the Tree layout every item is a block: a project header with the
+    /// rows open under it, or a group with its projects.
     fn layout(&self, to: usize) -> Vec<Pixels> {
         let mut order: Vec<_> = (0..self.order.len()).collect();
         let moved = order.remove(self.from);
@@ -130,15 +255,54 @@ impl ProjectRailDrag {
             .map_or(px(0.), |b| b.top() - self.bounds[0].bottom());
         let mut top = self.bounds[0].top();
         let mut starts = vec![px(0.); self.order.len()];
-        for ix in order {
+        for (slot, ix) in order.into_iter().enumerate() {
             starts[ix] = top;
-            top += self.bounds[ix].size.height + gap;
+            let slot_gap = if self.tree.is_some() {
+                self.bounds
+                    .get(slot + 1)
+                    .map_or(px(0.), |next| next.top() - self.bounds[slot].bottom())
+            } else {
+                gap
+            };
+            top += self.bounds[ix].size.height + slot_gap;
         }
         starts
     }
 }
-fn rail_shift_key(id: &str, group: bool) -> String {
-    format!("{}:{id}", if group { "group" } else { "project" })
+
+impl ProjectRailList {
+    fn step_aside(&mut self, drag: &ProjectRailDrag, reduce_motion: bool) {
+        let aside = drag.step_aside();
+        let now = std::time::Instant::now();
+        for (ix, id) in drag.order.iter().enumerate() {
+            if ix == drag.from {
+                continue;
+            }
+            let key = rail_shift_key(id, &drag.kind);
+            let target = aside[ix];
+            if drag.tree.is_some()
+                && self
+                    .shifts
+                    .get(&key)
+                    .is_some_and(|shift| (shift.to - target).abs() < 0.01)
+            {
+                continue;
+            }
+            let from = self.shifts.get(&key).map_or(0., |shift| shift.at(now).0);
+            self.shifts.insert(
+                key,
+                TabShift {
+                    from: if reduce_motion { target } else { from },
+                    to: target,
+                    start: now,
+                },
+            );
+        }
+    }
+}
+
+fn rail_shift_key(id: &str, kind: &RailDragKind) -> (RailDragKind, String) {
+    (kind.clone(), id.to_owned())
 }
 pub(super) struct ProjectTooltip(pub(super) String);
 impl Render for ProjectTooltip {
@@ -170,7 +334,7 @@ impl Shell {
             + if !self.session_sidebar_available(cx) {
                 0.
             } else {
-                self.workspace.sidebar_width * self.sidebar_fraction
+                self.session_sidebar_width()
             }
     }
     pub(super) fn toggle_primary_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -947,7 +1111,11 @@ impl Shell {
             )
             .into_any()
     }
-    fn project_rail_group_header(&mut self, id: String, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn project_rail_group_header(
+        &mut self,
+        id: String,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let Some(group) = self
             .workspace
             .project_rail_groups
@@ -961,28 +1129,10 @@ impl Shell {
         let context = id.clone();
         let options = id.clone();
         let drag_id = id.clone();
-        let bounds = self
-            .project_rail_list
-            .group_bounds
-            .entry(id.clone())
-            .or_default()
-            .clone();
-        let offset = self.project_rail_item_offset(&id, true);
-        let dragging = self.project_rail_item_raised(&id, true);
-        let color = group
-            .custom_color
-            .as_ref()
-            .and_then(|c| u32::from_str_radix(c.trim_start_matches('#'), 16).ok())
-            .or_else(|| {
-                group
-                    .color_index
-                    .and_then(|i| monocode_core::project_appearance::COLORS.get(i).copied())
-            });
-        let appearance = monocode_core::project_appearance::ProjectAppearance {
-            color,
-            mascot: group.mascot.clone(),
-            ..Default::default()
-        };
+        let appearance = project_group_appearance(group);
+        let bounds = self.project_rail_group_anchor(&id);
+        let offset = self.rail_item_offset(&id, &RailDragKind::Group);
+        let dragging = self.rail_item_raised(&id, &RailDragKind::Group);
         let row = div()
             .w_full()
             .px_2()
@@ -1515,9 +1665,9 @@ impl Shell {
         self.projects_frame.update(cx, |_, cx| cx.notify());
         id
     }
-    fn project_rail_item_offset(&self, id: &str, group: bool) -> f32 {
+    pub(super) fn rail_item_offset(&self, id: &str, kind: &RailDragKind) -> f32 {
         if let Some(drag) = &self.project_rail_drag
-            && drag.group == group
+            && &drag.kind == kind
             && drag.path == id
             && drag.active
         {
@@ -1525,11 +1675,11 @@ impl Shell {
         }
         self.project_rail_list
             .shifts
-            .get(&rail_shift_key(id, group))
+            .get(&rail_shift_key(id, kind))
             .map_or(0., |shift| shift.at(std::time::Instant::now()).0)
     }
-    fn project_rail_project_offset(&self, path: &str) -> f32 {
-        let project = self.project_rail_item_offset(path, false);
+    pub(super) fn project_rail_project_offset(&self, path: &str) -> f32 {
+        let project = self.rail_item_offset(path, &RailDragKind::Project);
         if self.workspace.project_rail_pinned.contains(path) {
             return project;
         }
@@ -1538,28 +1688,42 @@ impl Shell {
                 .workspace
                 .project_rail_assignments
                 .get(path)
-                .map_or(0., |group| self.project_rail_item_offset(group, true))
+                .map_or(0., |group| {
+                    self.rail_item_offset(group, &RailDragKind::Group)
+                })
     }
-    fn project_rail_item_raised(&self, id: &str, group: bool) -> bool {
-        let key = rail_shift_key(id, group);
+    pub(super) fn rail_item_raised(&self, id: &str, kind: &RailDragKind) -> bool {
+        let key = rail_shift_key(id, kind);
         self.project_rail_drag
             .as_ref()
-            .is_some_and(|drag| drag.active && drag.group == group && drag.path == id)
-            || self.project_rail_list.settling.as_ref() == Some(&key)
-                && self
-                    .project_rail_list
-                    .shifts
-                    .get(&key)
-                    .is_some_and(|shift| !shift.at(std::time::Instant::now()).1)
+            .is_some_and(|drag| drag.active && &drag.kind == kind && drag.path == id)
+            || self
+                .project_rail_list
+                .settling
+                .as_ref()
+                .is_some_and(|settling| {
+                    settling.key == key
+                        && (settling
+                            .tree
+                            .as_ref()
+                            .is_some_and(|tree| tree.drop_frame != TreeDropFrame::Finished)
+                            || self
+                                .project_rail_list
+                                .shifts
+                                .get(&key)
+                                .is_some_and(|shift| {
+                                    shift.from != shift.to && !shift.at(std::time::Instant::now()).1
+                                }))
+                })
     }
-    fn project_rail_project_raised(&self, path: &str) -> bool {
-        self.project_rail_item_raised(path, false)
+    pub(super) fn project_rail_project_raised(&self, path: &str) -> bool {
+        self.rail_item_raised(path, &RailDragKind::Project)
             || !self.workspace.project_rail_pinned.contains(path)
                 && self
                     .workspace
                     .project_rail_assignments
                     .get(path)
-                    .is_some_and(|id| self.project_rail_item_raised(id, true))
+                    .is_some_and(|id| self.rail_item_raised(id, &RailDragKind::Group))
     }
     fn project_rail_reordering(&self) -> bool {
         self.project_rail_drag
@@ -1567,15 +1731,152 @@ impl Shell {
             .is_some_and(|drag| drag.active)
     }
     pub(super) fn project_rail_animating(&self) -> bool {
-        self.workspace.classic_layout
-            && self.workspace.project_rail_open
-            && self
-                .project_rail_list
-                .shifts
-                .values()
-                .any(|shift| shift.from != shift.to && !shift.at(std::time::Instant::now()).1)
+        self.workspace.classic_layout && self.workspace.project_rail_open && self.rail_shifting()
     }
-    fn start_project_rail_drag(
+    /// A project or group is still stepping aside or settling.
+    pub(super) fn rail_shifting(&self) -> bool {
+        let now = std::time::Instant::now();
+        self.project_rail_list
+            .shifts
+            .values()
+            .any(|shift| shift.from != shift.to && !shift.at(now).1)
+    }
+    /// Where the Tree draws the lifted block, in window coordinates: the block
+    /// being dragged, or the one sliding into its gap after the drop.
+    pub(super) fn tree_lift_bounds(&self) -> Option<Bounds<Pixels>> {
+        let (kind, id, mut bounds) = match &self.project_rail_drag {
+            Some(drag) if drag.active => {
+                let mut bounds = drag.bounds[drag.from];
+                bounds.origin.y -= drag.tree.as_ref()?.scroll_delta;
+                (&drag.kind, &drag.path, bounds)
+            }
+            _ => {
+                let settling = self.project_rail_list.settling.as_ref()?;
+                let mut bounds = settling.bounds;
+                bounds.origin.y -= self.tree.scroll_top() - settling.tree.as_ref()?.scroll_top;
+                (&settling.key.0, &settling.key.1, bounds)
+            }
+        };
+        if !self.rail_item_raised(id, kind) {
+            return None;
+        }
+        let offset = match kind {
+            RailDragKind::Project => self.project_rail_project_offset(id),
+            _ => self.rail_item_offset(id, kind),
+        };
+        bounds.origin.y += px(offset);
+        Some(bounds)
+    }
+
+    pub(super) fn tree_rail_held(&self) -> bool {
+        self.project_rail_drag
+            .as_ref()
+            .is_some_and(|drag| drag.tree.is_some() && drag.active)
+    }
+
+    pub(super) fn tree_dragged_block(&self) -> Option<(&RailDragKind, &str)> {
+        let drag = self
+            .project_rail_drag
+            .as_ref()
+            .filter(|drag| drag.active && drag.tree.is_some())?;
+        Some((&drag.kind, &drag.path))
+    }
+
+    pub(super) fn tree_drop_frame(&self) -> bool {
+        self.project_rail_list
+            .settling
+            .as_ref()
+            .and_then(|settling| settling.tree.as_ref())
+            .is_some_and(|tree| tree.drop_frame != TreeDropFrame::Finished)
+    }
+
+    /// Advance edge scrolling in the sidebar's existing frame loop, and
+    /// update the held geometry after wheel or automatic scrolling.
+    pub(super) fn advance_tree_rail_frame(&mut self, now: std::time::Instant, cx: &App) -> bool {
+        if !self.workspace.tree_layout() {
+            return false;
+        }
+        if let Some(settling) = self.project_rail_list.settling.as_mut()
+            && let Some(tree) = settling.tree.as_mut()
+        {
+            tree.drop_frame = match tree.drop_frame {
+                TreeDropFrame::Pending if !cx.reduce_motion() => TreeDropFrame::Drawing,
+                _ => TreeDropFrame::Finished,
+            };
+        }
+        if cx.reduce_motion() {
+            for shift in self.project_rail_list.shifts.values_mut() {
+                shift.from = shift.to;
+            }
+        }
+
+        let Some(tree) = self
+            .project_rail_drag
+            .as_mut()
+            .filter(|drag| drag.active)
+            .and_then(|drag| drag.tree.as_mut())
+        else {
+            return false;
+        };
+        tree.viewport = self.tree.viewport_bounds();
+        let velocity = tree.edge_velocity();
+        let scrolling = if velocity == 0. {
+            tree.edge_frame = None;
+            false
+        } else {
+            let seconds = tree
+                .edge_frame
+                .replace(now)
+                .map_or(1. / 60., |then| {
+                    now.saturating_duration_since(then).as_secs_f32()
+                })
+                .min(1. / 30.);
+            self.tree.scroll_while_dragging(velocity, seconds)
+        };
+        self.update_tree_rail_drag(false, cx);
+        scrolling
+    }
+
+    pub(super) fn tree_session_rail_owns_position(&self, position: Point<Pixels>) -> bool {
+        let Some(drag) = self
+            .project_rail_drag
+            .as_ref()
+            .filter(|drag| matches!(drag.kind, RailDragKind::Session(_)))
+        else {
+            return false;
+        };
+        // As with pulling a tab out of its strip, moving off the vertical
+        // strip hands the gesture to the existing folder/pane targets.
+        let Some(tree) = &drag.tree else {
+            return false;
+        };
+        let content_y = position.y + self.tree.scroll_top() - tree.press_scroll;
+        self.tree.viewport_bounds().contains(&position)
+            && (position.x - drag.origin.x).abs() < px(PANE_DROP_PULL)
+            && content_y >= drag.bounds[0].top()
+            && content_y <= drag.bounds.last().unwrap().bottom()
+    }
+    pub(super) fn tree_project_anchor(&mut self, path: &str) -> AnchorSlot {
+        self.project_rail_list
+            .bounds
+            .entry(path.to_owned())
+            .or_default()
+            .clone()
+    }
+
+    pub(super) fn project_rail_group_anchor(&mut self, id: &str) -> AnchorSlot {
+        self.project_rail_list
+            .group_bounds
+            .entry(id.to_owned())
+            .or_default()
+            .clone()
+    }
+
+    pub(super) fn tree_take_project_drag_click(&mut self) -> bool {
+        std::mem::take(&mut self.project_rail_list.skip_click)
+    }
+
+    pub(super) fn start_project_rail_drag(
         &mut self,
         id: String,
         group: bool,
@@ -1583,11 +1884,66 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let kind = if group {
+            RailDragKind::Group
+        } else {
+            RailDragKind::Project
+        };
+        self.start_rail_drag(id, kind, event, window, cx);
+    }
+
+    pub(super) fn start_tree_folder_drag(
+        &mut self,
+        project: String,
+        id: String,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.start_rail_drag(id, RailDragKind::Folder(project), event, window, cx);
+    }
+
+    pub(super) fn start_tree_session_drag(
+        &mut self,
+        id: i64,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(scope) = self.tree.session_reorder_scope(id) {
+            self.start_rail_drag(
+                id.to_string(),
+                RailDragKind::Session(scope),
+                event,
+                window,
+                cx,
+            );
+        } else {
+            self.close_preview(cx);
+        }
+    }
+
+    fn start_rail_drag(
+        &mut self,
+        id: String,
+        kind: RailDragKind,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // Tauri's row buttons take keyboard focus on press. Keep Escape on the
         // workspace while a native div row is being dragged as well.
         window.focus(&self.focus, cx);
-        let now = std::time::Instant::now();
-        let items: Vec<(String, Bounds<Pixels>)> = if group {
+        self.close_preview(cx);
+        let tree = self.workspace.tree_layout();
+        let items: Vec<(String, Bounds<Pixels>)> = if tree {
+            // The tree's list knows where each block was laid out, before any
+            // step-aside offset, so nothing needs subtracting.
+            let workspace = &self.workspace;
+            self.tree.drag_blocks(&kind, |item| {
+                kind != RailDragKind::Project || workspace.project_rail_peers(item, &id)
+            })
+        } else if kind == RailDragKind::Group {
             self.workspace
                 .project_rail_groups
                 .iter()
@@ -1613,7 +1969,7 @@ impl Shell {
                             }
                         }
                     }
-                    let offset = self.project_rail_item_offset(&candidate.id, true);
+                    let offset = self.rail_item_offset(&candidate.id, &kind);
                     bounds.origin.y -= px(offset);
                     Some((candidate.id.clone(), bounds))
                 })
@@ -1630,19 +1986,24 @@ impl Shell {
                 })
                 .collect()
         };
+        self.project_rail_list.skip_click = false;
         let Some(from) = items.iter().position(|(path, _)| *path == id) else {
             return;
         };
         // A new press finishes any previous settling, as useAnimatedReorder does.
-        self.project_rail_list
-            .shifts
-            .retain(|_, shift| !shift.at(now).1);
         self.project_rail_list.shifts.clear();
         self.project_rail_list.settling = None;
-        self.project_rail_list.skip_click = false;
         self.project_rail_drag = Some(ProjectRailDrag {
             path: id,
-            group,
+            kind,
+            tree: tree.then(|| TreeRailDrag {
+                viewport: self.tree.viewport_bounds(),
+                press_scroll: self.tree.scroll_top(),
+                scroll_delta: px(0.),
+                grab_offset: event.position.y - items[from].1.top(),
+                pointer: event.position,
+                edge_frame: None,
+            }),
             order: items.iter().map(|(id, _)| id.clone()).collect(),
             bounds: items.into_iter().map(|(_, bounds)| bounds).collect(),
             from,
@@ -1661,56 +2022,93 @@ impl Shell {
             self.cancel_project_rail_drag(cx);
             return;
         }
+        let tree = self.workspace.tree_layout();
+        let session_owns_position = self.tree_session_rail_owns_position(event.position);
         let Some(drag) = &mut self.project_rail_drag else {
             return;
         };
+        let session = matches!(drag.kind, RailDragKind::Session(_));
+        if session && !session_owns_position {
+            if std::mem::take(&mut drag.active) {
+                drag.to = drag.from;
+                drag.offset = px(0.);
+                self.project_rail_list.shifts.clear();
+                self.notify_rail_drag(cx);
+            }
+            return;
+        }
         let offset = event.position.y - drag.origin.y;
-        if !drag.active && offset.abs() < px(5.) {
+        // The Tree lifts a block after 4 px, as its prototype does; Classic keeps 5.
+        let threshold = if tree { px(4.) } else { px(5.) };
+        if !drag.active && offset.abs() < threshold {
             return;
         }
         drag.active = true;
         self.project_rail_list.skip_click = true;
-        let slots: Vec<_> = (0..drag.order.len())
-            .map(|to| drag.layout(to)[drag.from] - drag.bounds[drag.from].top())
-            .collect();
-        drag.offset = offset.max(slots[0]).min(*slots.last().unwrap());
-        let to = slots
-            .iter()
-            .enumerate()
-            .min_by(|(_, a), (_, b)| {
-                (a.as_f32() - drag.offset.as_f32())
-                    .abs()
-                    .total_cmp(&(b.as_f32() - drag.offset.as_f32()).abs())
-            })
-            .map_or(drag.from, |(ix, _)| ix);
-        if drag.to != to {
-            drag.to = to;
-            let starts = drag.layout(to);
-            let now = std::time::Instant::now();
-            for (ix, id) in drag.order.iter().enumerate() {
-                if ix == drag.from {
-                    continue;
+        if session {
+            self.skip_session_click = true;
+        }
+        if let Some(tree) = &mut drag.tree {
+            tree.pointer = event.position;
+            self.update_tree_rail_drag(false, cx);
+        } else if drag.follow(offset) {
+            self.project_rail_list.step_aside(drag, cx.reduce_motion());
+        }
+        self.notify_rail_drag(cx);
+    }
+
+    fn update_tree_rail_drag(&mut self, refresh_measurements: bool, cx: &App) {
+        let Some(drag) = &mut self.project_rail_drag else {
+            return;
+        };
+        let Some(tree) = &mut drag.tree else {
+            return;
+        };
+        let scroll_delta = self.tree.scroll_top() - tree.press_scroll;
+        let mut changed_geometry = false;
+        if refresh_measurements || scroll_delta != tree.scroll_delta {
+            let measures: HashMap<_, _> = self
+                .tree
+                .drag_blocks(&drag.kind, |_| true)
+                .into_iter()
+                .collect();
+            for (id, previous) in drag.order.iter().zip(&mut drag.bounds) {
+                if let Some(mut bounds) = measures.get(id).copied() {
+                    bounds.origin.y += scroll_delta;
+                    changed_geometry |= *previous != bounds;
+                    *previous = bounds;
                 }
-                let key = rail_shift_key(id, drag.group);
-                let target = (starts[ix] - drag.bounds[ix].top()).as_f32();
-                let from = self
-                    .project_rail_list
-                    .shifts
-                    .get(&key)
-                    .map_or(0., |shift| shift.at(now).0);
-                self.project_rail_list.shifts.insert(
-                    key,
-                    TabShift {
-                        from: if cx.reduce_motion() { target } else { from },
-                        to: target,
-                        start: now,
-                    },
-                );
             }
         }
-        self.projects_frame.update(cx, |_, cx| cx.notify());
+        tree.viewport = self.tree.viewport_bounds();
+        tree.scroll_delta = scroll_delta;
+        let desired_top = tree.pointer.y - tree.grab_offset + scroll_delta;
+        if drag.follow(desired_top - drag.bounds[drag.from].top()) || changed_geometry {
+            self.project_rail_list.step_aside(drag, cx.reduce_motion());
+        }
     }
-    pub(super) fn finish_project_rail_drag(&mut self, cx: &mut Context<Self>) {
+    /// Redraws whichever list the drag is in.
+    fn notify_rail_drag(&self, cx: &mut Context<Self>) {
+        if self.workspace.tree_layout() {
+            self.notify_sidebar(cx);
+        } else {
+            self.projects_frame.update(cx, |_, cx| cx.notify());
+        }
+    }
+    pub(super) fn finish_project_rail_drag(
+        &mut self,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(tree) = self
+            .project_rail_drag
+            .as_mut()
+            .filter(|drag| drag.active)
+            .and_then(|drag| drag.tree.as_mut())
+        {
+            tree.pointer = position;
+            self.update_tree_rail_drag(true, cx);
+        }
         let Some(drag) = self.project_rail_drag.take() else {
             return;
         };
@@ -1720,10 +2118,12 @@ impl Shell {
         let mut reordered = drag.order.clone();
         let moved = reordered.remove(drag.from);
         reordered.insert(drag.to, moved);
+        // Every item glides from where it is drawn to its new slot: the
+        // dragged one slides into the gap the others opened for it.
         let starts = drag.layout(drag.to);
         let now = std::time::Instant::now();
         for (ix, id) in drag.order.iter().enumerate() {
-            let key = rail_shift_key(id, drag.group);
+            let key = rail_shift_key(id, &drag.kind);
             let old_offset = if ix == drag.from {
                 drag.offset.as_f32()
             } else {
@@ -1741,10 +2141,42 @@ impl Shell {
                 },
             );
         }
-        self.project_rail_list.settling = Some(rail_shift_key(&drag.path, drag.group));
+        let mut bounds = drag.bounds[drag.from];
+        bounds.origin.y =
+            starts[drag.from] - drag.tree.as_ref().map_or(px(0.), |tree| tree.scroll_delta);
+        self.project_rail_list.settling =
+            Some(RailSettlement {
+                key: rail_shift_key(&drag.path, &drag.kind),
+                bounds,
+                tree: drag.tree.as_ref().filter(|_| !cx.reduce_motion()).map(|_| {
+                    TreeRailSettlement {
+                        scroll_top: self.tree.scroll_top(),
+                        drop_frame: TreeDropFrame::Pending,
+                    }
+                }),
+            });
         let subset: HashSet<String> = drag.order.iter().cloned().collect();
-        let mut order = reordered.into_iter();
-        if drag.group {
+        if let RailDragKind::Session(scope) = &drag.kind {
+            if drag.from != drag.to {
+                self.record_tree_session_order(scope.clone(), &drag.order, reordered);
+            }
+        } else if let RailDragKind::Folder(project) = &drag.kind {
+            if drag.from != drag.to {
+                self.update_groups_for(project.clone(), cx, |groups| {
+                    let target = &drag.order[drag.to];
+                    let folders = &mut groups.folders;
+                    if let Some((from, to)) = folders
+                        .iter()
+                        .position(|folder| folder.id == drag.path)
+                        .zip(folders.iter().position(|folder| &folder.id == target))
+                    {
+                        let folder = folders.remove(from);
+                        folders.insert(to, folder);
+                    }
+                });
+            }
+        } else if drag.kind == RailDragKind::Group {
+            let mut order = reordered.into_iter();
             let groups: HashMap<_, _> = self
                 .workspace
                 .project_rail_groups
@@ -1760,6 +2192,7 @@ impl Shell {
                 }
             }
         } else {
+            let mut order = reordered.into_iter();
             for path in &mut self.workspace.projects {
                 if subset.contains(path.as_str())
                     && let Some(id) = order.next()
@@ -1772,18 +2205,36 @@ impl Shell {
         if cx.reduce_motion() {
             self.project_rail_list.shifts.clear();
         }
-        self.persist(cx);
-        self.projects_frame.update(cx, |_, cx| cx.notify());
+        if !matches!(&drag.kind, RailDragKind::Folder(_)) && drag.from != drag.to {
+            self.persist(cx);
+        }
+        self.notify_rail_drag(cx);
     }
     pub(super) fn cancel_project_rail_drag(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(drag) = self.project_rail_drag.take() else {
             return false;
         };
+        if matches!(drag.kind, RailDragKind::Session(_)) {
+            self.cancel_pane_drag(cx);
+        }
         if drag.active {
-            self.project_rail_list.settling = Some(rail_shift_key(&drag.path, drag.group));
+            let mut bounds = drag.bounds[drag.from];
+            if let Some(tree) = &drag.tree {
+                bounds.origin.y -= tree.scroll_delta;
+            }
+            self.project_rail_list.settling = Some(RailSettlement {
+                key: rail_shift_key(&drag.path, &drag.kind),
+                bounds,
+                tree: drag.tree.as_ref().filter(|_| !cx.reduce_motion()).map(|_| {
+                    TreeRailSettlement {
+                        scroll_top: self.tree.scroll_top(),
+                        drop_frame: TreeDropFrame::Finished,
+                    }
+                }),
+            });
             let now = std::time::Instant::now();
             for (ix, id) in drag.order.iter().enumerate() {
-                let key = rail_shift_key(id, drag.group);
+                let key = rail_shift_key(id, &drag.kind);
                 let from = if ix == drag.from {
                     drag.offset.as_f32()
                 } else {
@@ -1805,7 +2256,7 @@ impl Shell {
             if cx.reduce_motion() {
                 self.project_rail_list.shifts.clear();
             }
-            self.projects_frame.update(cx, |_, cx| cx.notify());
+            self.notify_rail_drag(cx);
         }
         true
     }
@@ -1872,6 +2323,74 @@ mod tests {
     use super::*;
     use gpui::{EntityInputHandler, TestAppContext, VisualTestContext, WindowHandle, size};
 
+    /// Tree blocks have uneven heights: an expanded project carries its rows.
+    /// The blocks the dragged one passes step aside by its whole height, and it
+    /// would drop where the others left room.
+    #[test]
+    fn tree_blocks_step_aside_by_the_dragged_block_height() {
+        // alpha is expanded (150 px), beta and gamma are bare headers.
+        let mut drag = ProjectRailDrag {
+            path: "alpha".into(),
+            kind: RailDragKind::Project,
+            tree: Some(TreeRailDrag {
+                viewport: Bounds::new(gpui::point(px(0.), px(20.)), size(px(100.), px(300.))),
+                press_scroll: px(0.),
+                scroll_delta: px(0.),
+                grab_offset: px(0.),
+                pointer: gpui::point(px(0.), px(0.)),
+                edge_frame: None,
+            }),
+            order: vec!["alpha".into(), "beta".into(), "gamma".into()],
+            bounds: [(20., 150.), (170., 30.), (200., 30.)]
+                .map(|(y, h)| Bounds::new(gpui::point(px(0.), px(y)), size(px(100.), px(h))))
+                .to_vec(),
+            from: 0,
+            to: 0,
+            origin: gpui::point(px(0.), px(0.)),
+            offset: px(0.),
+            active: true,
+        };
+        assert!(!drag.follow(px(10.)));
+        assert_eq!(drag.step_aside(), [0., 0., 0.]);
+        // The pointer still holds the header at its grab offset. Beta has not
+        // been reached merely because it fits inside alpha's open subtree.
+        assert!(!drag.follow(px(35.)));
+        assert_eq!(drag.offset, px(35.));
+        // Past the midpoint between the visible headers, beta steps aside.
+        assert!(drag.follow(px(110.)));
+        assert_eq!(drag.to, 1);
+        assert_eq!(drag.offset, px(110.));
+        assert_eq!(drag.step_aside(), [30., -150., 0.]);
+        // Beyond the last sibling, the header follows through the viewport.
+        assert!(drag.follow(px(400.)));
+        assert_eq!(drag.to, 2);
+        assert_eq!(drag.offset, px(300.));
+        assert_eq!(drag.step_aside(), [60., -150., -150.]);
+        // Back home: nobody stands aside.
+        assert!(drag.follow(px(-50.)));
+        assert_eq!(drag.to, 0);
+        assert_eq!(drag.step_aside(), [0., 0., 0.]);
+    }
+
+    #[test]
+    fn tree_edge_scroll_speed_is_proportional_to_edge_depth() {
+        let mut drag = TreeRailDrag {
+            viewport: Bounds::new(gpui::point(px(0.), px(0.)), size(px(100.), px(200.))),
+            press_scroll: px(0.),
+            scroll_delta: px(0.),
+            grab_offset: px(0.),
+            pointer: gpui::point(px(50.), px(100.)),
+            edge_frame: None,
+        };
+        assert_eq!(drag.edge_velocity(), 0.);
+        drag.pointer.y = px(24.);
+        assert_eq!(drag.edge_velocity(), -180.);
+        drag.pointer.y = px(8.);
+        assert_eq!(drag.edge_velocity(), -540.);
+        drag.pointer.y = px(192.);
+        assert_eq!(drag.edge_velocity(), 540.);
+    }
+
     #[gpui::test]
     fn original_layout_keeps_project_icons_when_sessions_are_hidden(cx: &mut TestAppContext) {
         cx.update(|cx| cx.set_reduce_motion(true));
@@ -1879,7 +2398,9 @@ mod tests {
         let visual = &mut VisualTestContext::from_window(window.into(), cx);
         visual.simulate_resize(size(px(1500.), px(900.)));
         window
-            .update(visual, |shell, _, cx| shell.toggle_layout(cx))
+            .update(visual, |shell, _, cx| {
+                shell.set_navigation_layout(crate::workspace::NavigationLayout::Classic, cx)
+            })
             .unwrap();
         visual.run_until_parked();
         let projects = visual.debug_bounds("project-rail-frame").unwrap();
@@ -2109,7 +2630,7 @@ mod tests {
                         .workspace
                         .add_project(&format!("/projects/project-{i}"));
                 }
-                shell.toggle_layout(cx);
+                shell.set_navigation_layout(crate::workspace::NavigationLayout::Classic, cx);
                 shell.sessions.len()
             })
             .unwrap();
@@ -2131,7 +2652,9 @@ mod tests {
         let visual = &mut VisualTestContext::from_window(window.into(), cx);
         visual.simulate_resize(size(px(1500.), px(900.)));
         window
-            .update(visual, |shell, _, cx| shell.toggle_layout(cx))
+            .update(visual, |shell, _, cx| {
+                shell.set_navigation_layout(crate::workspace::NavigationLayout::Classic, cx)
+            })
             .unwrap();
         visual.run_until_parked();
         for compact in [false, true] {
@@ -2222,6 +2745,9 @@ mod tests {
         window
             .update(cx, |shell, _, cx| {
                 assert!(!shell.workspace.classic_layout);
+                assert!(shell.workspace.new_layout_boxy);
+                shell.toggle_layout(cx);
+                assert!(shell.workspace.tree_layout());
                 assert!(shell.workspace.new_layout_boxy);
                 shell.toggle_layout(cx);
                 assert!(shell.workspace.classic_layout);

@@ -310,7 +310,7 @@ pub(super) fn outlined<E: Styled + InteractiveElement>(element: E) -> E {
 }
 enum AgentState {
     Working,
-    NeedsInput,
+    Activity(monocode_core::agent_status::Activity),
     /// The cloud workspace failed to start.
     StartFailed,
     Idle(u64),
@@ -343,18 +343,27 @@ fn sub_agent_card(agent: SubAgent) -> Stateful<Div> {
         .strip_prefix("Claude ")
         .map_or(model.clone(), |short| short.to_owned().into());
     let amber: gpui::Hsla = rgb(0xfbbf24).into();
-    let (label, color, live): (String, gpui::Hsla, bool) = match agent.state {
+    let (label, color, live): (String, gpui::Hsla, bool) = match &agent.state {
         AgentState::Working => ("Working".into(), accent_color(), true),
-        AgentState::NeedsInput => ("Needs approval".into(), amber, true),
+        AgentState::Activity(activity) => (
+            activity
+                .label(monocode_core::time::now_ms())
+                .unwrap_or_default(),
+            crate::session_mark::activity_color(activity),
+            activity.is_animating(),
+        ),
         AgentState::StartFailed => ("Failed to start".into(), danger_color(), false),
         AgentState::Idle(at) => (
-            monocode_core::time::relative(at, monocode_core::time::now_ms()),
+            monocode_core::time::relative(*at, monocode_core::time::now_ms()),
             content(0.45),
             false,
         ),
         AgentState::Unavailable => ("Unavailable".into(), content(0.45), false),
     };
-    let needs_input = matches!(agent.state, AgentState::NeedsInput);
+    let needs_input = matches!(
+        agent.state,
+        AgentState::Activity(monocode_core::agent_status::Activity::NeedsYou { .. })
+    );
     let id = agent.id;
     outlined(
         div()
@@ -1396,8 +1405,10 @@ impl Monos {
                         place: match &branch { Some(b) => format!("{project} · {b}"), None => project },
                         branch: branch.is_some(),
                         state: match state {
-                            Some(s) if s.needs_input => AgentState::NeedsInput,
+                            Some(s) if s.needs_input => AgentState::Activity(s.activity.clone()),
                             Some(s) if s.start_failed => AgentState::StartFailed,
+                            Some(s) if !matches!(s.activity, monocode_core::agent_status::Activity::Idle | monocode_core::agent_status::Activity::Done { unread: false, .. }) =>
+                                AgentState::Activity(s.activity.clone()),
                             Some(s) if s.busy => AgentState::Working,
                             Some(s) => AgentState::Idle(s.updated_at),
                             None => AgentState::Unavailable,

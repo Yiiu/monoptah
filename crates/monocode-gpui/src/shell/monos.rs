@@ -1,11 +1,21 @@
 use super::*;
 use monocode_core::agent::Settings;
+
+#[cfg(test)]
+std::thread_local! {
+    static MONO_SESSION_VIEW_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub(crate) struct MonoSession {
     pub id: i64,
     pub title: String,
     pub cwd: String,
-    /// Running, waiting on Mono input, or still settling a stop.
+    pub project: String,
+    /// Running a turn, waiting on wake work, or starting a cloud session.
     pub busy: bool,
+    /// Completion reports wait for the transport and persisted transcript.
+    pub unsettled: bool,
+    pub activity: monocode_core::agent_status::Activity,
     pub has_messages: bool,
     pub archived: bool,
     pub updated_at: u64,
@@ -13,6 +23,7 @@ pub(crate) struct MonoSession {
     /// Its codespace or sandbox failed to start; it waits for Retry and is not working.
     pub start_failed: bool,
     pub branch: Option<String>,
+    pub worktree: Option<String>,
     pub model: SharedString,
     /// Runs on a codespace or a sandbox rather than on this machine.
     pub cloud: bool,
@@ -36,6 +47,13 @@ impl Shell {
         self.track_cloud_start(id, cx);
         self.invalidate_chrome(cx);
     }
+    pub(crate) fn mono_forget_activity(&mut self, id: i64, cx: &mut Context<Self>) {
+        self.forget_agent_status(id);
+        self.process_notification_inputs(cx);
+        self.invalidate_chrome(cx);
+        cx.notify();
+    }
+
     pub(crate) fn close_mono_overview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.set_right_panel_open(false, window, cx);
     }
@@ -74,6 +92,8 @@ impl Shell {
         Some(format!("{} {}", mark.kind.title(), mark.codespace))
     }
     pub(crate) fn mono_session_views(&self, cx: &App) -> Vec<MonoSession> {
+        #[cfg(test)]
+        MONO_SESSION_VIEW_BUILDS.with(|count| count.set(count.get() + 1));
         // A Mono's launches are usually hidden from the sidebar, so they are
         // known by summary only, outside the sidebar's order.
         let listed: HashSet<_> = self.order.iter().collect();
@@ -84,31 +104,42 @@ impl Shell {
         self.order
             .iter()
             .chain(hidden)
-            .map(|&id| {
-                let metadata = self.session_metadata(id, cx);
-                let live = self.sessions.get(&id).map(|v| v.read(cx));
-                MonoSession {
-                    id,
-                    title: metadata.summary.title.clone(),
-                    cwd: metadata.summary.cwd.clone(),
-                    busy: metadata.busy
-                        || live.is_some_and(|v| {
-                            v.mono_external_pending()
-                                || v.mono_stopping()
-                                || v.cloud_launch_pending()
-                        }),
-                    has_messages: metadata.summary.has_messages,
-                    archived: metadata.summary.archived,
-                    updated_at: metadata.summary.updated_at,
-                    needs_input: metadata.needs_approval(),
-                    start_failed: self.cloud_start_failed(id)
-                        || live.is_some_and(|v| v.cloud_start_failed()),
-                    branch: live.and_then(|v| v.branch_name()).map(str::to_owned),
-                    model: live.map(|v| v.mono_model_label()).unwrap_or_default(),
-                    cloud: self.is_cloud(id),
-                }
-            })
+            .filter_map(|&id| self.mono_session_view(id, cx))
             .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mono_session_view_build_count() -> usize {
+        MONO_SESSION_VIEW_BUILDS.with(std::cell::Cell::get)
+    }
+
+    pub(crate) fn mono_session_view(&self, id: i64, cx: &App) -> Option<MonoSession> {
+        let live = self.sessions.get(&id).map(|v| v.read(cx));
+        if live.is_none() && !self.session_summaries.contains_key(&id) {
+            return None;
+        }
+        let metadata = self.session_metadata(id, cx);
+        let launching = live.is_some_and(|v| v.mono_external_pending() || v.cloud_launch_pending());
+        let status = self.agent_status(id);
+        Some(MonoSession {
+            id,
+            title: metadata.summary.title.clone(),
+            cwd: metadata.summary.cwd.clone(),
+            project: self.project_of(id, &metadata.summary.cwd).to_owned(),
+            busy: status.is_busy() || launching,
+            unsettled: metadata.busy || launching || live.is_some_and(Conversation::mono_stopping),
+            activity: status.activity.clone(),
+            has_messages: metadata.summary.has_messages,
+            archived: metadata.summary.archived,
+            updated_at: metadata.summary.updated_at,
+            needs_input: status.needs_you(),
+            start_failed: self.cloud_start_failed(id)
+                || live.is_some_and(|v| v.cloud_start_failed()),
+            branch: live.and_then(|v| v.branch_name()).map(str::to_owned),
+            worktree: self.session_worktrees.get(&id).and_then(Clone::clone),
+            model: live.map(|v| v.mono_model_label()).unwrap_or_default(),
+            cloud: self.is_cloud(id),
+        })
     }
     /// Load the sessions a Mono launched that the sidebar hides, so its panel
     /// can list and open them. They stay out of the sidebar.
@@ -126,7 +157,16 @@ impl Shell {
             Ok::<_, String>(
                 missing
                     .into_iter()
-                    .filter_map(|id| store.mono_session(id).ok().flatten())
+                    .filter_map(|id| {
+                        let summary = store.mono_session(id).ok().flatten()?;
+                        let worktree = store
+                            .agent_settings(id)
+                            .ok()
+                            .flatten()
+                            .filter(|settings| !settings.worktree_removed)
+                            .and_then(|settings| settings.worktree_cwd);
+                        Some((summary, worktree))
+                    })
                     .collect::<Vec<_>>(),
             )
         });
@@ -135,13 +175,15 @@ impl Shell {
                 return;
             };
             let _ = this.update(cx, |this, cx| {
-                for summary in found {
+                for (summary, worktree) in found {
                     if this.session_summaries.contains_key(&summary.id) {
                         continue;
                     }
                     this.sidebar_hidden_sessions.insert(summary.id);
+                    this.session_worktrees.insert(summary.id, worktree);
                     this.session_summaries.insert(summary.id, summary);
                 }
+                this.invalidate_chrome(cx);
                 if let Some(monos) = &this.monos {
                     monos.update(cx, |_, cx| cx.notify());
                 }

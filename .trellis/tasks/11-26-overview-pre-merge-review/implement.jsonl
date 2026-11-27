@@ -1,0 +1,8 @@
+{"file":".trellis/tasks/11-25-agent-overview/handoff.md","reason":"Shared branch, build and test rules for every follow-up"}
+{"file":".trellis/tasks/11-25-agent-overview/prd.md","reason":"Parent requirements and principles"}
+{"file":".trellis/spec/native/index.md","reason":"Native crate rules and quality commands"}
+{"file":".trellis/spec/native/testing.md","reason":"Test conventions incl. Windows gotchas"}
+{"file":".trellis/tasks/11-25-agent-overview/research/audit-status-mono.md","reason":"Known status/Mono gaps (do not re-report)"}
+{"file":".trellis/tasks/11-25-agent-overview/research/audit-tree-summary.md","reason":"Known Tree gaps"}
+{"file":".trellis/spec/core/persistence-and-compat.md","reason":"Migration rules to review against"}
+{"file":".trellis/spec/native/state-and-async.md","reason":"Timers and background work rules"}

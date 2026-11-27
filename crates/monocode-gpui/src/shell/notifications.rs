@@ -38,7 +38,8 @@ pub(super) struct State {
     permission: Permission,
     permission_probe: Option<Receiver<Permission>>,
     announcements: approvals::InputAnnouncements,
-    responding: HashSet<i64>,
+    #[cfg(windows)]
+    toast_dedupe: delivery::WindowsToastDedupe,
     sequence: u64,
     badge: usize,
     sounds_enabled: bool,
@@ -79,7 +80,8 @@ impl State {
             permission: Permission::Unsupported,
             permission_probe: None,
             announcements: Default::default(),
-            responding: HashSet::new(),
+            #[cfg(windows)]
+            toast_dedupe: Default::default(),
             sequence: 0,
             badge: 0,
             sounds_enabled: workspace.preferences.sounds,
@@ -114,31 +116,26 @@ impl Shell {
         self.notification_state.permission_probe = Some(platform::permission());
     }
 
-    /// Call from SessionChanged, so a turn beginning and ending between render
-    /// frames still produces exactly one completion. Render sync shares the set.
-    pub(super) fn notification_session_changed(&mut self, id: i64, cx: &mut Context<Self>) {
-        self.process_notification_inputs(cx);
-        let Some(view) = self.sessions.get(&id) else {
-            return;
-        };
+    pub(super) fn notification_turn_finished(
+        &mut self,
+        view: &Entity<Conversation>,
+        outcome: monocode_core::agent_status::Outcome,
+        cx: &mut Context<Self>,
+    ) {
         let chat = view.read(cx);
-        if chat.responding() {
-            self.notification_state.responding.insert(id);
-            return;
-        }
-        let ended = self.notification_state.responding.remove(&id) && !chat.busy;
-        if !ended
+        let id = chat.summary.id;
+        let habit = self.monos.as_ref().is_some_and(|monos| {
+            monos
+                .read(cx)
+                .notification_mono(id)
+                .is_some_and(|mono| mono.habit_sessions.contains(&id))
+        });
+        if outcome == monocode_core::agent_status::Outcome::Interrupted
             || chat.notification_was_cancelled()
             || chat.summary.archived
-            || self
-                .monos
-                .as_ref()
-                .is_some_and(|monos| monos.read(cx).is_mono_session(id))
+            || habit
         {
-            // Ended with no finish to send, as when stopped.
-            if ended {
-                self.mobile_turn_ended(id);
-            }
+            self.mobile_turn_ended(id);
             return;
         }
         let summary = chat.summary.clone();
@@ -213,7 +210,7 @@ impl Shell {
             |this, _, event, cx| {
                 if matches!(event, LayoutNoticeEvent::Try) && this.workspace.classic_layout {
                     // Dismisses the notice and picks the default frame.
-                    this.toggle_layout(cx);
+                    this.set_navigation_layout(crate::workspace::NavigationLayout::Focused, cx);
                 } else {
                     this.workspace.new_layout_prompt_dismissed = true;
                     this.persist(cx);
@@ -276,6 +273,12 @@ impl Shell {
             self.observations.push(cx.subscribe(
                 &monos,
                 |this, _, _: &crate::monos::NotificationChanged, cx| {
+                    for view in this.notification_chats(cx) {
+                        let id = view.read(cx).summary.id;
+                        if !this.sessions.contains_key(&id) {
+                            this.refresh_status(id, cx);
+                        }
+                    }
                     this.process_notification_inputs(cx);
                     cx.notify()
                 },
@@ -288,16 +291,13 @@ impl Shell {
             ));
             self.observations.push(cx.subscribe(
                 &monos,
-                |this, _, event: &crate::monos::NotificationFinished, cx| {
-                    if !event.was_cancelled && !event.habit && !event.summary.archived {
-                        this.deliver_session_notice(
-                            &event.summary,
-                            "agentFinished",
-                            &event.body,
-                            Some(crate::sound::Cue::Finished),
-                            cx,
-                        );
-                    }
+                |this, _, event: &crate::monos::HabitFinished, cx| {
+                    this.update_agent_status_for(
+                        event.summary.id,
+                        Some(&event.summary),
+                        Some(event.outcome),
+                        cx,
+                    );
                 },
             ));
         }
@@ -319,12 +319,12 @@ impl Shell {
         .detach();
     }
 
-    pub(super) fn start_native_notifications(&mut self, cx: &mut Context<Self>) {
-        platform::set_dock_badge(0);
-        if platform::initialize() {
+    pub(super) fn start_native_notifications(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if platform::initialize(window, cx) {
             self.notification_state.permission = Permission::Prompt;
             self.notification_state.permission_probe = Some(platform::permission());
         }
+        platform::set_dock_badge(0);
         self.notification_state.badge = 0;
         self.process_notification_inputs(cx);
         self.notification_state.poll = Some(cx.spawn(async move |this, cx| {
@@ -359,7 +359,7 @@ impl Shell {
                                 || this
                                     .notification_chats(cx)
                                     .iter()
-                                    .any(|v| v.read(cx).needs_approval())
+                                    .any(|v| this.agent_status(v.read(cx).summary.id).needs_you())
                             {
                                 cx.notify();
                             }
@@ -392,7 +392,7 @@ impl Shell {
     }
 
     /// Advance banners and the Dock badge while an occluded window skips render.
-    fn process_notification_inputs(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn process_notification_inputs(&mut self, cx: &mut Context<Self>) {
         let snapshots: Vec<_> = self
             .notification_chats(cx)
             .iter()
@@ -414,9 +414,9 @@ impl Shell {
             notices.track_pending(&snapshots);
         });
         let badge = delivery::dock_badge_count(
-            snapshots
+            self.agent_statuses
                 .iter()
-                .filter_map(|s| Some((s.session_id.parse().ok()?, !s.pending.is_empty()))),
+                .map(|(&id, status)| (id, status.needs_you())),
         );
         if badge != self.notification_state.badge {
             self.notification_state.badge = badge;
@@ -427,15 +427,21 @@ impl Shell {
                 && let Some(view) = self.notification_chat(id, cx)
             {
                 let summary = view.read(cx).summary.clone();
-                let body = if input.kind == approvals::InputKind::Approval {
+                let mobile_body = if input.kind == approvals::InputKind::Approval {
                     format!("Approve: {}", input.label)
                 } else {
-                    input.label
+                    input.label.clone()
                 };
-                self.deliver_session_notice(
+                self.notify_mobile(&summary, "agentInput", &mobile_body, cx);
+                self.dispatch_notice(
                     &summary,
                     "agentInput",
-                    &body,
+                    Target::Session(id),
+                    if cfg!(windows) {
+                        &input.label
+                    } else {
+                        &mobile_body
+                    },
                     Some(crate::sound::Cue::Input),
                     cx,
                 );
@@ -448,11 +454,11 @@ impl Shell {
             return false;
         }
         if self.mono_active(cx) {
-            return self
-                .monos
-                .as_ref()
-                .and_then(|m| m.read(cx).active_notification_session(cx))
-                == Some(id);
+            return self.monos.as_ref().is_some_and(|monos| {
+                let monos = monos.read(cx);
+                monos.active_notification_session(cx) == Some(id)
+                    || (self.workspace.right_panel_open && monos.routed_session() == Some(id))
+            });
         }
         self.workspace.active_tab().is_some_and(|tab| {
             self.workspace
@@ -480,30 +486,9 @@ impl Shell {
         let views = self.notification_chats(cx);
         let mut snapshots = Vec::new();
         let mut directories = HashMap::new();
-        let mut completed = Vec::new();
-        let mut quiet = Vec::new();
-        let mut live_ids = HashSet::new();
         for view in views {
             let chat = view.read(cx);
             let id = chat.summary.id;
-            live_ids.insert(id);
-            if chat.responding() {
-                self.notification_state.responding.insert(id);
-            } else if self.notification_state.responding.remove(&id) && !chat.busy {
-                if !chat.notification_was_cancelled()
-                    && !chat.summary.archived
-                    && self.sessions.contains_key(&id)
-                    && !self
-                        .monos
-                        .as_ref()
-                        .is_some_and(|monos| monos.read(cx).is_mono_session(id))
-                {
-                    completed.push((chat.summary.clone(), chat.notification_reply_text(cx)));
-                } else {
-                    // Ended with no finish to send, as when stopped.
-                    quiet.push(id);
-                }
-            }
             directories.insert(id.to_string(), chat.summary.cwd.clone());
             let mono_visible = self.mono_active(cx) && self.notice_session_visible(id, cx);
             snapshots.push(SessionInputs {
@@ -520,16 +505,10 @@ impl Shell {
                     && chat.composer_focused(window, cx),
             });
         }
-        self.notification_state
-            .responding
-            .retain(|id| live_ids.contains(id));
-        for id in quiet {
-            self.mobile_turn_ended(id);
-        }
         let badge = delivery::dock_badge_count(
-            snapshots
+            self.agent_statuses
                 .iter()
-                .filter_map(|s| Some((s.session_id.parse().ok()?, !s.pending.is_empty()))),
+                .map(|(&id, status)| (id, status.needs_you())),
         );
         if self.notification_state.badge != badge {
             self.notification_state.badge = badge;
@@ -549,15 +528,6 @@ impl Shell {
                     cx,
                 );
             }
-        }
-        for (summary, body) in completed {
-            self.deliver_session_notice(
-                &summary,
-                "agentFinished",
-                &body,
-                Some(crate::sound::Cue::Finished),
-                cx,
-            );
         }
         let prefs = &self.workspace.preferences;
         self.notification_state.approvals.update(cx, |notices, cx| {
@@ -650,6 +620,12 @@ impl Shell {
         cue: Option<crate::sound::Cue>,
         cx: &mut Context<Self>,
     ) {
+        // Completed turns still reach the mobile delivery path and update the
+        // status cache. Windows native alerts are reserved for input/reminders.
+        #[cfg(windows)]
+        if category == "agentFinished" {
+            return;
+        }
         let now = monocode_core::time::now_ms();
         let occurred = match target {
             Target::Session(_) => now,
@@ -674,22 +650,52 @@ impl Shell {
             }
             return;
         }
+        #[cfg(windows)]
+        if let Target::Session(id) = target {
+            if !self
+                .notification_state
+                .toast_dedupe
+                .should_show(id, std::time::Instant::now())
+            {
+                return;
+            }
+            if !self.window_active {
+                platform::flash_taskbar();
+            }
+        }
         self.notification_state.sequence = self.notification_state.sequence.wrapping_add(1);
         let body = if body.trim().is_empty() && category == "agentFinished" {
             format!("{} finished", Kind::from_id(&summary.provider).label())
         } else {
             body.to_owned()
         };
-        let receiver = platform::show(platform::Notification {
-            tag: target.tag(self.notification_state.sequence),
-            subtitle: if category == "reminders" {
-                "Session reminder".into()
-            } else {
-                summary.title.clone()
+        let subtitle = if category == "reminders" {
+            "Session reminder".into()
+        } else {
+            summary.title.clone()
+        };
+        #[cfg(not(windows))]
+        let clipped_body = delivery::clip_body(&body);
+        #[cfg(windows)]
+        let (subtitle, clipped_body) = if matches!(target, Target::Session(_)) {
+            let project = project_name(self.project_of(summary.id, &summary.cwd));
+            let title = self
+                .notification_chat(summary.id, cx)
+                .map_or(subtitle, |chat| chat.read(cx).display_title());
+            delivery::windows_toast_text(&project, &title, &body)
+        } else {
+            (subtitle, delivery::clip_body(&body))
+        };
+        let receiver = platform::show(
+            platform::Notification {
+                tag: target.tag(self.notification_state.sequence),
+                subtitle,
+                body: clipped_body,
+                sound: prefs.sounds
+                    && (!cfg!(windows) || occurred >= self.notification_state.sounds_enabled_at),
             },
-            body: delivery::clip_body(&body),
-            sound: prefs.sounds,
-        });
+            cx,
+        );
         let directory = summary.cwd.clone();
         let category = category.to_owned();
         let work = cx.background_executor().spawn(async move {
@@ -732,6 +738,7 @@ impl Shell {
                 if let Some(monos) = this.monos.clone()
                     && monos.update(cx, |m, cx| m.open_notification_session(id, window, cx))
                 {
+                    this.mark_agent_seen(id, cx);
                     window.activate_window();
                     return;
                 }
@@ -750,13 +757,19 @@ impl Shell {
                     this.observations.push(cx.subscribe(
                         &view,
                         move |this, _, _: &SessionChanged, cx| {
-                            this.refresh_session_mark(id, cx);
-                            this.notification_session_changed(id, cx);
+                            this.refresh_status(id, cx);
+                            this.process_notification_inputs(cx);
                             this.invalidate_chrome(cx);
                             cx.notify();
                         },
                     ));
+                    this.observations.push(
+                        cx.subscribe(&view, move |this, _, _: &AgentProgress, cx| {
+                            this.refresh_status(id, cx)
+                        }),
+                    );
                     this.sessions.insert(id, view);
+                    this.refresh_status(id, cx);
                     if !this.order.contains(&id) {
                         this.order.push(id);
                     }
@@ -777,6 +790,7 @@ impl Shell {
                     }
                     this.close_settings(window, cx);
                     this.open(id, window, cx);
+                    this.mark_agent_seen(id, cx);
                     if let Some(newer) = newer {
                         this.reminders.push(newer);
                     }
@@ -806,6 +820,7 @@ impl Shell {
                 due_at: expected,
             }
             .tag(0),
+            cx,
         );
         let store = self.store.clone();
         let previous = self.group_writes.take();
@@ -869,6 +884,7 @@ impl Shell {
                             due_at: expected,
                         }
                         .tag(0),
+                        cx,
                     );
                     this.notification_state.reminder_error = None;
                     this.reload_notification_reminders(cx);
@@ -1397,7 +1413,91 @@ impl Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workspace::NavigationLayout;
     use gpui::{TestAppContext, VisualTestContext};
+
+    #[gpui::test]
+    fn opening_a_system_notification_persists_seen_and_demotes_the_tree_row(
+        cx: &mut TestAppContext,
+    ) {
+        use monocode_core::agent_status::{Outcome, TurnEnd};
+
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (window, id, previous) = crate::shell::tests::window(cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        visual.simulate_resize(gpui::size(px(1400.), px(900.)));
+        let at = monocode_core::time::now_ms() + 1_000;
+        let row = format!("sidebar-session-{id}").leak();
+        let summary = format!("tree-session-summary-{id}").leak();
+
+        window
+            .update(visual, |shell, _, cx| {
+                assert_eq!(shell.workspace.active, Some(previous));
+                shell.set_navigation_layout(NavigationLayout::Tree, cx);
+                shell.session_activity = {
+                    let store = locked(&shell.store).unwrap();
+                    store
+                        .finish_session_turn_with_summary(
+                            id,
+                            at - 1,
+                            TurnEnd {
+                                at,
+                                outcome: Outcome::Completed,
+                            },
+                            Some("Verified the sample output."),
+                        )
+                        .unwrap();
+                    store.restore_session_activity(at).unwrap()
+                };
+                shell.update_agent_status(id, None, cx);
+                assert!(shell.agent_status(id).unread_done());
+            })
+            .unwrap();
+        visual.refresh().unwrap();
+        let project = visual
+            .debug_bounds("tree-project-/work/another-project")
+            .expect("project with the unread session");
+        visual.simulate_click(project.center(), Default::default());
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        let unread_height = visual
+            .debug_bounds(row)
+            .expect("unread session row")
+            .size
+            .height;
+        assert!(visual.debug_bounds(summary).is_some());
+
+        window
+            .update(visual, |shell, _, cx| {
+                shell.open_notice_target(Target::Session(id), cx)
+            })
+            .unwrap();
+        visual.run_until_parked();
+        window
+            .update(visual, |shell, window, cx| {
+                assert_eq!(shell.workspace.active, Some(id));
+                assert!(!shell.agent_status(id).unread_done());
+                assert_eq!(shell.session_activity[&id].seen_at, Some(at));
+                let saved = locked(&shell.store)
+                    .unwrap()
+                    .restore_session_activity(at)
+                    .unwrap();
+                assert_eq!(saved[&id].seen_at, Some(at), "seen survives a reload");
+                shell.open(previous, window, cx);
+            })
+            .unwrap();
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        assert!(visual.debug_bounds(summary).is_none());
+        assert!(
+            visual
+                .debug_bounds(row)
+                .expect("read session row")
+                .size
+                .height
+                < unread_height
+        );
+    }
 
     #[gpui::test]
     fn error_cards_share_top_right_stack_and_dismiss_independently(cx: &mut TestAppContext) {

@@ -1,4 +1,4 @@
-// Sidebar.tsx's peek: in the Focused layout (rounded or boxy) a collapsed
+// Sidebar.tsx's peek: in Focused and Tree (rounded or boxy) a hidden
 // sidebar slides out over the workspace while the pointer rests on the
 // window's left edge or on the sidebar toggle, and puts itself away once the
 // pointer leaves it.
@@ -63,7 +63,7 @@ impl SidebarPeek {
 }
 
 impl Shell {
-    /// Only the Focused layout's collapsed sidebar peeks, rounded or boxy.
+    /// Focused and Tree peeking work in either workspace style.
     fn peek_available(&self) -> bool {
         !self.workspace.classic_layout
             && !self.workspace.sidebar_visible
@@ -97,6 +97,10 @@ impl Shell {
         }
         self.sidebar_peek = Some(SidebarPeek::new(open, current, cx.reduce_motion()));
         self.peek_animating = true;
+        if self.workspace.tree_layout() {
+            // Opening with reduced motion can use the cached frame immediately.
+            self.notify_sidebar(cx);
+        }
         cx.notify();
     }
 
@@ -126,7 +130,7 @@ impl Shell {
         }));
     }
 
-    fn peek_contains(&self, position: Point<Pixels>) -> bool {
+    fn peek_area_contains(&self, position: Point<Pixels>) -> bool {
         let (x, y) = (position.x.as_f32(), position.y.as_f32());
         x >= PEEK_INSET
             && x <= PEEK_INSET + self.workspace.sidebar_width
@@ -140,7 +144,7 @@ impl Shell {
         self.peek_toggle_bounds
             .get()
             .is_some_and(|bounds| bounds.contains(&position))
-            || self.peek_contains(position)
+            || self.peek_area_contains(position)
             || self.menu.is_some()
             || self.session_preview.as_ref().is_some_and(|preview| {
                 preview
@@ -255,13 +259,14 @@ impl Shell {
                 ));
         let mut dim: gpui::Hsla = rgba(0x000000ff).into();
         dim.a = if light { 0.18 } else { 0.4 } * progress;
-        div().absolute().top_0().left_0().size_full().bg(dim)
+        div().absolute().inset_0().bg(dim)
     }
 
     fn peek_panel(&self, progress: f32, window: &mut Window) -> gpui::Stateful<gpui::Div> {
-        // Glass blurs the dimmed workspace under a faint wash; otherwise the
-        // panel takes the window's own surface.
-        let glass = self.window_glass == Some(true) && !is_light();
+        // Tree uses its floating surface in every appearance, including when
+        // the rest of the window is glass. The badge rim takes this same fill.
+        let tree = self.workspace.tree_layout();
+        let glass = !tree && self.window_glass == Some(true) && !is_light();
         // The blur marker carries no alpha for opacity to fade, so the blur
         // itself eases with the panel; at full strength to the last frame it
         // would vanish all at once as the peek closes.
@@ -295,7 +300,9 @@ impl Shell {
                 BoxShadow::new(px(0.), px(12.), rgba(0x00000047).into()).blur_radius(px(32.)),
                 BoxShadow::new(px(0.), px(2.), rgba(0x00000029).into()).blur_radius(px(6.)),
             ])
-            .when(!glass, |d| d.bg(shell_fill()))
+            .when(!glass, |d| {
+                d.bg(if tree { floating_fill() } else { shell_fill() })
+            })
             .when(glass, |d| {
                 d.child(
                     canvas(

@@ -285,6 +285,11 @@ mod tests {
         BackgroundTask {
             id: id.into(),
             description: format!("Task {id}"),
+            kind: if agent {
+                monocode_core::provider::TaskKind::Agent
+            } else {
+                monocode_core::provider::TaskKind::Shell
+            },
             agent,
             command: (!agent).then(|| "npm run dev".into()),
             started_at: monocode_core::time::now_ms(),

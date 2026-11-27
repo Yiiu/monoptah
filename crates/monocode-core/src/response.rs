@@ -1,5 +1,7 @@
 //! Response actions use the same prose and recap rules as transcriptActivity.ts,
 //! secondOpinion.ts and handoff.ts. Tool chrome and private reasoning aren't copied.
+pub mod progress;
+
 use crate::{
     tool::{ToolCall, ToolState},
     transcript::Row,

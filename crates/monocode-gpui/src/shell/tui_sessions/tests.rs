@@ -477,7 +477,8 @@ fn busy_marks_the_session_and_the_cli_exiting_clears_it(cx: &mut TestAppContext)
             assert!(shell.session_marks[&ids.tui].read(cx).state() == MarkState::Working);
             // A chat in the same shell is not busy.
             assert!(!shell.session_metadata(ids.chat, cx).busy);
-            // The CLI exits (early, so the pane stays): idle again.
+            // The CLI fails during a turn; the pane stays with its failure.
+            shell.window_active = false;
             terminal(shell, ids.tui, cx).update(cx, |t, cx| t.fake_exit(Some(1), cx));
         })
         .unwrap();
@@ -486,7 +487,13 @@ fn busy_marks_the_session_and_the_cli_exiting_clears_it(cx: &mut TestAppContext)
         .update(cx, |shell, _, cx| {
             assert!(!shell.busy_sessions.contains(&ids.tui));
             assert!(!shell.session_metadata(ids.tui, cx).busy);
-            assert!(shell.tab_marks[&ids.tui].read(cx).state() == MarkState::Idle);
+            assert!(matches!(
+                shell.agent_status(ids.tui).activity,
+                monocode_core::agent_status::Activity::Done {
+                    outcome: monocode_core::agent_status::Outcome::Failed,
+                    ..
+                }
+            ));
         })
         .unwrap();
 }
@@ -506,7 +513,13 @@ fn killing_the_pane_clears_a_busy_mark(cx: &mut TestAppContext) {
             assert!(shell.busy_sessions.contains(&ids.tui));
             shell.close(ids.tui, w, cx);
             assert!(!shell.busy_sessions.contains(&ids.tui));
-            assert!(!shell.unseen_finished.contains(&ids.tui));
+            assert!(matches!(
+                shell.agent_status(ids.tui).activity,
+                monocode_core::agent_status::Activity::Done {
+                    outcome: monocode_core::agent_status::Outcome::Interrupted,
+                    ..
+                }
+            ));
         })
         .unwrap();
 }

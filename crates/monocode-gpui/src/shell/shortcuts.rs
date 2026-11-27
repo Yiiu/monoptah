@@ -64,7 +64,7 @@ pub(super) fn block_menu_actions<E: InteractiveElement>(element: E) -> E {
     swallow!(
         element;
         NewCodex, NewClaude, OpenProject, CloseTab, CloseAllTabs, CloseOtherTabs, VisitBack,
-        VisitForward, NextTab, PreviousTab, ToggleSidebar, FocusSearch, SearchFiles,
+        VisitForward, NextTab, PreviousTab, ToggleSidebar, NextTreeRequest, FocusSearch, SearchFiles,
         PreviousSession, NextSession, PreviousProject, NextProject, SwitchModel,
         ToggleRightPanel, SplitRight, SplitDown, FocusPaneLeft, FocusPaneRight, FocusPaneUp,
         FocusPaneDown, ToggleTerminal, NewTerminal, NewTerminalHome, SplitTerminal,

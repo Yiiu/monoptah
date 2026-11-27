@@ -7,6 +7,7 @@ use super::started_rail::{
 };
 use super::*;
 use crate::reveal::{Disclosure, bezier};
+use monocode_core::agent_status::Activity;
 use std::time::{Duration, Instant};
 
 /// RevealHeight's `reveal-height-in` and `reveal-height-out`.
@@ -85,7 +86,11 @@ impl Shell {
     fn in_play(&self, id: i64, cx: &App) -> bool {
         (self.workspace.active == Some(id) && !self.mono_active(cx))
             || self.selected_sessions.contains(&id)
-            || self.responding(id, cx)
+            || self.status_keeps_rail_open(id)
+    }
+    fn status_keeps_rail_open(&self, id: i64) -> bool {
+        let status = self.agent_status(id);
+        status.is_busy() || status.needs_you()
     }
     /// startedViewing: in view or chosen.
     fn in_view(&self, id: i64, cx: &App) -> bool {
@@ -96,11 +101,6 @@ impl Shell {
         self.workspace
             .active
             .filter(|_| !self.mono_active(cx) && !self.app_view_open())
-    }
-    fn responding(&self, id: i64, cx: &App) -> bool {
-        self.sessions
-            .get(&id)
-            .is_some_and(|s| s.read(cx).responding())
     }
     /// Collapses or expands a thread's started sessions; the user's choice
     /// holds while the thread stays in play.
@@ -190,7 +190,7 @@ impl Shell {
             &by_parent,
             |_| false,
             |id| self.in_view(id, cx),
-            |id| self.responding(id, cx),
+            |id| self.status_keeps_rail_open(id),
             highlighted,
             self.rails.focused,
         );
@@ -367,7 +367,7 @@ impl Shell {
         let active =
             self.workspace.active == Some(id) && !self.mono_active(cx) && !self.app_view_open();
         let draft = session.has_saved_draft();
-        let approval = session.needs_approval();
+        let approval = self.agent_status(id).needs_you();
         let orchestration = matches!(rail, Some((Rail::Agents(_), true)));
         let header = !compact || orchestration;
         let started_in_view = match rail {
@@ -427,7 +427,6 @@ impl Shell {
         } else {
             model
         };
-        let status = self.classic_session_status(id, &session, cx);
         let title = div()
             .debug_selector(move || format!("session-title-{id}"))
             .flex_1()
@@ -469,7 +468,11 @@ impl Shell {
                                         .child(model),
                                 ),
                         )
-                        .child(status),
+                        .child(
+                            div()
+                                .max_w(gpui::relative(0.65))
+                                .child(self.classic_session_status(id, &session)),
+                        ),
                 )
             })
             .child(
@@ -488,7 +491,8 @@ impl Shell {
                         d.child(
                             div()
                                 .pl_2()
-                                .child(self.classic_session_status(id, &session, cx)),
+                                .max_w(gpui::relative(0.65))
+                                .child(self.classic_session_status(id, &session)),
                         )
                     }),
             )
@@ -729,56 +733,99 @@ impl Shell {
         &self,
         id: i64,
         session: &session_loading::Metadata<'_>,
-        _cx: &Context<Self>,
     ) -> AnyElement {
-        let status = div()
-            .flex_shrink_0()
+        let status = self.agent_status(id);
+        let now = monocode_core::time::now_ms();
+        let detail = if let Some(badge) = self.auto_resume_activity_badge(id, true, 12.) {
+            div().min_w_0().child(badge)
+        } else if let Some(label) = status.label(now) {
+            div()
+                .flex()
+                .min_w_0()
+                .items_center()
+                .gap_1()
+                .text_color(crate::session_mark::activity_color(&status.activity))
+                .children(crate::session_mark::activity_glyph(&status.activity, 12.))
+                .when(
+                    matches!(status.activity, Activity::Running { stale: false, .. }),
+                    |d| d.children(self.session_marks.get(&id).cloned()),
+                )
+                .child(Self::session_activity_caption(id, label))
+        } else if session.has_saved_draft() && matches!(status.activity, Activity::Idle) {
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .text_color(content(0.55))
+                .child(icon("circle-dashed-hi", 12.))
+                .child("Draft")
+        } else {
+            let at = match status.activity {
+                Activity::Done { at, .. } => at,
+                _ => session.summary.updated_at,
+            };
+            div().child(monocode_core::time::relative(at, now))
+        };
+        div()
             .flex()
+            .min_w_0()
             .items_center()
             .gap_1()
             .text_size(px(11.))
             .line_height(px(16.5))
-            .text_color(content(0.45));
-        if session.needs_approval() {
-            status
-                .text_color(rgb(0xfbbf24))
-                .child(icon("circle-alert", 12.))
-                .child(if self.orchestration_summaries.contains_key(&id) {
-                    "Needs input"
-                } else {
-                    "Need approval"
-                })
-                .into_any_element()
-        } else if session.responding() {
-            status
-                .text_color(crate::theme::accent_color())
-                .children(self.session_marks.get(&id).cloned())
-                .child("Working...")
-                .into_any_element()
-        } else if let Some(state) = session.auto_resume(monocode_core::usage::now_ms()) {
-            status
-                .child(self.auto_resume_badge(id, state, true, 12.))
-                .into_any_element()
-        } else if self.unseen_finished.contains(&id) {
-            status
-                .text_color(rgb(0x34d399))
-                .child(icon("check", 12.))
-                .child("Done")
-                .into_any_element()
-        } else if session.has_saved_draft() {
-            status
-                .text_color(content(0.55))
-                .child(icon("circle-dashed-hi", 12.))
-                .child("Draft")
-                .into_any_element()
-        } else {
-            status
-                .child(monocode_core::time::relative(
-                    session.summary.updated_at,
-                    monocode_core::time::now_ms(),
-                ))
-                .into_any_element()
+            .text_color(content(0.45))
+            .child(detail)
+            .children(self.shell_task_chip(id))
+            .into_any_element()
+    }
+
+    pub(super) fn shell_task_chip(&self, id: i64) -> Option<AnyElement> {
+        let shells = &self.agent_status(id).shells;
+        if shells.is_empty() {
+            return None;
         }
+        let noun = if shells.len() == 1 {
+            "background shell"
+        } else {
+            "background shells"
+        };
+        let commands: SharedString = shells
+            .iter()
+            .map(|task| task.command.as_str())
+            .filter(|command| !command.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+            .into();
+        let title = format!("{} {noun}", shells.len());
+        let tooltip = if commands.is_empty() {
+            title.clone().into()
+        } else {
+            commands
+        };
+        Some(
+            div()
+                .id(("session-shell-tasks", id as usize))
+                .debug_selector(move || format!("session-shell-tasks-{id}"))
+                .role(Role::Image)
+                .aria_label(title)
+                .flex()
+                .flex_shrink_0()
+                .items_center()
+                .gap_px()
+                .px_1()
+                .rounded_sm()
+                .bg(content(0.08))
+                .text_color(content(0.65))
+                .text_size(px(10.))
+                .line_height(px(14.))
+                .child(icon("terminal", 10.).text_color(content(0.65)))
+                .child(shells.len().to_string())
+                .tooltip(move |_, cx| {
+                    cx.new(|_| crate::cloud_mark::CloudTip(tooltip.clone()))
+                        .into()
+                })
+                .into_any_element(),
+        )
     }
     /// OrchestrationSidebarAgents, `tree`.
     fn agents(
@@ -787,6 +834,22 @@ impl Shell {
         summary: &monocode_core::orchestration::Summary,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        self.agents_excluding(lead, summary, &[], cx)
+    }
+
+    pub(super) fn agents_excluding(
+        &self,
+        lead: i64,
+        summary: &monocode_core::orchestration::Summary,
+        represented: &[i64],
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let tasks: Vec<_> = summary
+            .tasks
+            .iter()
+            .enumerate()
+            .filter(|(_, task)| task.session.is_none_or(|id| !represented.contains(&id)))
+            .collect();
         let classic = self.workspace.classic_layout;
         div()
             .when(!classic, |d| d.pt_1().pb_1())
@@ -828,20 +891,30 @@ impl Shell {
                     .flex()
                     .flex_col()
                     .when(classic, |d| d.mx(px(-8.)).gap_px())
-                    .children(summary.tasks.iter().enumerate().map(|(ix, task)| {
-                        let needs_input = task.session.is_some_and(|s| {
-                            self.sessions
-                                .get(&s)
-                                .is_some_and(|v| v.read(cx).needs_approval())
-                        });
+                    .children(tasks.iter().enumerate().map(|(row_ix, &(ix, task))| {
+                        let worker_status = task.session.map(|id| self.agent_status(id));
+                        let needs_input = worker_status.is_some_and(|status| status.needs_you());
                         let open = self.rails.open_tasks.contains(&(lead, ix)) || needs_input;
-                        let label = task.label(summary, needs_input);
-                        let working = summary.live && task.status == "running" && !needs_input;
+                        let in_progress = summary.live && task.status == "running";
+                        let live_status = worker_status.filter(|status| {
+                            (in_progress || needs_input)
+                                && !matches!(status.activity, Activity::Idle)
+                        });
+                        let activity = live_status.map(|status| &status.activity);
+                        let label = live_status
+                            .and_then(|status| status.label(monocode_core::time::now_ms()))
+                            .unwrap_or_else(|| task.label(summary, needs_input).to_owned());
+                        let working = in_progress
+                            && activity.is_none_or(|activity| {
+                                matches!(activity, Activity::Running { stale: false, .. })
+                            });
                         let alert =
                             needs_input || matches!(task.status.as_str(), "failed" | "blocked");
                         let done = task.status == "completed";
-                        let tone: gpui::Hsla = if alert {
-                            rgb(0xfbbf24).into()
+                        let tone = if let Some(activity) = activity {
+                            crate::session_mark::activity_color(activity)
+                        } else if alert {
+                            warning_color()
                         } else if working {
                             accent_color()
                         } else if done {
@@ -935,16 +1008,20 @@ impl Shell {
                             )
                             .child(
                                 div()
-                                    .flex_shrink_0()
+                                    .min_w_0()
+                                    .max_w(gpui::relative(0.65))
                                     .flex()
                                     .items_center()
                                     .gap_1()
                                     .text_size(px(11.))
                                     .when(classic, |d| d.line_height(px(16.5)))
                                     .text_color(tone)
-                                    .when(alert, |d| {
-                                        d.child(icon("circle-alert", 12.).text_color(tone))
+                                    .when(alert && activity.is_none(), |d| {
+                                        d.child(icon("alert-circle", 12.).text_color(tone))
                                     })
+                                    .children(activity.and_then(|activity| {
+                                        crate::session_mark::activity_glyph(activity, 12.)
+                                    }))
                                     .when(working, |d| {
                                         d.child(crate::pulse::looping(
                                             SharedString::from(format!("rail-spinner-{lead}-{ix}")),
@@ -957,7 +1034,9 @@ impl Shell {
                                         d.child(icon("check", 12.).text_color(tone))
                                     })
                                     // On the rail the spinner says it on its own.
-                                    .when(classic || !working, |d| d.child(label)),
+                                    .when(classic || !working, |d| {
+                                        d.child(div().min_w_0().truncate().child(label))
+                                    }),
                             )
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -1019,7 +1098,13 @@ impl Shell {
                                             d.child(
                                                 solid("rail-agent-open", "See details").on_click(
                                                     cx.listener(move |this, _, window, cx| {
-                                                        this.open(worker, window, cx)
+                                                        if this.workspace.tree_layout() {
+                                                            this.open_tree_session(
+                                                                worker, window, cx,
+                                                            );
+                                                        } else {
+                                                            this.open(worker, window, cx);
+                                                        }
                                                     }),
                                                 ),
                                             )
@@ -1052,7 +1137,7 @@ impl Shell {
                         if classic {
                             row.into_any_element()
                         } else {
-                            step(ix + 1 == summary.tasks.len(), row).into_any_element()
+                            step(row_ix + 1 == tasks.len(), row).into_any_element()
                         }
                     })),
             )
@@ -1063,7 +1148,143 @@ impl Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workspace::NavigationLayout;
     use gpui::{TestAppContext, VisualTestContext, WindowHandle};
+    use monocode_core::agent_status::{AgentStatus, Outcome, ShellTask, Wait};
+
+    fn in_both_session_rails(
+        cx: &mut TestAppContext,
+        status: AgentStatus,
+        assert_row: impl Fn(&mut VisualTestContext, i64, NavigationLayout),
+    ) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (window, id, _) = crate::shell::tests::window(cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        visual.simulate_resize(gpui::size(px(1400.), px(900.)));
+        window
+            .update(visual, |shell, window, cx| {
+                shell.open(id, window, cx);
+                shell.workspace.compact_session_cards = false;
+                shell.workspace.project_rail_open = true;
+                shell.workspace.sidebar_visible = true;
+            })
+            .unwrap();
+        visual.run_until_parked();
+        for layout in [NavigationLayout::Classic, NavigationLayout::Focused] {
+            window
+                .update(visual, |shell, _, cx| {
+                    shell.set_navigation_layout(layout, cx);
+                    shell.agent_statuses.insert(id, status.clone());
+                    shell.invalidate_chrome(cx);
+                    cx.notify();
+                })
+                .unwrap();
+            visual.refresh().unwrap();
+            assert_row(visual, id, layout);
+        }
+    }
+
+    fn assert_status_text(cx: &mut TestAppContext, activity: Activity, text: &str) {
+        in_both_session_rails(
+            cx,
+            AgentStatus {
+                activity,
+                ..Default::default()
+            },
+            |visual, id, layout| {
+                let selector = format!("session-status-text-{id}-{text}").leak();
+                assert!(
+                    visual
+                        .debug_bounds(selector)
+                        .is_some_and(|bounds| bounds.size.width > px(0.)),
+                    "{layout:?} should display {text:?}",
+                );
+            },
+        );
+    }
+
+    #[gpui::test]
+    fn classic_and_focused_show_failed_turns(cx: &mut TestAppContext) {
+        assert_status_text(
+            cx,
+            Activity::Done {
+                outcome: Outcome::Failed,
+                at: 1,
+                unread: true,
+            },
+            "Failed",
+        );
+    }
+
+    #[gpui::test]
+    fn classic_and_focused_show_stopped_turns(cx: &mut TestAppContext) {
+        assert_status_text(
+            cx,
+            Activity::Done {
+                outcome: Outcome::Interrupted,
+                at: 1,
+                unread: true,
+            },
+            "Stopped",
+        );
+    }
+
+    #[gpui::test]
+    fn classic_and_focused_show_the_subtask_count(cx: &mut TestAppContext) {
+        assert_status_text(
+            cx,
+            Activity::BackgroundWait {
+                reason: Wait::Subtasks(3),
+                since: 1,
+            },
+            "Waiting on 3 subtasks",
+        );
+    }
+
+    #[gpui::test]
+    fn classic_and_focused_show_usage_limit_waits(cx: &mut TestAppContext) {
+        assert_status_text(
+            cx,
+            Activity::BackgroundWait {
+                reason: Wait::UsageLimit { resume_at: 1 },
+                since: 1,
+            },
+            "Usage limit · resuming",
+        );
+    }
+
+    #[gpui::test]
+    fn classic_and_focused_show_stale_turns(cx: &mut TestAppContext) {
+        assert_status_text(
+            cx,
+            Activity::Running {
+                step: Some("Build".into()),
+                since: 1,
+                stale: true,
+            },
+            "No update in 30m",
+        );
+    }
+
+    #[gpui::test]
+    fn classic_and_focused_show_a_chip_for_background_shells(cx: &mut TestAppContext) {
+        let status = AgentStatus {
+            activity: Activity::Idle,
+            shells: vec![ShellTask {
+                id: "dev".into(),
+                command: "npm run dev".into(),
+            }],
+        };
+        in_both_session_rails(cx, status, |visual, id, layout| {
+            let chip = format!("session-shell-tasks-{id}").leak();
+            assert!(
+                visual
+                    .debug_bounds(chip)
+                    .is_some_and(|bounds| bounds.size.width > px(0.)),
+                "{layout:?} should show the detached dev server chip",
+            );
+        });
+    }
 
     fn bounds(cx: &mut VisualTestContext, selector: String) -> Option<gpui::Bounds<Pixels>> {
         cx.debug_bounds(Box::leak(selector.into_boxed_str()))

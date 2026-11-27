@@ -1,0 +1,5 @@
+{"file":".trellis/spec/native/index.md","reason":"Native quality gate"}
+{"file":".trellis/spec/native/testing.md","reason":"Tests must not be weakened; Linux-portable"}
+{"file":".trellis/spec/core/persistence-and-compat.md","reason":"Review the session_activity migration"}
+{"file":".trellis/spec/core/testing.md","reason":"Core test conventions"}
+{"file":".trellis/tasks/11-25-agent-status-core/research/state-plumbing.md","reason":"Checklist of consumers that must all read the unified status"}
