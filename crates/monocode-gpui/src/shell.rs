@@ -1248,6 +1248,15 @@ impl Shell {
             this.sync_project_rail_git_stats(cx);
             if this.workspace.classic_layout {
                 this.sidebar_frame.update(cx, |_, cx| cx.notify());
+            } else if this.workspace.tree_layout() {
+                let branch = git
+                    .read(cx)
+                    .index
+                    .as_ref()
+                    .map(|index| index.branch.clone());
+                if let Some(branch) = branch {
+                    this.observe_tree_git_branch(&cwd, branch.as_deref(), cx);
+                }
             }
             cx.notify();
         });
@@ -7921,33 +7930,7 @@ impl Shell {
                                             })),
                                     )
                                 })
-                                .child(
-                                    icon_button(
-                                        "sidebar-options",
-                                        "Sidebar options",
-                                        "more-horizontal",
-                                    )
-                                    .debug_selector(|| "sidebar-options".into())
-                                    .aria_expanded(self.menu_open(&MenuTarget::SidebarOptions))
-                                    .relative()
-                                    .child(self.sidebar_options_anchor.probe())
-                                    .on_click(cx.listener(
-                                        |this, _, window, cx| {
-                                            if this.menu_open(&MenuTarget::SidebarOptions) {
-                                                this.close_menu(cx);
-                                            } else {
-                                                this.open_menu(
-                                                    MenuTarget::SidebarOptions,
-                                                    Anchor::Slot(
-                                                        this.sidebar_options_anchor.clone(),
-                                                    ),
-                                                    window,
-                                                    cx,
-                                                );
-                                            }
-                                        },
-                                    )),
-                                ),
+                                .child(self.sidebar_options_button(cx)),
                         )
                         .child(self.virtual_sidebar(cx))
                         .children(live_agents)
@@ -7964,49 +7947,58 @@ impl Shell {
             .when(!self.workspace.classic_layout, |d| {
                 d.child(self.project_spaces(cx))
             })
-            .when_some(self.session_preview.as_ref(), |d, preview| {
-                let id = preview.id;
-                d.child(
-                    popover("session-preview", Anchor::Slot(preview.anchor.clone()))
-                        .side(Side::Right)
-                        .gap(8.)
-                        .width(260.)
-                        .max_height(440.)
-                        .track(preview.surface.clone())
-                        .child(
-                            div()
-                                .id("session-preview-content")
-                                .role(Role::Tooltip)
-                                .max_h(px(438.))
-                                .overflow_y_scroll()
-                                .on_hover(cx.listener(move |this, hovered, window, cx| {
-                                    if this
-                                        .session_preview
-                                        .as_ref()
-                                        .is_none_or(|preview| preview.id != id)
-                                    {
-                                        return;
-                                    }
-                                    if *hovered {
-                                        this.preview_close = None;
-                                    } else {
-                                        this.schedule_preview_close(window, cx);
-                                    }
-                                }))
-                                .child(self.sessions.get(&preview.id).map_or_else(
-                                    || {
-                                        session_preview::render(
-                                            self.session_metadata(preview.id, cx).summary,
-                                            preview.data.as_ref(),
-                                            self.agent_status(preview.id),
-                                        )
-                                    },
-                                    |view| view.read(cx).preview(self.agent_status(preview.id)),
-                                )),
-                        ),
-                )
-            })
+            .children(self.inline_session_preview(cx))
             .into_any()
+    }
+
+    fn inline_session_preview(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let preview = self.session_preview.as_ref()?;
+        let id = preview.id;
+        let status = self.agent_status(id);
+        let tree = self.workspace.tree_layout();
+        let content = self.sessions.get(&id).map_or_else(
+            || {
+                session_preview::render(
+                    self.session_metadata(id, cx).summary,
+                    preview.data.as_ref(),
+                    status,
+                    tree,
+                )
+            },
+            |view| view.read(cx).preview(status, tree),
+        );
+        Some(
+            popover("session-preview", Anchor::Slot(preview.anchor.clone()))
+                .side(Side::Right)
+                .gap(8.)
+                .width(260.)
+                .max_height(440.)
+                .track(preview.surface.clone())
+                .child(
+                    div()
+                        .id("session-preview-content")
+                        .debug_selector(|| "session-preview-content".into())
+                        .role(Role::Tooltip)
+                        .max_h(px(438.))
+                        .overflow_y_scroll()
+                        .on_hover(cx.listener(move |this, hovered, window, cx| {
+                            if this
+                                .session_preview
+                                .as_ref()
+                                .is_none_or(|preview| preview.id != id)
+                            {
+                                return;
+                            }
+                            if *hovered {
+                                this.preview_close = None;
+                            } else {
+                                this.schedule_preview_close(window, cx);
+                            }
+                        }))
+                        .child(content),
+                )
+                .into_any_element(),
+        )
     }
 
     fn project_spaces(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -9892,6 +9884,7 @@ impl Render for Shell {
                         }
                     } else {
                         this.resume_git(cx);
+                        this.invalidate_tree_worktrees(cx);
                         this.check_github_star(true, cx);
                         if let Some(center) = crate::accounts::get(cx) {
                             center.update(cx, |center, cx| center.app_reactivated(window, cx));

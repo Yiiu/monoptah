@@ -1,0 +1,22 @@
+/* Sampled from the Monoptah Native dark theme (Windows screenshot, 2026-11-27).
+   GPUI's content(a) is white at alpha a over the surface. */
+:root,
+[data-appearance="dark"] {
+  --surface: #2b2b2b;
+  --content-100: rgba(255, 255, 255, 1);
+  --content-85: rgba(255, 255, 255, 0.85);
+  --content-70: rgba(255, 255, 255, 0.7);
+  --content-50: rgba(255, 255, 255, 0.5);
+  --content-35: rgba(255, 255, 255, 0.35);
+  --content-10: rgba(255, 255, 255, 0.1);
+  --content-06: rgba(255, 255, 255, 0.06);
+  --content-04: rgba(255, 255, 255, 0.04);
+  --accent: #4f8fd0;
+  --attention: #e0a43a;
+  --success: #6fbf73;
+  --claude: #d97757;
+  --codex: #5b6cf0;
+  --font-ui: "Segoe UI", system-ui, sans-serif;
+  --row-h: 28px;
+  --radius: 6px;
+}

@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="zh" data-appearance="dark">
+<head>
+<meta charset="utf-8">
+<title>Tree sidebar · rows with options menu</title>
+<link rel="stylesheet" href="../tokens.css">
+<link rel="stylesheet" href="sidebar.css">
+<style>.side { position: relative; } .hdr { height: 28px; display: flex; justify-content: flex-end; color: var(--content-50); }</style>
+</head>
+<body>
+<nav class="side" aria-label="Tree sidebar">
+  <div class="hdr"><span style="width:26px;height:26px;display:grid;place-items:center;border-radius:6px;background:var(--content-10);color:var(--content-100)" title="Sidebar options"><ryugi-icon name="ellipsis" size="15"></ryugi-icon></span></div>
+  <div class="search"><ryugi-icon name="search" size="15"></ryugi-icon>Search<span class="kbd">Ctrl K</span></div>
+  <div class="navrow"><ryugi-icon name="square-plus" size="15"></ryugi-icon>New<span class="kbd">Ctrl T</span></div>
+  <div class="navrow"><ryugi-icon name="inbox" size="15"></ryugi-icon>Inbox</div>
+
+  <div class="menu" role="menu" aria-label="Sidebar options" style="left:58px;top:32px">
+    <div class="mi"><ryugi-icon name="search" size="13"></ryugi-icon>Search<ryugi-icon class="chk" name="check" size="13"></ryugi-icon></div>
+    <div class="mi"><ryugi-icon name="clock" size="13"></ryugi-icon>Today</div>
+    <div class="mi"><ryugi-icon name="sticky-note" size="13"></ryugi-icon>Notes</div>
+    <div class="mi"><ryugi-icon name="zap" size="13"></ryugi-icon>Automations</div>
+    <div class="mi"><ryugi-icon name="inbox" size="13"></ryugi-icon>Inbox<ryugi-icon class="chk" name="check" size="13"></ryugi-icon></div>
+    <div class="mi"><ryugi-icon name="chart-column" size="13"></ryugi-icon>Contributors</div>
+    <div class="mi"><ryugi-icon name="ghost" size="13"></ryugi-icon>Monos<ryugi-icon class="chk" name="check" size="13"></ryugi-icon></div>
+    <div class="sep"></div>
+    <div class="mi"><ryugi-icon name="list" size="13"></ryugi-icon>Compact view</div>
+  </div>
+
+  <div class="monos" aria-label="Monos" style="margin-top:8px">
+    <span class="label">Monos</span>
+    <span class="mono" title="MonoInvader"><ryugi-icon name="bug" size="14" style="color:#8aa4ff"></ryugi-icon></span>
+    <span class="mono" title="MonoGhost"><ryugi-icon name="ghost" size="14" style="color:#e58c8c"></ryugi-icon></span>
+  </div>
+
+  <div class="sec">Projects<span class="tools"><span><ryugi-icon name="list-filter" size="13"></ryugi-icon></span><span><ryugi-icon name="plus" size="13"></ryugi-icon></span></span></div>
+  <div class="scroll">
+    <div class="row proj"><ryugi-icon class="chev" name="chevron-right" size="12"></ryugi-icon><span class="av" style="background:#1f3b2c"><ryugi-icon name="squirrel" size="13" style="color:#5fd08a"></ryugi-icon></span><span class="name">watermelon-ui</span><ryugi-icon class="pin" name="pin" size="12"></ryugi-icon></div>
+    <div class="row proj"><ryugi-icon class="chev" name="chevron-right" size="12"></ryugi-icon><span class="av" style="background:#1f2c4a"><ryugi-icon name="bot" size="13" style="color:#6f9bff"></ryugi-icon></span><span class="name">yishao-tanzhen</span><ryugi-icon class="pin" name="pin" size="12"></ryugi-icon></div>
+    <div class="row proj"><ryugi-icon class="chev" name="chevron-down" size="12"></ryugi-icon><span class="av" style="background:#4a3a14"><ryugi-icon name="cat" size="13" style="color:#f2c94c"></ryugi-icon></span><span class="name">monoptah</span><span class="counts"><span style="color:var(--accent)">●1</span></span></div>
+    <div class="row sess sel"><span class="tile claude running"></span><span class="name">Improve tree UI usability</span><span class="meta run">Run Bash</span></div>
+    <div class="row sess"><span class="tile codex"></span><span class="name">Investigate Missing Contributors</span></div>
+    <div class="row sess"><span class="tile codex"></span><span class="name">完善概览树体验与验证</span></div>
+    <div class="row sess unread"><span class="tile claude"></span><span class="name">chatgpt经验沉淀</span><span class="udot"></span></div>
+    <div class="row sess"><span class="tile claude"></span><span class="name">Improve Monoptah's release flow</span></div>
+    <div class="row sess"><span class="tile codex"></span><span class="name">审阅已规划设计的落地情况</span></div>
+    <div class="row proj"><ryugi-icon class="chev" name="chevron-down" size="12"></ryugi-icon><span class="av" style="background:#1d3a33"><ryugi-icon name="rabbit" size="13" style="color:#4fd1b5"></ryugi-icon></span><span class="name">old-streamer</span><span class="counts"><span style="color:var(--accent)">●1</span></span></div>
+    <div class="row sess"><span class="tile codex running"></span><span class="name">实现小游戏原型</span><span class="meta run">Run $dir=J…</span></div>
+    <div class="row sess"><span class="tile claude"></span><span class="name">WeChat mini-game port</span></div>
+  </div>
+  <div class="footer"><ryugi-icon name="settings" size="15"></ryugi-icon></div>
+</nav>
+</body>
+</html>

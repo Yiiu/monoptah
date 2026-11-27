@@ -12,6 +12,7 @@ pub(super) fn render(
     summary: &Session,
     data: Option<&SessionPreviewData>,
     status: &AgentStatus,
+    tree: bool,
 ) -> AnyElement {
     let model = data
         .and_then(|data| data.model.as_deref())
@@ -20,13 +21,7 @@ pub(super) fn render(
     let worktree = data.and_then(|data| data.worktree_cwd.as_deref());
     let cwd = worktree.unwrap_or(&summary.cwd);
     let now = monocode_core::time::now_ms();
-    let label = status.label(now).unwrap_or_else(|| {
-        let at = match status.activity {
-            Activity::Done { at, .. } => at,
-            _ => summary.updated_at,
-        };
-        monocode_core::time::relative(at, now)
-    });
+    let label = preview_label(summary, status, tree, now);
     let directory = std::env::var_os("HOME")
         .and_then(|home| {
             Path::new(cwd).strip_prefix(home).ok().map(|path| {
@@ -112,4 +107,49 @@ pub(super) fn render(
                 ),
         )
         .into_any_element()
+}
+
+fn preview_label(summary: &Session, status: &AgentStatus, tree: bool, now: u64) -> String {
+    if tree && let Some(label) = crate::session_mark::finished_preview_label(&status.activity, now)
+    {
+        return label;
+    }
+    status.label(now).unwrap_or_else(|| {
+        let at = match status.activity {
+            Activity::Done { at, .. } => at,
+            _ => summary.updated_at,
+        };
+        monocode_core::time::relative(at, now)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use monocode_core::{agent_status::Outcome, store::Store};
+
+    #[test]
+    fn unopened_tree_preview_uses_the_receipt_even_when_the_session_was_updated_later() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let mut summary = store.create("claude", "/work/app").unwrap();
+        let now = 5_000_000;
+        summary.updated_at = now - 2_000;
+        for unread in [true, false] {
+            let status = AgentStatus {
+                activity: Activity::Done {
+                    at: now - 79 * 60_000,
+                    outcome: Outcome::Completed,
+                    unread,
+                },
+                ..Default::default()
+            };
+            assert_eq!(
+                preview_label(&summary, &status, true, now),
+                "Finished 1h 19m ago"
+            );
+            if !unread {
+                assert_eq!(preview_label(&summary, &status, false, now), "1h 19m");
+            }
+        }
+    }
 }

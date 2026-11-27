@@ -1,6 +1,13 @@
 //! GPUI rows and the two presentations of the project tree.
 use super::*;
 
+const TREE_SESSION_CONTENT_HEIGHT: f32 = 26.;
+const TREE_PROJECT_GAP: f32 = 6.;
+const TREE_PIN_SIZE: f32 = 12.;
+const TREE_SECTION_TOP: f32 = 12.;
+const TREE_REQUEST_HEIGHT: f32 = 44.;
+const TREE_WORKTREE_INDENT: f32 = 20.;
+
 #[derive(Default)]
 struct LiftedTreeRows {
     start: usize,
@@ -17,16 +24,21 @@ impl Shell {
             let catalog = self.tree_catalog(cx);
             let rows = self.tree_rows(&catalog, cx);
             self.tree.counts = catalog.counts;
+            if !self.tree.requests.is_empty() && catalog.requests.is_empty() {
+                self.tree.closing_requests = std::mem::take(&mut self.tree.requests);
+            }
             self.tree.requests = catalog.requests;
             self.tree.replace_rows(rows);
         }
         self.tree.clear_anchors();
+        let now = Instant::now();
         let has_requests = !self.tree.requests.is_empty();
-        self.tree.request_disclosure.set(
-            has_requests,
-            has_requests && !cx.reduce_motion(),
-            Instant::now(),
-        );
+        self.tree
+            .request_disclosure
+            .set(has_requests, !cx.reduce_motion(), now);
+        if has_requests || !self.tree.request_disclosure.mounted(now) {
+            self.tree.closing_requests.clear();
+        }
         let plate = self.tree_badge_plate();
         let lift = self.tree_lift_plate();
         let LiftedTreeRows {
@@ -56,7 +68,7 @@ impl Shell {
             .flex()
             .flex_col()
             .child(self.sidebar_navigation(cx))
-            .child(self.tree_request_queue(&self.tree.requests, cx))
+            .children(self.tree_request_queue(now, cx))
             .child(
                 div()
                     .relative()
@@ -82,6 +94,7 @@ impl Shell {
                     ),
             )
             .child(self.tree_footer(cx))
+            .children(self.inline_session_preview(cx))
             .into_any()
     }
 
@@ -152,14 +165,20 @@ impl Shell {
             .collect::<Option<_>>()?;
         let lift = self.tree_lift_bounds()?;
         let viewport = self.tree.viewport_bounds();
-        let offset = lift.top() - measurements.first()?.top();
+        let offset =
+            lift.top() - measurements.first()?.top() - self.tree.project_gap_at(rows.start);
         let mut overlays = Vec::new();
         for (ix, bounds) in rows.clone().zip(&measurements) {
             let top = bounds.top() + offset;
             if top + bounds.size.height < viewport.top() || top > viewport.bottom() {
                 continue;
             }
-            let row = self.tree_row(self.tree.rows[ix].clone(), plate, cx);
+            let row = self.tree_row(
+                self.tree.rows[ix].clone(),
+                self.tree.project_gap_at(ix),
+                plate,
+                cx,
+            );
             let overlay = div()
                 .absolute()
                 .top(top - viewport.top())
@@ -185,7 +204,7 @@ impl Shell {
             return div().into_any();
         };
         let owner = self.tree.owners.get(ix).cloned().flatten();
-        let row = self.tree_row(row, plate, cx);
+        let row = self.tree_row(row, self.tree.project_gap_at(ix), plate, cx);
         let Some(owner) = owner else {
             return row;
         };
@@ -227,19 +246,28 @@ impl Shell {
         plate: gpui::Hsla,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let rows: Vec<_> = rows
-            .into_iter()
-            .map(|row| self.tree_row(row, plate, cx))
-            .collect();
+        let mut children = Vec::with_capacity(rows.len());
+        let mut previous = None;
+        for row in &rows {
+            let gap = project_gap(row, previous);
+            children.push(self.tree_row(row.clone(), gap, plate, cx));
+            previous = Some(row);
+        }
         self.tree
             .disclosures
             .get(&key)
-            .and_then(|d| d.render(div().flex().flex_col().children(rows), Instant::now()))
+            .and_then(|d| d.render(div().flex().flex_col().children(children), Instant::now()))
             // Unlike the steady block rows, this flex root otherwise sizes to its contents.
             .map_or_else(|| div().into_any(), |clip| clip.w_full().into_any())
     }
 
-    fn tree_row(&mut self, row: TreeRow, plate: gpui::Hsla, cx: &mut Context<Self>) -> AnyElement {
+    fn tree_row(
+        &mut self,
+        row: TreeRow,
+        project_gap: Pixels,
+        plate: gpui::Hsla,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         // A session row's spacing comes from its rail step's own padding, which the
         // rail is drawn through; a gap outside it would break the line between rows.
         let rail_row = matches!(row, TreeRow::Session { .. });
@@ -249,13 +277,15 @@ impl Shell {
                 || div().into_any(),
                 |monos| {
                     monos.update(cx, |monos, cx| {
-                        monos.tree_rail(tree_section_heading("Monos"), cx)
+                        monos.tree_rail(tree_heading_text("Monos"), cx)
                     })
                 },
             ),
             TreeRow::Header(ProjectEntry::Heading(name)) => self.tree_heading(name, cx),
             TreeRow::Header(ProjectEntry::Group(group)) => self.tree_group_header(group, cx),
-            TreeRow::Header(ProjectEntry::Project(path)) => self.tree_project_row(path, cx),
+            TreeRow::Header(ProjectEntry::Project(project)) => {
+                self.tree_project_row(project.path, cx)
+            }
             TreeRow::Section {
                 project,
                 name,
@@ -271,10 +301,10 @@ impl Shell {
             TreeRow::Worktree {
                 project,
                 path,
-                branch,
+                title,
                 open,
                 counts,
-            } => self.tree_worktree_row(project, path, branch, open, counts, cx),
+            } => self.tree_worktree_row(project, path, title, open, counts, cx),
             TreeRow::Session {
                 id,
                 depth,
@@ -287,7 +317,10 @@ impl Shell {
                 let row = self.tree_session_row(id, branch, children, orchestration, plate, cx);
                 div()
                     .ml(px((f32::from(depth) - 1.).max(0.) * 12.))
-                    .child(rails::step(last, row))
+                    .child(
+                        rails::step(last, row)
+                            .debug_selector(move || format!("tree-session-step-{id}")),
+                    )
                     .into_any()
             }
             TreeRow::Orchestration { id, represented } => {
@@ -309,6 +342,7 @@ impl Shell {
                 tree_node(
                     "tree-archived",
                     format!("Archived {count}"),
+                    None,
                     "archive",
                     open,
                     self.tree.openness(ARCHIVED_KEY, open, Instant::now()),
@@ -324,12 +358,15 @@ impl Shell {
         div()
             .px(px(6.))
             .when(!rail_row, |d| d.pb(px(2.)))
+            .pt(project_gap)
             .child(row)
             .into_any()
     }
 
     fn tree_heading(&mut self, name: &'static str, cx: &mut Context<Self>) -> AnyElement {
         tree_section_heading(name)
+            .debug_selector(|| "tree-projects-heading".into())
+            .pt(px(TREE_SECTION_TOP))
             .when(name == "Projects", |heading| {
                 heading.child(self.sidebar_filter_button(cx)).child(
                     icon_button("tree-project-add", "Add a project or group", "plus").on_click(
@@ -510,6 +547,13 @@ impl Shell {
             )
             .child(self.tree_project_avatar(&path, counts))
             .child(div().flex_1().min_w_0().truncate().child(name))
+            .when(self.workspace.project_rail_pinned.contains(&path), |d| {
+                d.child(
+                    icon("pin", TREE_PIN_SIZE)
+                        .text_color(content(0.35))
+                        .group_hover("tree-project", |s| s.invisible()),
+                )
+            })
             .child(counts_row(counts))
             .child(
                 icon_button("tree-project-new-session", "New session", "plus")
@@ -615,6 +659,7 @@ impl Shell {
         tree_node(
             SharedString::from(format!("tree-section-{project}-{name}")),
             name,
+            None,
             glyph,
             open,
             self.tree.openness(&key, open, Instant::now()),
@@ -672,6 +717,7 @@ impl Shell {
         tree_node(
             SharedString::from(format!("tree-folder-{project}-{id}")),
             name,
+            None,
             "folder",
             open,
             turn,
@@ -722,31 +768,41 @@ impl Shell {
         &mut self,
         project: String,
         path: String,
-        branch: Option<String>,
+        title: WorktreeTitle,
         open: bool,
         counts: Counts,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        self.queue_tree_worktrees(&project, cx);
         self.queue_tree_diff(&path, cx);
         let diff = self.tree.diffs.display(&path);
         let key = worktree_key(&path);
-        let title = branch.clone().unwrap_or_else(|| project_name(&path));
         let new_session = crate::worktree_switcher::WorktreeFocus {
             path: path.clone(),
-            branch,
+            branch: title.branch().map(str::to_owned),
         };
+        let (title, detached) = match title {
+            WorktreeTitle::Branch(branch) => (branch, false),
+            WorktreeTitle::Directory { name, detached } => (name, detached),
+        };
+        let tooltip = path.clone();
         let selector = format!("tree-worktree-{path}");
         let plus_selector = format!("tree-worktree-new-session-{path}");
         tree_node(
             SharedString::from(selector.clone()),
             title,
+            detached.then_some("· detached"),
             "git-branch",
             open,
             self.tree.openness(&key, open, Instant::now()),
         )
         .debug_selector(move || selector.clone())
         .group("tree-worktree")
-        .ml(px(14.))
+        .ml(px(TREE_WORKTREE_INDENT))
+        .tooltip(move |_, cx| {
+            cx.new(|_| super::super::project_rail::ProjectTooltip(tooltip.clone()))
+                .into()
+        })
         .when_some(diff, |d, diff| d.child(tree_caption(diff, content(0.42))))
         .when_some(counts.color(), |d, color| d.child(tree_dot(color)))
         .child(
@@ -791,21 +847,16 @@ impl Shell {
             .map(|input| input.label)
     }
 
-    fn tree_request_queue(&self, ids: &[i64], cx: &mut Context<Self>) -> AnyElement {
-        let queue = div().id("tree-needs-you").mx(px(6.)).mb(px(4.));
-        let color = needs_you_color(ids.len());
-        if ids.is_empty() {
-            return queue
-                .debug_selector(|| "tree-needs-you-empty".into())
-                .h(px(28.))
-                .px(px(6.))
-                .flex()
-                .items_center()
-                .text_size(px(12.))
-                .text_color(color)
-                .child("Nothing needs you")
-                .into_any();
+    fn tree_request_queue(&self, now: Instant, cx: &mut Context<Self>) -> Option<gpui::Div> {
+        if !self.tree.request_disclosure.mounted(now) {
+            return None;
         }
+        let ids = if self.tree.requests.is_empty() {
+            &self.tree.closing_requests
+        } else {
+            &self.tree.requests
+        };
+        let color = warning_color();
         let summary = div()
             .id("tree-next-request")
             .debug_selector(|| "tree-next-request".into())
@@ -835,12 +886,15 @@ impl Shell {
             .max_h(px(118.))
             .overflow_y_scroll()
             .children(ids.iter().map(|id| self.tree_request_item(*id, cx)));
-        queue
+        let queue = div()
+            .id("tree-needs-you")
+            .mx(px(6.))
+            .mb(px(4.))
             .rounded(px(6.))
             .bg(color.opacity(0.055))
             .child(summary)
-            .children(self.tree.request_disclosure.render(list, Instant::now()))
-            .into_any()
+            .child(list);
+        self.tree.request_disclosure.render(queue, now)
     }
 
     fn tree_request_item(&self, id: i64, cx: &mut Context<Self>) -> AnyElement {
@@ -862,10 +916,14 @@ impl Shell {
             .unwrap_or_else(|| "Waiting for input".into());
         div()
             .id(("tree-request-session", id as usize))
+            .debug_selector(move || format!("tree-needs-you-{id}"))
             .role(Role::Button)
             .aria_label(format!("{title}, {ask}"))
             .px(px(6.))
-            .py_1()
+            .h(px(TREE_REQUEST_HEIGHT))
+            .flex()
+            .flex_col()
+            .justify_center()
             .rounded(px(6.))
             .hover(|d| d.bg(content(0.05)))
             .child(
@@ -886,9 +944,11 @@ impl Shell {
                     .truncate()
                     .child(ask),
             )
-            .on_click(
-                cx.listener(move |this, _, window, cx| this.open_tree_session(id, window, cx)),
-            )
+            .on_click(cx.listener(move |this, _, window, cx| {
+                if this.tree.requests.contains(&id) {
+                    this.open_tree_session(id, window, cx);
+                }
+            }))
             .into_any()
     }
 
@@ -927,14 +987,6 @@ impl Shell {
             },
             ref activity => activity.clone(),
         };
-        let read_activity = match status.activity {
-            Activity::Done { at, outcome, .. } => Activity::Done {
-                at,
-                outcome,
-                unread: false,
-            },
-            ref activity => activity.clone(),
-        };
         let subline = if needs_you {
             Some(
                 self.tree_ask(id, cx)
@@ -946,27 +998,13 @@ impl Shell {
             None
         };
         let trailing = match shown_activity {
-            Activity::Done { at, .. } => {
-                let color = mix(
-                    crate::session_mark::activity_color(&read_activity),
-                    crate::session_mark::activity_color(&shown_activity),
-                    look,
-                );
-                Some(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .child(
-                            crate::session_mark::activity_glyph(&shown_activity, 12.)
-                                .filter(|_| look >= 0.5)
-                                .unwrap_or_else(|| icon("check", 12.)),
-                        )
-                        .child(tree_caption(monocode_core::time::relative(at, now), color))
-                        .into_any(),
-                )
+            Activity::Done { .. } if unread => {
+                Some(tree_dot(accent_color()).opacity(look).into_any())
             }
-            Activity::NeedsYou { .. } => None,
+            Activity::Done { .. } => None,
+            Activity::NeedsYou { .. } => {
+                Some(tree_caption("Needs you", warning_color()).into_any())
+            }
             Activity::Idle => self
                 .reminders
                 .iter()
@@ -1011,8 +1049,9 @@ impl Shell {
         let title = meta.display_title();
         let expanded = self.tree.sessions.contains(&id);
         let compact = !needs_you && !unread;
+        let show_preview = compact || matches!(status.activity, Activity::Done { .. });
         let content_row = div()
-            .h(px(24.))
+            .h(px(TREE_SESSION_CONTENT_HEIGHT))
             .min_w_0()
             .flex()
             .items_center()
@@ -1044,7 +1083,13 @@ impl Shell {
             .children(if hover {
                 Some(self.session_archive_button(id, &meta, cx))
             } else {
-                trailing
+                trailing.map(|trailing| {
+                    div()
+                        .debug_selector(move || format!("tree-session-trailing-{id}"))
+                        .min_w_0()
+                        .child(trailing)
+                        .into_any()
+                })
             })
             .when(children > 0, |d| {
                 d.child(
@@ -1126,7 +1171,7 @@ impl Shell {
                 if !this.tree_rail_held()
                     && !this.pane_drag.as_ref().is_some_and(|drag| drag.active)
                 {
-                    this.hover_session(id, bounds.clone(), *entered, compact, window, cx);
+                    this.hover_session(id, bounds.clone(), *entered, show_preview, window, cx);
                 }
             }))
             .on_click(cx.listener(move |this, e: &gpui::ClickEvent, window, cx| {
@@ -1170,12 +1215,22 @@ impl Shell {
     }
 }
 
-pub(super) fn needs_you_color(count: usize) -> gpui::Hsla {
-    if count == 0 {
-        content(0.4)
-    } else {
-        warning_color()
+pub(super) fn project_gap(row: &TreeRow, previous: Option<&TreeRow>) -> Pixels {
+    let Some(previous) = previous else {
+        return px(0.);
+    };
+    if matches!(previous, TreeRow::Header(ProjectEntry::Heading(_))) {
+        return px(0.);
     }
+    let spaced = match row {
+        TreeRow::Header(ProjectEntry::Group(_)) => true,
+        TreeRow::Header(ProjectEntry::Project(project)) => !matches!(
+            previous,
+            TreeRow::Header(ProjectEntry::Group(previous)) if project.group.as_ref() == Some(previous)
+        ),
+        _ => false,
+    };
+    px(if spaced { TREE_PROJECT_GAP } else { 0. })
 }
 
 fn tree_section_heading(name: &str) -> gpui::Div {
@@ -1221,29 +1276,10 @@ fn tree_chevron(openness: f32, side: f32) -> gpui::Svg {
     )))
 }
 
-/// `from` eased towards `to` by `t`.
-fn mix(from: gpui::Hsla, to: gpui::Hsla, t: f32) -> gpui::Hsla {
-    let t = t.clamp(0., 1.);
-    let lerp = |a: f32, b: f32| a + (b - a) * t;
-    // A grey ink has no hue of its own: keep the colour's all the way.
-    let (h0, h1) = if from.s == 0. {
-        (to.h, to.h)
-    } else if to.s == 0. {
-        (from.h, from.h)
-    } else {
-        (from.h, to.h)
-    };
-    gpui::hsla(
-        lerp(h0, h1),
-        lerp(from.s, to.s),
-        lerp(from.l, to.l),
-        lerp(from.a, to.a),
-    )
-}
-
 fn tree_node(
     id: impl Into<gpui::ElementId>,
     title: impl Into<SharedString>,
+    caption: Option<&'static str>,
     glyph: &'static str,
     open: bool,
     openness: f32,
@@ -1252,7 +1288,9 @@ fn tree_node(
     div()
         .id(id)
         .role(Role::Button)
-        .aria_label(title.clone())
+        .aria_label(
+            caption.map_or_else(|| title.to_string(), |caption| format!("{title} {caption}")),
+        )
         .aria_expanded(open)
         .h(px(25.))
         .px(px(5.))
@@ -1265,7 +1303,18 @@ fn tree_node(
         .hover(|d| d.bg(content(0.05)))
         .child(tree_chevron(openness, 10.).text_color(content(0.36)))
         .child(icon(glyph, 12.))
-        .child(div().flex_1().min_w_0().truncate().child(title))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(div().min_w_0().truncate().child(title))
+                .children(
+                    caption.map(|caption| tree_caption(caption, content(0.35)).flex_shrink_0()),
+                ),
+        )
 }
 
 fn counts_row(counts: Counts) -> impl IntoElement {

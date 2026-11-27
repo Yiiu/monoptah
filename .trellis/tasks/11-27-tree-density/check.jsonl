@@ -1,0 +1,5 @@
+{"file": ".trellis/spec/native/component-guidelines.md", "reason": "check tokens, shared components, Tree spacing rules, entry points kept"}
+{"file": ".trellis/spec/native/state-and-async.md", "reason": "check R6 background work and stale-result guards"}
+{"file": ".trellis/spec/native/testing.md", "reason": "check tests are Linux-portable and use the shell fixture"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "Sidebar options fields and project_rail_pinned are shared with Focused/Classic and persisted"}
+{"file": ".trellis/tasks/11-27-tree-density/research/specs.md", "reason": "spec map for this change"}

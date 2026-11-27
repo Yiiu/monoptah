@@ -29,7 +29,10 @@
     "11-26-status-perf-correctness",
     "11-26-overview-test-coverage",
     "11-26-windows-attention",
-    "11-26-overview-pre-merge-review"
+    "11-26-overview-pre-merge-review",
+    "11-27-tree-density",
+    "11-27-window-unfocus-white",
+    "11-27-tree-collapsed-bar"
   ],
   "parent": null,
   "relatedFiles": [],

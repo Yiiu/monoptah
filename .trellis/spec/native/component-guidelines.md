@@ -94,9 +94,10 @@ fill (`modal::surface`). Do not hand-roll a card.
   `tree_layout_reaches_settings_open_in_peek_and_by_shortcut`). When adding or replacing a
   layout, list the old header/footer/menu actions and map each one before shipping.
 - Tree and Focused hide the sidebar on collapse and open Peek from the window's left edge or
-  title-bar toggle. Tree lays out the pin beside Search, or in a separate header row when Search
-  is hidden. The `tree_shortcuts_hide_the_sidebar_and_allow_peek` regression checks the hidden
-  layout and Peek edge, and compares the widths of Today and Inbox with their docked widths.
+  title-bar toggle. Tree lays out the pin beside Search. When Search is hidden, the pin shares
+  the icon strip with Sidebar options. The `tree_shortcuts_hide_the_sidebar_and_allow_peek`
+  regression checks both pin positions, the Peek edge, and the docked and Peek widths of Today
+  and Inbox.
 - Hover needs an element id: GPUI keeps hover state per id, so a `.hover(..)` on a div without
   `.id(..)` only repaints when something else redraws the view (hover appears "sometimes").
 

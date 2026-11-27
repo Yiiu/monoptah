@@ -959,9 +959,10 @@ impl Shell {
                                     self.session_metadata(id, cx).summary,
                                     preview.data.as_ref(),
                                     self.agent_status(id),
+                                    false,
                                 )
                             },
-                            |view| view.read(cx).preview(self.agent_status(id)),
+                            |view| view.read(cx).preview(self.agent_status(id), false),
                         )),
                 )
                 .into_any_element(),

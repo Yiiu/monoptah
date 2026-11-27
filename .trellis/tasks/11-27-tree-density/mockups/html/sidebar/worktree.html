@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="zh" data-appearance="dark">
+<head>
+<meta charset="utf-8">
+<title>Tree sidebar · worktrees</title>
+<link rel="stylesheet" href="../tokens.css">
+<link rel="stylesheet" href="sidebar.css">
+<style>
+  .side { height: 560px; }
+  .wt-node { height: 25px; display: flex; align-items: center; gap: 6px; padding: 0 6px 0 18px; color: var(--content-70); border-radius: var(--radius); }
+  .wt-node .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sess.deep { padding-left: 38px; }
+  .sess.deep::before { left: 28px; }
+  .chip { flex-shrink: 0; max-width: 72px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; padding: 1px 4px; border-radius: 4px; background: var(--content-06); color: var(--content-50); }
+  .wt-label { height: 20px; display: flex; align-items: center; gap: 4px; padding: 0 6px 0 24px; margin-top: 4px; font-size: 11px; color: var(--content-35); }
+  .wt-label .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .wt-label .plus { opacity: 0; }
+  .wt-label.hover .plus { opacity: 1; color: var(--content-70); }
+</style>
+</head>
+<body>
+<nav class="side" aria-label="Tree sidebar worktrees">
+  <div class="sec">Projects<span class="tools"><span><ryugi-icon name="list-filter" size="13"></ryugi-icon></span><span><ryugi-icon name="plus" size="13"></ryugi-icon></span></span></div>
+  <div class="scroll" id="tree"></div>
+</nav>
+<script>
+  const variant = (window.ryugiProps && window.ryugiProps.variant) || 'label';
+  const main = [
+    ['claude', 'Improve tree UI usability', 'run', 'Run Bash'],
+    ['codex', 'Investigate Missing Contributors', '', ''],
+  ];
+  const worktrees = [
+    ['fix/agent-status-core', [
+      ['claude', '完善概览树体验与验证', '', ''],
+      ['codex', 'Stop stale Working status', 'unread', ''],
+    ]],
+    ['feat/tree-density', [
+      ['claude', 'Compress the Tree header', 'run', 'Edit render.rs'],
+    ]],
+  ];
+  const icon = (n, s = 12, cls = '') => `<ryugi-icon class="${cls}" name="${n}" size="${s}"></ryugi-icon>`;
+  const sess = ([p, t, state, step], opts = {}) => {
+    const meta = state === 'run' ? `<span class="meta run">${step}</span>` : state === 'unread' ? '<span class="udot"></span>' : '';
+    const chip = opts.chip ? `<span class="chip" title="${opts.chip}">${opts.chip}</span>` : '';
+    return `<div class="row sess ${opts.deep ? 'deep' : ''} ${state === 'unread' ? 'unread' : ''} ${opts.sel ? 'sel' : ''}"><span class="tile ${p} ${state === 'run' ? 'running' : ''}"></span><span class="name">${t}</span>${chip}${meta}</div>`;
+  };
+  let html = `<div class="row proj">${icon('chevron-down', 12, 'chev')}<span class="av" style="background:#4a3a14">${icon('cat', 13)}</span><span class="name">monoptah</span><span class="counts"><span style="color:var(--accent)">●2</span></span></div>`;
+  if (variant === 'node') {
+    html += `<div class="wt-node">${icon('chevron-down', 12)}${icon('git-branch', 12)}<span class="name">main</span></div>`;
+    main.forEach((s, i) => html += sess(s, { deep: true, sel: i === 0 }));
+    worktrees.forEach(([b, list]) => {
+      html += `<div class="wt-node">${icon('chevron-down', 12)}${icon('git-branch', 12)}<span class="name">${b}</span></div>`;
+      list.forEach((s) => html += sess(s, { deep: true }));
+    });
+  } else if (variant === 'chip') {
+    main.forEach((s, i) => html += sess(s, { sel: i === 0 }));
+    worktrees.forEach(([b, list]) => list.forEach((s) => html += sess(s, { chip: b.split('/').pop() })));
+  } else {
+    main.forEach((s, i) => html += sess(s, { sel: i === 0 }));
+    worktrees.forEach(([b, list], i) => {
+      html += `<div class="wt-label ${i === 0 ? 'hover' : ''}">${icon('git-branch', 11)}<span class="name">${b}</span>${icon('plus', 12, 'plus')}</div>`;
+      list.forEach((s) => html += sess(s));
+    });
+  }
+  html += `<div class="row proj">${icon('chevron-right', 12, 'chev')}<span class="av" style="background:#1d3a33">${icon('rabbit', 13)}</span><span class="name">old-streamer</span></div>`;
+  document.getElementById('tree').innerHTML = html;
+</script>
+</body>
+</html>

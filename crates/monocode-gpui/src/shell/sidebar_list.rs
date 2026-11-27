@@ -574,6 +574,10 @@ impl Shell {
 /// The navigation rows' trailing column: centred 7px in from the row's
 /// padding, on the same axis as the section headers' 24px icon buttons.
 const TRAILING_SLOT: f32 = 14.;
+const TREE_SEARCH_HEIGHT: f32 = 34.;
+const TREE_NAV_BUTTON_SIZE: f32 = 28.;
+const TREE_NAV_GAP: f32 = 4.;
+const TREE_NAV_BADGE_SIZE: f32 = 6.;
 
 impl Shell {
     pub(super) fn sidebar_options_menu_items(&self) -> Vec<MenuItem> {
@@ -640,8 +644,31 @@ impl Shell {
         }
         self.close_preview(cx);
         self.sidebar_list.remeasure();
+        if self.workspace.tree_layout() {
+            self.notify_sidebar(cx);
+        }
         self.persist(cx);
         cx.notify();
+    }
+
+    pub(super) fn sidebar_options_button(&self, cx: &Context<Self>) -> gpui::Stateful<gpui::Div> {
+        icon_button("sidebar-options", "Sidebar options", "more-horizontal")
+            .debug_selector(|| "sidebar-options".into())
+            .aria_expanded(self.menu_open(&MenuTarget::SidebarOptions))
+            .relative()
+            .child(self.sidebar_options_anchor.probe())
+            .on_click(cx.listener(|this, _, window, cx| {
+                if this.menu_open(&MenuTarget::SidebarOptions) {
+                    this.close_menu(cx);
+                } else {
+                    this.open_menu(
+                        MenuTarget::SidebarOptions,
+                        Anchor::Slot(this.sidebar_options_anchor.clone()),
+                        window,
+                        cx,
+                    );
+                }
+            }))
     }
 
     pub(super) fn sidebar_navigation(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -657,6 +684,205 @@ impl Shell {
                 .on_click(
                     cx.listener(|this, _, window, cx| this.toggle_primary_sidebar(window, cx)),
                 )
+        });
+        let search_shortcut = tree
+            .then(|| crate::settings::command_shortcut(&self.workspace.preferences, "App: Search"))
+            .flatten();
+        let search_tip: SharedString = search_shortcut
+            .as_ref()
+            .map_or_else(
+                || "Search".to_owned(),
+                |shortcut| format!("Search · {shortcut}"),
+            )
+            .into();
+        let items = [
+            ("Today", "clock"),
+            ("New", "square-plus"),
+            ("Inbox", "inbox"),
+            ("Notes", "note"),
+            ("Automations", "zap"),
+            ("Contributors", "chart-square"),
+        ]
+        .into_iter()
+        .filter(|(label, _)| match *label {
+            // Only the Focused layout lists New here.
+            "New" => focused,
+            "Today" => self.workspace.sidebar_today_visible,
+            "Notes" => self.workspace.preferences.notes && self.workspace.sidebar_notes_visible,
+            "Automations" => self.workspace.sidebar_automations_visible,
+            "Contributors" => self.workspace.sidebar_contributors_visible,
+            "Inbox" => self.workspace.sidebar_inbox_visible,
+            _ => true,
+        })
+        .map(|(label, glyph)| {
+            let glyph = if self.workspace.classic_layout && label == "Notes" {
+                "file"
+            } else {
+                glyph
+            };
+            let selected = if label == "New" {
+                blank_session
+            } else {
+                self.app_view_label() == Some(label)
+            };
+            let open_count = if label == "Today" {
+                self.today.as_ref().map_or(0, |t| t.read(cx).open_count())
+            } else {
+                0
+            };
+            let unread = label == "Inbox"
+                && self
+                    .inbox
+                    .as_ref()
+                    .is_some_and(|inbox| inbox.read(cx).unread_count() > 0);
+            let row = if tree {
+                let notes = if label == "Notes" {
+                    self.note_count.unwrap_or(0)
+                } else {
+                    0
+                };
+                let has_badge = open_count > 0 || notes > 0 || unread;
+                let detail = match label {
+                    "Today" if open_count > 0 => Some(format!("{open_count} open")),
+                    "Notes" if notes > 0 => Some(format!(
+                        "{notes} {}",
+                        if notes == 1 { "note" } else { "notes" }
+                    )),
+                    "Inbox" if unread => Some("new items".to_owned()),
+                    _ => None,
+                };
+                let tip = detail.clone().or_else(|| {
+                    (label == "New")
+                        .then(|| {
+                            crate::settings::command_shortcut(
+                                &self.workspace.preferences,
+                                "Tab: New",
+                            )
+                        })
+                        .flatten()
+                });
+                let tip: SharedString = tip
+                    .map_or_else(|| label.to_owned(), |tip| format!("{label} · {tip}"))
+                    .into();
+                icon_button(label, label, glyph)
+                    .debug_selector(move || format!("sidebar-navigation-{label}"))
+                    .aria_label(
+                        detail.map_or_else(
+                            || label.to_owned(),
+                            |detail| format!("{label}, {detail}"),
+                        ),
+                    )
+                    .aria_selected(selected)
+                    .relative()
+                    .size(px(TREE_NAV_BUTTON_SIZE))
+                    .when(selected, |d| d.bg(content(0.1)))
+                    .tooltip(move |_, cx| {
+                        cx.new(|_| crate::cloud_mark::CloudTip(tip.clone())).into()
+                    })
+                    .when(has_badge, |d| {
+                        d.child(
+                            div()
+                                .debug_selector(move || {
+                                    format!("sidebar-navigation-trailing-{label}")
+                                })
+                                .absolute()
+                                .top(px(3.))
+                                .right(px(3.))
+                                .size(px(TREE_NAV_BADGE_SIZE))
+                                .rounded_full()
+                                .bg(accent_color()),
+                        )
+                    })
+            } else {
+                div()
+                    .id(label)
+                    .debug_selector(move || format!("sidebar-navigation-{label}"))
+                    .role(Role::Button)
+                    .aria_label(if unread {
+                        "Inbox, new items".to_string()
+                    } else if open_count > 0 {
+                        format!("{label}, {open_count} open")
+                    } else {
+                        label.to_string()
+                    })
+                    .aria_selected(selected)
+                    .cursor_pointer()
+                    .group("rail-action")
+                    .h(px(32.))
+                    .px_2()
+                    .rounded_md()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_size(px(14.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(content(if selected || self.sidebar_hover == Some(label) {
+                        1.
+                    } else {
+                        0.5
+                    }))
+                    .when(selected, |d| d.bg(content(0.1)))
+                    .hover(|s| s.bg(content(0.1)).text_color(content(1.)))
+                    .child(icon(glyph, 16.).text_color(content(if selected { 0.7 } else { 0.35 })))
+                    .child(div().flex_1().child(label))
+                    .when_some(
+                        match label {
+                            "New" => Some(format!("{MOD}T").into_any_element()),
+                            "Today" if open_count > 0 => {
+                                Some(open_count.to_string().into_any_element())
+                            }
+                            "Notes" => self
+                                .note_count
+                                .map(|count| count.to_string().into_any_element()),
+                            "Inbox" if unread => Some(
+                                div()
+                                    .flex_shrink_0()
+                                    .size(px(if self.workspace.classic_layout {
+                                        8.
+                                    } else {
+                                        6.
+                                    }))
+                                    .rounded_full()
+                                    .bg(accent_color())
+                                    .into_any_element(),
+                            ),
+                            _ => None,
+                        },
+                        |row, trailing| {
+                            row.child(
+                                div()
+                                    .debug_selector(move || {
+                                        format!("sidebar-navigation-trailing-{label}")
+                                    })
+                                    .flex_shrink_0()
+                                    .flex()
+                                    .w(px(TRAILING_SLOT))
+                                    .justify_center()
+                                    .text_size(px(11.))
+                                    .font_weight(FontWeight::NORMAL)
+                                    .text_color(content(0.35))
+                                    .child(trailing),
+                            )
+                        },
+                    )
+            };
+            row.on_click(cx.listener(move |this, _, window, cx| match label {
+                "New" => this.new_chat(cx),
+                "Today" => this.open_today(window, cx),
+                "Inbox" => this.open_inbox(window, cx),
+                "Notes" => this.open_notes(window, cx),
+                "Automations" => this.open_automations(window, cx),
+                "Contributors" => this.open_contributors(None, None, window, cx),
+                _ => (),
+            }))
+            .on_hover(cx.listener(move |this, hovered, _, cx| {
+                if *hovered {
+                    this.sidebar_hover = Some(label);
+                } else if this.sidebar_hover == Some(label) {
+                    this.sidebar_hover = None;
+                }
+                this.notify_navigation(cx);
+            }))
         });
         div()
             .w_full()
@@ -693,9 +919,14 @@ impl Shell {
                             .group("rail-search")
                             .flex_1()
                             .min_w_0()
-                            .h(px(32.))
+                            .h(px(if tree { TREE_SEARCH_HEIGHT } else { 32. }))
                             .rounded_md()
-                            .when(tree, |d| d.px_2().bg(content(0.04)))
+                            .when(tree, |d| {
+                                d.px_2().bg(content(0.04)).tooltip(move |_, cx| {
+                                    cx.new(|_| crate::cloud_mark::CloudTip(search_tip.clone()))
+                                        .into()
+                                })
+                            })
                             .when(!tree, |d| {
                                 // Classic RailSearch's two-layer Tailwind shadow-sm.
                                 d.px_1p5()
@@ -736,169 +967,62 @@ impl Shell {
                                     .group_hover("rail-search", |s| s.text_color(content(0.7))),
                             )
                             .child(div().flex_1().min_w_0().h(px(20.)).child("Search"))
-                            .child(
-                                // The shortcut span sits outside the label's `font-medium`.
-                                div()
-                                    .debug_selector(|| "sidebar-search-hint".into())
-                                    .flex_shrink_0()
-                                    .text_size(px(11.))
-                                    .font_weight(FontWeight::NORMAL)
-                                    .text_color(content(if tree { 0.35 } else { 0.4 }))
-                                    .child(if tree || cfg!(target_os = "macos") {
+                            .when_some(
+                                if tree {
+                                    search_shortcut
+                                } else {
+                                    Some(if cfg!(target_os = "macos") {
                                         format!("{MOD}K")
                                     } else {
                                         "Ctrl K".into()
-                                    }),
+                                    })
+                                },
+                                |d, shortcut| {
+                                    d.child(
+                                        // The shortcut span sits outside the label's `font-medium`.
+                                        div()
+                                            .debug_selector(|| "sidebar-search-hint".into())
+                                            .flex_shrink_0()
+                                            .text_size(px(11.))
+                                            .font_weight(FontWeight::NORMAL)
+                                            .text_color(content(if tree { 0.35 } else { 0.4 }))
+                                            .child(shortcut),
+                                    )
+                                },
                             ),
                     )
                     .children(peek_pin.take()),
                 )
             })
-            .children(peek_pin.map(|pin| {
-                div()
-                    .h(px(32.))
-                    .flex()
-                    .items_center()
-                    .justify_end()
-                    .child(pin)
-            }))
-            .children(
-                [
-                    ("Today", "clock"),
-                    ("New", "square-plus"),
-                    ("Inbox", "inbox"),
-                    ("Notes", "note"),
-                    ("Automations", "zap"),
-                    ("Contributors", "chart-square"),
-                ]
-                .into_iter()
-                .filter(|(label, _)| match *label {
-                    // Only the Focused layout lists New here.
-                    "New" => focused,
-                    "Today" => self.workspace.sidebar_today_visible,
-                    "Notes" => {
-                        self.workspace.preferences.notes && self.workspace.sidebar_notes_visible
-                    }
-                    "Automations" => self.workspace.sidebar_automations_visible,
-                    "Contributors" => self.workspace.sidebar_contributors_visible,
-                    "Inbox" => self.workspace.sidebar_inbox_visible,
-                    _ => true,
-                })
-                .map(|(label, glyph)| {
-                    let glyph = if self.workspace.classic_layout && label == "Notes" {
-                        "file"
-                    } else {
-                        glyph
-                    };
-                    let selected = if label == "New" {
-                        blank_session
-                    } else {
-                        self.app_view_label() == Some(label)
-                    };
-                    let open_count = if label == "Today" {
-                        self.today.as_ref().map_or(0, |t| t.read(cx).open_count())
-                    } else {
-                        0
-                    };
-                    let unread = label == "Inbox"
-                        && self
-                            .inbox
-                            .as_ref()
-                            .is_some_and(|inbox| inbox.read(cx).unread_count() > 0);
-                    div()
-                        .id(label)
-                        .debug_selector(move || format!("sidebar-navigation-{label}"))
-                        .role(Role::Button)
-                        .aria_label(if unread {
-                            "Inbox, new items".to_string()
-                        } else if open_count > 0 {
-                            format!("{label}, {open_count} open")
-                        } else {
-                            label.to_string()
-                        })
-                        .aria_selected(selected)
-                        .cursor_pointer()
-                        .group("rail-action")
-                        .h(px(32.))
-                        .px_2()
-                        .rounded_md()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .text_size(px(14.))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(content(if selected || self.sidebar_hover == Some(label) {
-                            1.
-                        } else {
-                            0.5
-                        }))
-                        .when(selected, |d| d.bg(content(0.1)))
-                        .hover(|s| s.bg(content(0.1)).text_color(content(1.)))
-                        .child(icon(glyph, 16.).text_color(content(if selected {
-                            0.7
-                        } else {
-                            0.35
-                        })))
-                        .child(div().flex_1().child(label))
-                        .when_some(
-                            match label {
-                                "New" => Some(format!("{MOD}T").into_any_element()),
-                                "Today" if open_count > 0 => {
-                                    Some(open_count.to_string().into_any_element())
-                                }
-                                "Notes" => self
-                                    .note_count
-                                    .map(|count| count.to_string().into_any_element()),
-                                "Inbox" if unread => Some(
-                                    div()
-                                        .flex_shrink_0()
-                                        .size(px(if self.workspace.classic_layout {
-                                            8.
-                                        } else {
-                                            6.
-                                        }))
-                                        .rounded_full()
-                                        .bg(accent_color())
-                                        .into_any_element(),
-                                ),
-                                _ => None,
-                            },
-                            |row, trailing| {
-                                row.child(
-                                    div()
-                                        .debug_selector(move || {
-                                            format!("sidebar-navigation-trailing-{label}")
-                                        })
-                                        .flex_shrink_0()
-                                        .flex()
-                                        .when(tree, |d| d.min_w(px(TRAILING_SLOT)).justify_end())
-                                        .when(!tree, |d| d.w(px(TRAILING_SLOT)).justify_center())
-                                        .text_size(px(11.))
-                                        .font_weight(FontWeight::NORMAL)
-                                        .text_color(content(0.35))
-                                        .child(trailing),
-                                )
-                            },
-                        )
-                        .on_click(cx.listener(move |this, _, window, cx| match label {
-                            "New" => this.new_chat(cx),
-                            "Today" => this.open_today(window, cx),
-                            "Inbox" => this.open_inbox(window, cx),
-                            "Notes" => this.open_notes(window, cx),
-                            "Automations" => this.open_automations(window, cx),
-                            "Contributors" => this.open_contributors(None, None, window, cx),
-                            _ => (),
-                        }))
-                        .on_hover(cx.listener(move |this, hovered, _, cx| {
-                            if *hovered {
-                                this.sidebar_hover = Some(label);
-                            } else if this.sidebar_hover == Some(label) {
-                                this.sidebar_hover = None;
-                            }
-                            this.notify_navigation(cx);
-                        }))
-                }),
-            )
+            .map(|d| {
+                if tree {
+                    d.child(
+                        div()
+                            .id("tree-nav-strip")
+                            .debug_selector(|| "tree-nav-strip".into())
+                            .flex()
+                            .items_center()
+                            .gap(px(TREE_NAV_GAP))
+                            .child(
+                                div()
+                                    .id("tree-nav-items")
+                                    .flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_x_scroll()
+                                    .gap(px(TREE_NAV_GAP))
+                                    .children(items),
+                            )
+                            .children(peek_pin)
+                            .child(
+                                self.sidebar_options_button(cx)
+                                    .size(px(TREE_NAV_BUTTON_SIZE)),
+                            ),
+                    )
+                } else {
+                    d.children(items)
+                }
+            })
             .into_any()
     }
     /// The workspace shows an open session that has no messages yet.
@@ -1153,6 +1277,93 @@ mod tests {
             visual.simulate_click(options.center(), Default::default());
             visual.run_until_parked();
         }
+    }
+
+    #[gpui::test]
+    fn tree_navigation_is_a_strip_with_shared_sidebar_options(cx: &mut TestAppContext) {
+        use crate::workspace::NavigationLayout;
+        let (window, _, _) = super::super::tests::window(cx);
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.simulate_resize(gpui::size(px(1400.), px(905.)));
+        window
+            .update(visual, |shell, _, cx| {
+                cx.set_reduce_motion(true);
+                shell.set_navigation_layout(NavigationLayout::Tree, cx);
+                shell.note_count = Some(0);
+            })
+            .unwrap();
+        visual.refresh().unwrap();
+
+        let nav = visual.debug_bounds("tree-nav-strip").unwrap();
+        for (index, selector) in [
+            "sidebar-navigation-Today",
+            "sidebar-navigation-New",
+            "sidebar-navigation-Inbox",
+            "sidebar-navigation-Notes",
+            "sidebar-navigation-Automations",
+            "sidebar-navigation-Contributors",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let button = visual.debug_bounds(selector).unwrap();
+            assert_eq!(button.size, gpui::size(px(28.), px(28.)));
+            assert_eq!(button.top(), nav.top());
+            assert_eq!(button.left() - nav.left(), px(32. * index as f32));
+        }
+        assert_eq!(
+            visual
+                .debug_bounds("sidebar-search-field")
+                .unwrap()
+                .size
+                .height,
+            px(34.)
+        );
+        let sidebar = visual.debug_bounds("project-tree-sidebar").unwrap();
+        let heading = visual.debug_bounds("tree-projects-heading").unwrap();
+        assert!(heading.bottom() - sidebar.top() <= px(200.));
+        assert!(
+            visual
+                .debug_bounds("sidebar-navigation-trailing-Notes")
+                .is_none()
+        );
+
+        window
+            .update(visual, |shell, _, cx| {
+                shell.note_count = Some(3);
+                shell.notify_sidebar(cx);
+            })
+            .unwrap();
+        visual.refresh().unwrap();
+        assert_eq!(
+            visual
+                .debug_bounds("sidebar-navigation-trailing-Notes")
+                .unwrap()
+                .size,
+            gpui::size(px(6.), px(6.))
+        );
+
+        let options = visual.debug_bounds("sidebar-options").unwrap();
+        assert_eq!(options.top(), nav.top());
+        visual.simulate_click(options.center(), Default::default());
+        visual.run_until_parked();
+        let inbox = visual.debug_bounds("menu-action-sidebar-inbox").unwrap();
+        visual.simulate_click(inbox.center(), Default::default());
+        visual.run_until_parked();
+        assert!(visual.debug_bounds("sidebar-navigation-Inbox").is_none());
+        assert!(visual.debug_bounds("menu-action-sidebar-inbox").is_some());
+
+        window
+            .update(visual, |shell, _, cx| {
+                shell.close_menu(cx);
+                shell.set_navigation_layout(NavigationLayout::Focused, cx);
+                let saved = shell.latest_state.lock().unwrap().clone();
+                let restored = Workspace::restore(Some(&saved), &[], "/work/monocode");
+                assert!(!restored.sidebar_inbox_visible);
+            })
+            .unwrap();
+        visual.refresh().unwrap();
+        assert!(visual.debug_bounds("sidebar-navigation-Inbox").is_none());
     }
 
     #[gpui::test]

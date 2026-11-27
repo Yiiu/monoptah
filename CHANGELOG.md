@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The native Tree sidebar keeps navigation and Monos in compact rows, hides the empty Needs you section, and puts pinned projects first. Worktree rows show the current Git branch and reveal the full path on hover.
+
 ## [0.33.0] - 2026-10-24
 
 ### Added

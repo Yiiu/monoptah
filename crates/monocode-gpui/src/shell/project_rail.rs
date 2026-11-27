@@ -307,7 +307,7 @@ fn rail_shift_key(id: &str, kind: &RailDragKind) -> (RailDragKind, String) {
 pub(super) struct ProjectTooltip(pub(super) String);
 impl Render for ProjectTooltip {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div()
+        let tooltip = div()
             .px_2()
             .py_1()
             .rounded_md()
@@ -316,7 +316,13 @@ impl Render for ProjectTooltip {
             .border_color(content(0.15))
             .text_size(px(12.))
             .text_color(content(1.))
-            .child(self.0.clone())
+            .child(self.0.clone());
+        #[cfg(test)]
+        let tooltip = tooltip.debug_selector({
+            let text = self.0.clone();
+            move || format!("project-tooltip-{text}")
+        });
+        tooltip
     }
 }
 impl Shell {
@@ -1620,6 +1626,9 @@ impl Shell {
         }
         self.persist(cx);
         self.projects_frame.update(cx, |_, cx| cx.notify());
+        if self.workspace.tree_layout() {
+            self.notify_sidebar(cx);
+        }
     }
     pub(super) fn assign_project_rail_group(
         &mut self,
