@@ -3,9 +3,9 @@
 Parent: `11-25-agent-overview`。开工前请先读父任务的 `handoff.md`。这一项原本是第 1 期的 R6，当时用户决定暂缓，现在单独立项。
 
 研究和设计都已经做完，直接沿用：
-- 研究：`11-25-agent-status-core/research/windows-attention.md`
-- 设计：`11-25-agent-status-core/design.md` 第 7 节
-- 原执行计划：`11-25-agent-status-core/implement.md` 中的 PR-B。按父任务约定，本项**不单独开 PR**，在本分支完成后合回 PR #22。
+- 研究：`archive/2026-11/11-25-agent-status-core/research/windows-attention.md`
+- 设计：`archive/2026-11/11-25-agent-status-core/design.md` 第 7 节
+- 原执行计划：`archive/2026-11/11-25-agent-status-core/implement.md` 中的 PR-B。按父任务约定，本项**不单独开 PR**，在本分支完成后合回 PR #22。
 
 ## Goal
 
