@@ -7,7 +7,7 @@ impl Request {
             self.settings
                 .attachments
                 .iter()
-                .filter(|p| crate::composer::image_mime(p).is_some())
+                .filter(|p| crate::composer::attachment_image_mime(p).is_some())
                 .map(|p| json!({"type":"localImage","path":p})),
         );
         json!(blocks)
@@ -17,13 +17,13 @@ impl Request {
             .settings
             .attachments
             .iter()
-            .any(|p| crate::composer::image_mime(p).is_some())
+            .any(|p| crate::composer::attachment_image_mime(p).is_some())
         {
             return Ok(json!(prompt));
         }
         let mut blocks = vec![json!({"type":"text","text":prompt})];
         for path in &self.settings.attachments {
-            if let Some(mime) = crate::composer::image_mime(path) {
+            if let Some(mime) = crate::composer::attachment_image_mime(path) {
                 blocks.push(json!({"type":"image","source":{"type":"base64","media_type":mime,"data":crate::composer::image_data(path)?}}));
             }
         }
@@ -32,7 +32,7 @@ impl Request {
     pub(super) fn acp_content(&self) -> Result<Value, String> {
         let mut blocks = vec![json!({"type":"text","text":self.prompt})];
         for path in &self.settings.attachments {
-            if let Some(mime) = crate::composer::image_mime(path) {
+            if let Some(mime) = crate::composer::attachment_image_mime(path) {
                 blocks.push(json!({"type":"image","mimeType":mime,"data":crate::composer::image_data(path)?}));
             }
         }
@@ -41,7 +41,7 @@ impl Request {
     pub(super) fn pi_images(&self) -> Result<Value, String> {
         let mut blocks = Vec::new();
         for path in &self.settings.attachments {
-            if let Some(mime) = crate::composer::image_mime(path) {
+            if let Some(mime) = crate::composer::attachment_image_mime(path) {
                 blocks.push(json!({"type":"image","mimeType":mime,"data":crate::composer::image_data(path)?}));
             }
         }
@@ -78,5 +78,25 @@ mod tests {
         );
         assert_eq!(request.acp_content().unwrap()[1]["mimeType"], "image/png");
         assert_eq!(request.pi_images().unwrap()[0]["type"], "image");
+    }
+    #[test]
+    fn image_named_folders_are_not_sent_as_images() {
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("screenshots.png");
+        std::fs::create_dir(&folder).unwrap();
+        let mut request = Request {
+            kind: Kind::Claude,
+            binary: "unused".into(),
+            cwd: temp.path().into(),
+            prompt: "Look at this".into(),
+            provider_id: None,
+            model: None,
+            settings: Settings::default(),
+        };
+        request.settings.attachments.push(folder);
+        assert_eq!(request.codex_input().as_array().unwrap().len(), 1);
+        assert_eq!(request.claude_content("hello").unwrap(), json!("hello"));
+        assert_eq!(request.acp_content().unwrap().as_array().unwrap().len(), 1);
+        assert_eq!(request.pi_images().unwrap(), json!([]));
     }
 }

@@ -445,6 +445,12 @@ impl QuickComposer {
         if self.input.read(cx).is_composing() || !self.can_submit(cx) {
             return;
         }
+        if self.cwd.starts_with("remote://") && self.attachments.iter().any(|path| path.is_dir()) {
+            self.error =
+                Some("Remove folder references before sending to a remote project.".into());
+            cx.notify();
+            return;
+        }
         let new_worktree = self.workspace.new_worktree;
         let base = self
             .workspace
@@ -712,7 +718,8 @@ impl QuickComposer {
                 all.push(path);
             }
         }
-        match monocode_core::composer::validate_attachments(&all) {
+        let allow_folders = !self.cwd.starts_with("remote://");
+        match monocode_core::composer::validate_attachment_paths(&all, allow_folders) {
             Ok(()) => {
                 self.attachments = all;
                 self.error = None;
@@ -1104,7 +1111,7 @@ impl QuickComposer {
         let attachments = &self.attachments;
         self.photos.retain(|path, _| attachments.contains(path));
         for path in &self.attachments {
-            if let Some(mime) = monocode_core::composer::image_mime(path)
+            if let Some(mime) = monocode_core::composer::attachment_image_mime(path)
                 && !self.photos.contains_key(path)
             {
                 let origin = crate::transcript::attachments::Origin::Path(path.clone());
@@ -1878,7 +1885,7 @@ impl Render for QuickComposer {
         } else {
             gpui::rgba(0x1717178c).into()
         };
-        let mut root = div()
+        let root = div()
             .id("quick-composer")
             .key_context("QuickComposer")
             .w_full()
@@ -1926,7 +1933,27 @@ impl Render for QuickComposer {
                 this.dragging = false;
                 this.add_attachments(paths.paths().to_vec(), cx);
                 this.focus(window, cx);
-            }))
+            }));
+        let mut root = root
+            .when(!self.cwd.starts_with("remote://"), |target| {
+                crate::attachment_tray::bind_folder_drop(
+                    target,
+                    crate::attachment_tray::DropHooks {
+                        over: |this: &Self| this.dragging,
+                        set_over: |this, over, cx| {
+                            if this.dragging != over {
+                                this.dragging = over;
+                                cx.notify();
+                            }
+                        },
+                        drop: |this, paths, window, cx| {
+                            this.add_attachments(paths, cx);
+                            this.focus(window, cx);
+                        },
+                    },
+                    cx,
+                )
+            })
             .child(
                 // The window is exactly this card, so the native shadow and
                 // blur follow its rounded outline.
@@ -2300,6 +2327,32 @@ mod tests {
         assert_eq!(launch.worktree_cwd, None);
         assert!(launch.foreground);
         assert_eq!(launch.access, AccessMode::FullAccess);
+    }
+
+    #[gpui::test]
+    fn quick_composer_launches_with_a_local_folder_reference(cx: &mut TestAppContext) {
+        let window = open(cx);
+        let folder = std::env::temp_dir().join(format!(
+            "monoptah-folder-{}.png",
+            monocode_core::mono::new_id()
+        ));
+        std::fs::create_dir(&folder).unwrap();
+        let launched = std::rc::Rc::new(std::cell::RefCell::new(None));
+        window
+            .update(cx, |view, window, cx| {
+                let sink = launched.clone();
+                cx.subscribe_in(&cx.entity(), window, move |_, _, launch: &Launch, _, _| {
+                    *sink.borrow_mut() = Some(launch.clone());
+                })
+                .detach();
+                view.add_attachments(vec![folder.clone()], cx);
+                assert!(view.error.is_none());
+                view.launch(true, cx);
+            })
+            .unwrap();
+        let launch = launched.borrow_mut().take().expect("launched");
+        assert_eq!(launch.attachments.as_slice(), std::slice::from_ref(&folder));
+        std::fs::remove_dir(&folder).unwrap();
     }
 
     #[gpui::test]

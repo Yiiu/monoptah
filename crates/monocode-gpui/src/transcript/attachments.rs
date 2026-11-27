@@ -24,11 +24,12 @@ impl Attachment {
             .or_else(|| path.as_ref()?.file_name()?.to_str().map(str::to_owned))
             .unwrap_or_else(|| "Image".into());
         let mime = value["mimeType"].as_str().unwrap_or("").to_owned();
-        let image = value["kind"] == "image"
-            || mime.starts_with("image/")
-            || path
-                .as_ref()
-                .is_some_and(|path| monocode_core::composer::image_mime(path).is_some());
+        let image = mime != monocode_core::transcript::attachments::FOLDER_MIME
+            && (value["kind"] == "image"
+                || mime.starts_with("image/")
+                || path
+                    .as_ref()
+                    .is_some_and(|path| monocode_core::composer::image_mime(path).is_some()));
         let data = match value["data"].take() {
             serde_json::Value::String(data) if !data.is_empty() => Some(Arc::from(data)),
             _ => path
@@ -305,7 +306,10 @@ impl TranscriptView {
                         .rounded_md()
                         .bg(content(0.06))
                         .child(crate::file_icons::file_type_icon(
-                            &file.name, false, false, 16.,
+                            &file.name,
+                            file.mime == monocode_core::transcript::attachments::FOLDER_MIME,
+                            false,
+                            16.,
                         ))
                         .child(
                             div()

@@ -271,7 +271,7 @@ impl Conversation {
         let store = self.store.clone();
         let id = self.summary.id;
         let work = cx.background_executor().spawn(async move {
-            monocode_core::composer::validate_attachments(&checked_attachments)?;
+            monocode_core::composer::validate_attachment_paths(&checked_attachments, true)?;
             locked(&store)?.validate_edit_last_turn(id, &edit)?;
             let binding = match provider::rewind_last_turn(request, edit.provider_turn_id.as_deref()) {
                 Ok(binding)=>binding,

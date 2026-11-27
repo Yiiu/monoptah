@@ -1,7 +1,7 @@
 //! The pending-attachment row and drop highlight shared by the chat composer
 //! and the Today note composer: image thumbnails, file chips, the remove
 //! button, the "Attaching..." and error lines, the drop target and overlay.
-use crate::explorer::DraggedFile;
+use crate::explorer::{DraggedFile, DraggedFolder};
 use crate::theme::*;
 use crate::transcript::attachments::{Origin, Photo};
 use gpui::{
@@ -21,7 +21,7 @@ pub(crate) type Photos = HashMap<PathBuf, Entity<Photo>>;
 pub(crate) fn sync_photos(paths: &[PathBuf], photos: &mut Photos, cx: &mut App) {
     photos.retain(|path, _| paths.contains(path));
     for path in paths {
-        if let Some(mime) = monocode_core::composer::image_mime(path)
+        if let Some(mime) = monocode_core::composer::attachment_image_mime(path)
             && !photos.contains_key(path)
         {
             let photo = cx.new(|cx| Photo::new(Origin::Path(path.clone()), mime.into(), cx));
@@ -75,7 +75,7 @@ pub(crate) fn tray(spec: Tray<'_>, on_remove: OnRemove, on_open: OnOpen) -> Opti
                     .to_string_lossy()
                     .to_string();
                 let photo = spec.photos.get(path).cloned();
-                let image = monocode_core::composer::image_mime(path).is_some();
+                let image = monocode_core::composer::attachment_image_mime(path).is_some();
                 let on_remove = on_remove.clone();
                 let remove = div()
                     .id((ids.remove, ix))
@@ -251,6 +251,25 @@ pub(crate) fn bind_drop<T: 'static>(
 /// Shown when a drag carried no file (an image dragged out of a web page).
 pub(crate) const NO_FILE_DRAGGED: &str =
     "This drag did not provide a file. Save the image, then drag the saved file here.";
+
+pub(crate) fn bind_folder_drop<T: 'static>(
+    target: Stateful<Div>,
+    hooks: DropHooks<T>,
+    cx: &mut Context<T>,
+) -> Stateful<Div> {
+    target
+        .on_drag_move::<DraggedFolder>(cx.listener(
+            move |this, event: &gpui::DragMoveEvent<DraggedFolder>, _, cx| {
+                (hooks.set_over)(this, event.bounds.contains(&event.event.position), cx);
+            },
+        ))
+        .on_drop(
+            cx.listener(move |this, folder: &DraggedFolder, window, cx| {
+                (hooks.set_over)(this, false, cx);
+                (hooks.drop)(this, vec![folder.0.clone()], window, cx);
+            }),
+        )
+}
 
 /// What a paste brought: copied files, or (when there are none) images.
 pub(crate) enum Pasted {

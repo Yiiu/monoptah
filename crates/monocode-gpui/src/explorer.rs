@@ -50,27 +50,39 @@ pub(crate) struct DraggedFile(pub PathBuf);
 
 impl Render for DraggedFile {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        let name = self
-            .0
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        div()
-            .flex()
-            .items_center()
-            .gap_1p5()
-            .px_2()
-            .py_1p5()
-            .rounded_md()
-            .border_1()
-            .border_color(stroke())
-            .bg(pane_fill())
-            .text_size(px(12.))
-            .text_color(content(1.))
-            .child(file_type_icon(&name, false, false, 16.))
-            .child(div().max_w(px(240.)).truncate().child(name))
+        drag_label(&self.0, false)
     }
+}
+
+#[derive(Clone)]
+pub(crate) struct DraggedFolder(pub PathBuf);
+
+impl Render for DraggedFolder {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        drag_label(&self.0, true)
+    }
+}
+
+fn drag_label(path: &Path, folder: bool) -> impl IntoElement {
+    let name = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    div()
+        .flex()
+        .items_center()
+        .gap_1p5()
+        .px_2()
+        .py_1p5()
+        .rounded_md()
+        .border_1()
+        .border_color(stroke())
+        .bg(pane_fill())
+        .text_size(px(12.))
+        .text_color(content(1.))
+        .child(file_type_icon(&name, folder, false, 16.))
+        .child(div().max_w(px(240.)).truncate().child(name))
 }
 
 actions!(
@@ -1681,6 +1693,12 @@ impl Explorer {
                         d.on_drag(DraggedFile(PathBuf::from(&entry.path)), |file, _, _, cx| {
                             cx.new(|_| file.clone())
                         })
+                    })
+                    .when(is_dir && !self.cwd.starts_with("remote://"), |d| {
+                        d.on_drag(
+                            DraggedFolder(PathBuf::from(&entry.path)),
+                            |folder, _, _, cx| cx.new(|_| folder.clone()),
+                        )
                     })
                     .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
                     .on_click(cx.listener(move |this, _, window, cx| {
