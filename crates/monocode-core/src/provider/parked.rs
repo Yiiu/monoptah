@@ -55,6 +55,10 @@ pub(super) struct Wire {
     stderr_reader: Option<thread::JoinHandle<()>>,
     writer: Option<thread::JoinHandle<()>>,
     terminated: bool,
+    /// Our own handles to the child's stdio pipes, used only to cancel the pipe
+    /// threads' blocked I/O after the child is gone (see `retire_pipe_threads`).
+    #[cfg(windows)]
+    pipes: Vec<std::os::windows::io::OwnedHandle>,
     /// `process::session_epoch` when the turn took this process; it is parked
     /// for reuse only while that is unchanged (see `provider::retire_session`).
     pub epoch: u64,
@@ -95,6 +99,16 @@ impl Wire {
         let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
         let mut stdin = child.stdin.take().unwrap();
+        // Duplicates, not raw values: a raw handle closed by a finished thread
+        // could be reused by an unrelated object before it is cancelled.
+        #[cfg(windows)]
+        let pipes = {
+            use std::os::windows::io::AsHandle;
+            [stdin.as_handle(), stdout.as_handle(), stderr.as_handle()]
+                .into_iter()
+                .filter_map(|handle| handle.try_clone_to_owned().ok())
+                .collect()
+        };
         // Tauri's JSON-RPC transport has a 15s write deadline. A wedged child
         // must not leave a worker stuck forever in a full stdin pipe.
         let (writes, requests) = mpsc::channel::<WriteRequest>();
@@ -156,6 +170,8 @@ impl Wire {
             stderr_reader: Some(stderr_reader),
             writer: Some(writer),
             terminated: false,
+            #[cfg(windows)]
+            pipes,
             epoch: process::turn_epoch(),
             _registration: Some(registration),
             _account: Some(account),
@@ -202,22 +218,70 @@ impl Drop for Wire {
             drop(held);
         });
     }
-    #[cfg(not(unix))]
+    /// The child is ended before this returns. Its pipe threads are retired on
+    /// a background thread: a process the provider started can hold the
+    /// provider's pipes open after it is gone (see [`retire_pipe_threads`]).
+    #[cfg(windows)]
     fn drop(&mut self) {
         if !self.terminated {
             process::terminate(&mut self.child);
         }
         self.stdin.sender.take();
-        if let Some(writer) = self.writer.take() {
-            let _ = writer.join();
-        }
         // Disconnect before joining so a bounded stdout sender cannot deadlock.
         let (_, empty) = mpsc::channel();
         drop(std::mem::replace(&mut self.rx, empty));
-        if let Some(t) = self.reader.take() {
-            let _ = t.join();
+        let threads = [
+            self.writer.take(),
+            self.reader.take(),
+            self.stderr_reader.take(),
+        ];
+        let pipes = std::mem::take(&mut self.pipes);
+        thread::spawn(move || retire_pipe_threads(threads.into_iter().flatten().collect(), pipes));
+    }
+}
+
+/// How long the pipe threads of an ended child may take to see EOF by themselves.
+#[cfg(windows)]
+const PIPE_EOF_GRACE: Duration = Duration::from_secs(1);
+
+/// Windows passes every inheritable handle to a `CreateProcess` child, so a
+/// process the provider started (a dev server, a detached app) inherits the
+/// provider's stdio pipes. After the provider ends, that process keeps them
+/// open: a read never sees EOF and a write into a full pipe never returns.
+/// Give the threads a moment to finish, then cancel their blocked I/O so they
+/// and their pipe handles do not live as long as that process.
+///
+/// std opens our end of each child pipe for overlapped I/O and waits for it in
+/// an alertable sleep, which `CancelSynchronousIo` does not reach. `CancelIoEx`
+/// on a handle to the same pipe completes that I/O with an error, and the
+/// thread leaves its loop.
+#[cfg(windows)]
+fn retire_pipe_threads(
+    threads: Vec<thread::JoinHandle<()>>,
+    pipes: Vec<std::os::windows::io::OwnedHandle>,
+) {
+    use std::os::windows::io::AsRawHandle;
+    let settled = |threads: &[thread::JoinHandle<()>]| threads.iter().all(|t| t.is_finished());
+    let deadline = Instant::now() + PIPE_EOF_GRACE;
+    while !settled(&threads) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    // A cancel that arrives between two reads finds no I/O; retry until each
+    // thread is out of its loop.
+    for _ in 0..200 {
+        if settled(&threads) {
+            break;
         }
-        if let Some(t) = self.stderr_reader.take() {
+        for pipe in &pipes {
+            // SAFETY: `pipe` is an open handle this function owns.
+            unsafe {
+                windows_sys::Win32::System::IO::CancelIoEx(pipe.as_raw_handle(), std::ptr::null());
+            }
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    for t in threads {
+        if t.is_finished() {
             let _ = t.join();
         }
     }
@@ -632,6 +696,118 @@ fn invalidate_binding(binding: Binding) -> Vec<Parked> {
     remove_idle_entries(idle_pool(), |entry| {
         Binding::request(&entry.protocol.request) == binding
     })
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    const ROLE: &str = "MONOCODE_WIRE_DROP_TEST_ROLE";
+    const NAME: &str =
+        "provider::parked::windows_tests::drop_does_not_wait_for_a_grandchild_holding_the_pipes";
+
+    /// Ends the grandchild even when an assertion fails, so it cannot hold the
+    /// test runner's pipes for the rest of its sleep.
+    struct Kill(Option<u32>);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            if let Some(pid) = self.0 {
+                let _ = Command::new("taskkill")
+                    .args(["/PID", &pid.to_string(), "/T", "/F"])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+        }
+    }
+
+    fn this_test(role: &str) -> Command {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", NAME, "--nocapture"])
+            .env(ROLE, role);
+        command
+    }
+
+    /// Windows hands every inheritable handle to a `CreateProcess` child, so a
+    /// process the provider started (a dev server, a detached app) can keep the
+    /// provider's stdout open after the provider is gone. Retiring the wire must
+    /// not wait for that pipe to close, or the turn never ends.
+    #[test]
+    fn drop_does_not_wait_for_a_grandchild_holding_the_pipes() {
+        match std::env::var(ROLE).as_deref() {
+            Ok("grandchild") => {
+                thread::sleep(Duration::from_secs(60));
+                return;
+            }
+            Ok("provider") => {
+                // It must outlive this process; the test ends it by pid.
+                #[allow(clippy::zombie_processes)]
+                let grandchild = this_test("grandchild")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap();
+                // Serial libtest output (RUST_TEST_THREADS=1) leaves "test … ... "
+                // open on the line, so start a fresh one.
+                println!("\ngrandchild-pid:{}", grandchild.id());
+                return;
+            }
+            _ => {}
+        }
+        let request = Request {
+            kind: Kind::Codex,
+            binary: std::env::current_exe().unwrap(),
+            cwd: std::env::temp_dir(),
+            prompt: String::new(),
+            provider_id: None,
+            model: None,
+            settings: Settings::default(),
+        };
+        let mut command = this_test("provider");
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        process::isolate(&mut command);
+        let mut wire = Wire::spawn(&mut command, &request).unwrap();
+        let mut grandchild = Kill(None);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while grandchild.0.is_none() {
+            let line = wire
+                .rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("the provider reports its grandchild")
+                .unwrap();
+            grandchild.0 = String::from_utf8_lossy(&line)
+                .split("grandchild-pid:")
+                .nth(1)
+                .map(|pid| pid.trim().parse().unwrap());
+        }
+        while wire.child.try_wait().unwrap().is_none() {
+            assert!(Instant::now() < deadline, "the provider exits by itself");
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        let stderr_reader = wire.tail.clone();
+        let started = Instant::now();
+        drop(wire);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "dropping the wire waited {elapsed:?} for a pipe its grandchild holds"
+        );
+        // The stderr reader holds the other reference to the tail until it ends.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Arc::strong_count(&stderr_reader) > 1 {
+            assert!(
+                Instant::now() < deadline,
+                "the reader threads stay blocked on the inherited pipe"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
 }
 
 #[test]
