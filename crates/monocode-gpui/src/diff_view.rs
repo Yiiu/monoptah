@@ -74,7 +74,8 @@ impl DiffFile {
         }
     }
     fn same_content(&self, other: &DiffFile) -> bool {
-        Arc::ptr_eq(&self.blocks, &other.blocks)
+        (Arc::ptr_eq(&self.blocks, &other.blocks)
+            || (self.blocks.is_empty() && other.blocks.is_empty()))
             && self.label == other.label
             && self.binary == other.binary
             && self.too_large == other.too_large
@@ -121,6 +122,7 @@ struct Body {
     rows: Vec<Row>,
     columns: usize,
     digits: usize,
+    hunks: Vec<usize>,
 }
 fn build_body(file: &DiffFile, message: Option<String>, stageable: bool) -> Body {
     let mut rows = Vec::new();
@@ -174,7 +176,13 @@ fn build_body(file: &DiffFile, message: Option<String>, stageable: bool) -> Body
             }
         }
     }
+    let hunks = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(i, row)| matches!(row.kind, RowKind::Hunk(_)).then_some(i))
+        .collect();
     Body {
+        hunks,
         blocks: file.blocks.clone(),
         message,
         stageable,
@@ -287,6 +295,7 @@ pub(crate) struct DiffView {
     total: f32,
     /// Hunk rows in order: (file, row index when expanded).
     hunks: Vec<(usize, Option<usize>)>,
+    visible_hunks: Vec<(usize, usize)>,
     file_rows: Vec<usize>,
     max_columns: usize,
     number_width: f32,
@@ -340,6 +349,7 @@ impl DiffView {
             offsets: vec![0.],
             total: 0.,
             hunks: Vec::new(),
+            visible_hunks: Vec::new(),
             file_rows: Vec::new(),
             max_columns: 40,
             number_width: 36.,
@@ -368,12 +378,19 @@ impl DiffView {
 
     /// New file models. Folds a user made survive; files that appear open.
     pub(crate) fn set_files(&mut self, files: Vec<DiffFile>, cx: &mut Context<Self>) {
-        let unchanged = files.len() == self.files.len()
-            && files
+        let same_order = files.len() == self.files.len()
+            && files.iter().zip(&self.files).all(|(a, b)| a.id == b.id);
+        if same_order {
+            let changed: Vec<_> = files
                 .iter()
                 .zip(&self.files)
-                .all(|(a, b)| a.id == b.id && a.same_content(b));
-        if unchanged {
+                .enumerate()
+                .filter_map(|(i, (a, b))| (!a.same_content(b)).then_some(i))
+                .collect();
+            self.files = files;
+            if !changed.is_empty() {
+                self.replace_files(&changed, cx);
+            }
             return;
         }
         let ids: HashSet<SharedString> = files.iter().map(|f| f.id.clone()).collect();
@@ -410,7 +427,7 @@ impl DiffView {
         Some(match &row.kind {
             RowKind::File => RowKey(id, 0, 0, 0),
             RowKind::Line { block, line, .. } => RowKey(id, 1, *block, *line),
-            RowKind::Hunk(_) => RowKey(id, 2, ix, 0),
+            RowKind::Hunk(_) => RowKey(id, 2, ix - self.file_rows[row.file], 0),
             RowKind::Notice(_) => RowKey(id, 3, 0, 0),
         })
     }
@@ -454,11 +471,11 @@ impl DiffView {
                 height: FILE_HEADER,
             });
             let start = rows.len();
-            for (i, row) in body.rows.iter().enumerate() {
-                if matches!(row.kind, RowKind::Hunk(_)) {
-                    hunks.push((index, expanded.then_some(start + i)));
-                }
-            }
+            hunks.extend(
+                body.hunks
+                    .iter()
+                    .map(|&i| (index, expanded.then_some(start + i))),
+            );
             if expanded {
                 rows.extend(body.rows.iter().map(|row| Row {
                     file: index,
@@ -479,6 +496,7 @@ impl DiffView {
         self.offsets = offsets;
         self.total = at;
         self.hunks = hunks;
+        self.index_visible_hunks();
         self.file_rows = file_rows;
         self.max_columns = columns;
         self.number_width = (digits as f32 * 8. + 12.).max(36.);
@@ -487,7 +505,7 @@ impl DiffView {
         if self.pending.is_some() {
             self.apply_pending(cx);
         } else if let Some((key, offset)) = anchor {
-            let target = (0..self.rows.len()).find(|&i| self.row_key(i).as_ref() == Some(&key));
+            let target = self.find_row(&key);
             let target = target.or_else(|| self.by_id.get(&key.0).map(|&f| self.file_rows[f]));
             if let Some(item_ix) = target {
                 let offset_in_item = if self.row_key(item_ix).as_ref() == Some(&key) {
@@ -504,6 +522,117 @@ impl DiffView {
         self.clamp_scroll_x();
         cx.notify();
     }
+    fn replace_files(&mut self, changed: &[usize], cx: &mut Context<Self>) {
+        let top = self.list.logical_scroll_top();
+        let anchor = self.row_key(top.item_ix);
+        let mut remaining = changed.len();
+        while remaining > 0 {
+            let mut first = remaining - 1;
+            while first > 0 && changed[first - 1] + 1 == changed[first] {
+                first -= 1;
+            }
+            let first_file = changed[first];
+            let last_file = changed[remaining - 1];
+            let start = self.file_rows[first_file];
+            let end = self
+                .file_rows
+                .get(last_file + 1)
+                .copied()
+                .unwrap_or(self.rows.len());
+            let mut rows = Vec::new();
+            for index in first_file..=last_file {
+                let file = &self.files[index];
+                let body = build_body(file, file.message(), file.can_stage_hunk);
+                self.file_rows[index] = start + rows.len();
+                rows.push(Row {
+                    file: index,
+                    kind: RowKind::File,
+                    height: FILE_HEADER,
+                });
+                if self.open.contains(&file.id) {
+                    rows.extend(body.rows.iter().map(|row| Row {
+                        file: index,
+                        ..row.clone()
+                    }));
+                }
+                self.bodies.insert(file.id.clone(), body);
+            }
+            let count = rows.len();
+            let delta = count as isize - (end - start) as isize;
+            let mut offset = self.offsets[start];
+            let offsets: Vec<_> = rows
+                .iter()
+                .map(|row| {
+                    let at = offset;
+                    offset += row.height;
+                    at
+                })
+                .collect();
+            let height_delta = offset - self.offsets[end];
+            self.rows.splice(start..end, rows);
+            self.offsets.splice(start..end, offsets);
+            if height_delta != 0. {
+                for offset in &mut self.offsets[start + count..] {
+                    *offset += height_delta;
+                }
+            }
+            for row in &mut self.file_rows[last_file + 1..] {
+                *row = row.checked_add_signed(delta).unwrap();
+            }
+            self.list.splice(start..end, count);
+            remaining = first;
+        }
+        self.total = *self.offsets.last().unwrap_or(&0.);
+        self.hunks.clear();
+        let (mut columns, mut digits) = (40, 3);
+        for (index, file) in self.files.iter().enumerate() {
+            let body = &self.bodies[&file.id];
+            let open = self.open.contains(&file.id);
+            self.hunks.extend(
+                body.hunks
+                    .iter()
+                    .map(|&row| (index, open.then_some(self.file_rows[index] + 1 + row))),
+            );
+            if open {
+                columns = columns.max(body.columns);
+                digits = digits.max(body.digits);
+            }
+        }
+        self.index_visible_hunks();
+        self.max_columns = columns;
+        self.number_width = (digits as f32 * 8. + 12.).max(36.);
+        self.hovered = None;
+        if self.pending.is_some() {
+            self.apply_pending(cx);
+        } else if let Some(key) = anchor {
+            let target = self.find_row(&key);
+            if let Some(row) = target.or_else(|| self.by_id.get(&key.0).map(|&f| self.file_rows[f]))
+            {
+                self.list.scroll_to(ListOffset {
+                    item_ix: row,
+                    offset_in_item: if target.is_some() {
+                        top.offset_in_item
+                    } else {
+                        px(0.)
+                    },
+                });
+            }
+        }
+        self.clamp_scroll_x();
+        cx.notify();
+    }
+
+    fn find_row(&self, key: &RowKey) -> Option<usize> {
+        let &file = self.by_id.get(&key.0)?;
+        let start = self.file_rows[file];
+        let end = self
+            .file_rows
+            .get(file + 1)
+            .copied()
+            .unwrap_or(self.rows.len());
+        (start..end).find(|&i| self.row_key(i).as_ref() == Some(key))
+    }
+
     /// A jump holds until its file has loaded, then lets go.
     fn apply_pending(&mut self, cx: &mut Context<Self>) {
         let Some(file) = self.pending else {
@@ -629,20 +758,23 @@ impl DiffView {
             }))
             .into_any_element()
     }
+    fn index_visible_hunks(&mut self) {
+        self.visible_hunks = self
+            .hunks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (_, row))| row.map(|row| (i, row)))
+            .collect();
+    }
     /// currentHunkIndex.
     fn current_hunk(&self) -> Option<usize> {
-        let top = self.top_px() + FILE_HEADER + 8.;
-        let mut found = None;
-        let mut first = None;
-        for (index, (_, row)) in self.hunks.iter().enumerate() {
-            let Some(row) = row else { continue };
-            first.get_or_insert(index);
-            if self.offsets[*row] > top + 0.5 {
-                break;
-            }
-            found = Some(index);
-        }
-        found.or(first)
+        let top = self.top_px() + FILE_HEADER + 8.5;
+        let at = self
+            .visible_hunks
+            .partition_point(|(_, row)| self.offsets[*row] <= top);
+        self.visible_hunks
+            .get(at.saturating_sub(1))
+            .map(|(i, _)| *i)
     }
     fn navigate(&mut self, direction: isize, cx: &mut Context<Self>) {
         if self.hunks.is_empty() {
@@ -1740,6 +1872,65 @@ impl Render for DiffView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[gpui::test]
+    fn streaming_an_earlier_file_keeps_the_visible_hunk_anchor(cx: &mut gpui::TestAppContext) {
+        let view = cx.new(DiffView::new);
+        view.update(cx, |view, cx| {
+            let second = file("b", "", "two\n");
+            view.set_files(vec![file("a", "", "one\n"), second.clone()], cx);
+            let hunk = view.file_rows[1] + 1;
+            assert!(matches!(view.rows[hunk].kind, RowKind::Hunk(_)));
+            view.list.scroll_to(ListOffset {
+                item_ix: hunk,
+                offset_in_item: px(7.),
+            });
+            view.set_files(vec![file("a", "", &"more\n".repeat(30)), second], cx);
+            let top = view.list.logical_scroll_top();
+            assert_eq!(top.item_ix, view.file_rows[1] + 1);
+            assert_eq!(top.offset_in_item, px(7.));
+        });
+    }
+
+    #[gpui::test]
+    fn streamed_ranges_match_a_full_rebuild_after_folding(cx: &mut gpui::TestAppContext) {
+        let view = cx.new(DiffView::new);
+        let reference = cx.new(DiffView::new);
+        let text = "line\n".repeat(30);
+        let mut files: Vec<_> = (0..8)
+            .map(|i| file(&format!("{i}.rs"), "", &text))
+            .collect();
+        view.update(cx, |view, cx| {
+            view.set_files(files.clone(), cx);
+            view.toggle(2, cx);
+        });
+        for size in [1, 55, 0] {
+            files[1] = file("1.rs", "", &"changed\n".repeat(size));
+            files[2] = file("2.rs", "", &"folded\n".repeat(size));
+            files[4] = file("4.rs", "", &"later\n".repeat(size));
+            view.update(cx, |view, cx| view.set_files(files.clone(), cx));
+            reference.update(cx, |view, cx| {
+                view.files.clear();
+                view.set_files(files.clone(), cx);
+                view.open.remove(&files[2].id);
+                view.rebuild(cx);
+            });
+            cx.update(|cx| {
+                let actual = view.read(cx);
+                let expected = reference.read(cx);
+                assert_eq!(actual.file_rows, expected.file_rows);
+                assert_eq!(actual.offsets, expected.offsets);
+                assert_eq!(actual.hunks, expected.hunks);
+                assert_eq!(actual.visible_hunks, expected.visible_hunks);
+                assert_eq!(actual.max_columns, expected.max_columns);
+                assert_eq!(actual.number_width, expected.number_width);
+                assert_eq!(actual.list.item_count(), expected.list.item_count());
+                assert!(actual.rows.iter().zip(&expected.rows).all(|(a, b)| {
+                    a.file == b.file && a.kind == b.kind && a.height == b.height
+                }));
+            });
+        }
+    }
+
     #[gpui::test]
     fn review_overview_has_no_change_markers_and_supports_scrolling_and_dragging(
         cx: &mut gpui::TestAppContext,
