@@ -749,7 +749,9 @@ mod windows_tests {
                     .stderr(Stdio::null())
                     .spawn()
                     .unwrap();
-                println!("grandchild-pid:{}", grandchild.id());
+                // Serial libtest output (RUST_TEST_THREADS=1) leaves "test … ... "
+                // open on the line, so start a fresh one.
+                println!("\ngrandchild-pid:{}", grandchild.id());
                 return;
             }
             _ => {}
@@ -779,9 +781,9 @@ mod windows_tests {
                 .expect("the provider reports its grandchild")
                 .unwrap();
             grandchild.0 = String::from_utf8_lossy(&line)
-                .trim()
-                .strip_prefix("grandchild-pid:")
-                .map(|pid| pid.parse().unwrap());
+                .split("grandchild-pid:")
+                .nth(1)
+                .map(|pid| pid.trim().parse().unwrap());
         }
         while wire.child.try_wait().unwrap().is_none() {
             assert!(Instant::now() < deadline, "the provider exits by itself");
