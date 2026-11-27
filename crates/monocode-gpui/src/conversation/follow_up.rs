@@ -1090,14 +1090,13 @@ mod tests {
     #[gpui::test]
     fn worktree_failure_belongs_to_the_sendable_message(cx: &mut TestAppContext) {
         let window = conversation(cx);
-        let project = tempfile::tempdir().unwrap();
+        let missing_project = std::env::temp_dir().join(format!(
+            "monoptah-missing-repo-{}",
+            monocode_core::mono::new_id()
+        ));
         window
             .update(cx, |view, _, cx| {
-                view.summary.cwd = project
-                    .path()
-                    .join("missing-repo")
-                    .to_string_lossy()
-                    .into_owned();
+                view.summary.cwd = missing_project.to_string_lossy().into_owned();
                 view.settings.new_worktree = true;
                 view.follow_ups.state.messages.extend([
                     Message {
