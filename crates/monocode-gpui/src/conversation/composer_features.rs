@@ -344,7 +344,8 @@ impl Conversation {
         let start = rows.iter().rposition(|row| row.role == "user").unwrap_or(0);
         let text = monocode_core::response::prose(&rows[start..]);
         (
-            self.status == "Ready",
+            self.status == "Ready"
+                || self.agent_outcome == Some(monocode_core::agent_status::Outcome::Completed),
             monocode_core::response::limit(&format!("{}\n{}", self.status, text), 12_000),
         )
     }

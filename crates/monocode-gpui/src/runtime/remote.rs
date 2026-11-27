@@ -40,6 +40,7 @@ fn update(status: impl Into<String>, finished: bool) -> Update {
         handoff: None,
         status: status.into(),
         finished,
+        reply_pending: false,
     }
 }
 /// A terminal update that only carries an error message.

@@ -239,7 +239,7 @@ impl Conversation {
         let preview = self.load_history_preview(cx);
         let work = cx.background_executor().spawn(async move {
             preview.await;
-            let (history, turns, before) = {
+            let (mut history, turns, before) = {
                 let store = locked(&store)?;
                 (
                     store.load(id)?,
@@ -247,6 +247,7 @@ impl Conversation {
                     store.history_before(id)?,
                 )
             };
+            crate::runtime::recovery::show_pending(&store, id, &mut history.rows);
             Ok::<_, String>((
                 crate::transcript::PreparedHistory::at(history.rows, mono, anchor),
                 turns,

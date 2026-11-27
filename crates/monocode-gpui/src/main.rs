@@ -522,6 +522,7 @@ fn main() {
             Default::default()
         });
     let db = Arc::new(Mutex::new(db));
+    runtime::recovery::recover_journals(&db);
     // GPUI reports frame stalls through `log`; keep warnings where a Finder launch can't lose them.
     #[cfg(target_os = "macos")]
     native_log::install(&database.with_file_name("gpui-hangs"));

@@ -1292,6 +1292,41 @@ impl Store {
         }
     }
 
+    pub(super) fn shared_reply_recovery_baseline(
+        &self,
+        id: i64,
+    ) -> Result<Option<Transcript>, String> {
+        let tx = sql(self.conn.unchecked_transaction())?;
+        let original = self.persisted_session_id(id)?;
+        let mode = native_chunks::session_storage_mode(&self.conn, &original)
+            .map_err(|error| error.to_string())?;
+        let shared = self.shared.as_ref().unwrap();
+        if shared.storage_modes.borrow().get(&id) != Some(&mode) {
+            return Ok(None);
+        }
+        let matches = match mode {
+            native_chunks::StorageMode::Blob => {
+                let current = self.shared_blocks(id)?;
+                shared
+                    .snapshots
+                    .borrow()
+                    .get(&id)
+                    .is_some_and(|seen| seen.matches(&current))
+            }
+            native_chunks::StorageMode::NativeChunks { .. } => {
+                let current = native_chunks::session_revision(&self.conn, &original)
+                    .map_err(|error| error.to_string())?;
+                current.is_some() && shared.native_revisions.borrow().get(&id).copied() == current
+            }
+        };
+        if !matches {
+            return Ok(None);
+        }
+        let transcript = self.shared_load(id)?;
+        sql(tx.commit())?;
+        Ok(Some(transcript))
+    }
+
     pub(super) fn shared_load(&self, id: i64) -> Result<Transcript, String> {
         let tx = if self.conn.is_autocommit() {
             Some(sql(self.conn.unchecked_transaction())?)

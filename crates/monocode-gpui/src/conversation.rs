@@ -1049,6 +1049,7 @@ impl Conversation {
                             )?;
                         }
                     }
+                    crate::runtime::recovery::show_pending(&store, id, &mut history.rows);
                     let edits = if mono {
                         Vec::new()
                     } else {
@@ -2020,7 +2021,7 @@ impl Conversation {
                             use monocode_core::agent_status::Outcome;
                             this.agent_outcome = Some(if stopping || this.notification_cancelled {
                                 Outcome::Interrupted
-                            } else if this.status == "Ready" {
+                            } else if this.status == "Ready" || update.reply_pending {
                                 Outcome::Completed
                             } else {
                                 Outcome::Failed

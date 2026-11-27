@@ -179,6 +179,55 @@ impl PendingSave {
         Ok(())
     }
 
+    pub(super) fn flush_final(
+        &mut self,
+        store: &Database,
+        session: i64,
+        transcript: &Transcript,
+        context: &monocode_core::context::Usage,
+    ) -> (Result<(), String>, bool) {
+        let result = self.flush(
+            store,
+            session,
+            transcript,
+            context,
+            SaveReason::Final,
+            Instant::now(),
+        );
+        let Err(error) = result else {
+            return (result, false);
+        };
+        let ranges = self.pending_ranges(transcript);
+        if !ranges
+            .iter()
+            .flat_map(|(_, rows)| rows.iter())
+            .any(|row| row.role == "assistant" && !row.text.is_empty())
+        {
+            return (Err(error), false);
+        }
+        match recovery::retain(store, session, &transcript.rows, &ranges) {
+            Ok(Some(true)) => (
+                Err(format!(
+                    "{error} · The reply is kept and will be saved again."
+                )),
+                true,
+            ),
+            Ok(Some(false)) => (
+                Err(format!(
+                    "{error} · The reply is kept in memory and will be saved again. Keep the app open until it saves."
+                )),
+                true,
+            ),
+            Ok(None) => (Err(error), false),
+            Err(recovery) => (
+                Err(format!(
+                    "{error} · Could not preserve the reply: {recovery}"
+                )),
+                false,
+            ),
+        }
+    }
+
     pub(super) fn accept(
         &mut self,
         store: &Database,
@@ -450,6 +499,7 @@ mod persistence_safety_tests {
             handoff: None,
             status: "Streaming".into(),
             finished: false,
+            reply_pending: false,
         }
     }
 
