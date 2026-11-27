@@ -1,0 +1,29 @@
+{
+  "id": "agent-settings-redesign",
+  "name": "agent-settings-redesign",
+  "title": "Redesign the Agent CLIs settings section",
+  "description": "Rebuild the native Agent CLIs settings section on Orca's model: expandable per-agent rows with command, model, effort, permission, args and env, global defaults, and auto-save.",
+  "status": "completed",
+  "dev_type": null,
+  "scope": null,
+  "package": null,
+  "priority": "P2",
+  "creator": "Yiiu",
+  "assignee": "Yiiu",
+  "createdAt": "2026-11-24",
+  "completedAt": "2026-11-27",
+  "branch": "feat/agent-settings-redesign",
+  "base_branch": "main",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [
+    "11-24-agent-config-core",
+    "11-24-agent-settings-page"
+  ],
+  "parent": null,
+  "relatedFiles": [],
+  "notes": "",
+  "meta": {}
+}

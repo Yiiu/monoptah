@@ -1,0 +1,6 @@
+{"file": ".trellis/spec/core/processes-and-platforms.md", "reason": "复用本地 provider 进程隔离、取消和回收机制。"}
+{"file": ".trellis/spec/core/persistence-and-compat.md", "reason": "保护队列接收凭据、共享 SQLite 格式和历史写入的一致性。"}
+{"file": ".trellis/spec/native/state-and-async.md", "reason": "在现有 Conversation 异步状态与持久化回调内闭合追问和停止路径。"}
+{"file": ".trellis/tasks/11-26-native-session-steer-recovery/research/session-controls-comparison.md", "reason": "核对同类工具的恢复边界和现场版本的 Codex 消息关联协议。"}
+{"file": ".trellis/tasks/11-26-native-session-steer-recovery/research/orca-follow-up-recovery.md", "reason": "参考 Orca 的发送确认、断线核对和仅收尾对应会话的实现。"}
+{"file": ".trellis/tasks/11-26-native-session-steer-recovery/research/t3-code-session-controls.md", "reason": "核对队列顺序、按目标回合停止和待确认追问的恢复方式。"}
