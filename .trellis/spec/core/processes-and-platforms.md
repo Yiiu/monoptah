@@ -124,8 +124,31 @@ worker thread, never in a GPUI render/input handler (`provider.rs` header).
   lock access during a blocked destructor.
 - **Lock lifetime** — Removing an entry with `pool.retain(...)` drops it under
   the guard. Use `remove_idle_entries` to move out owned entries and release the
-  shared locks before dropping them. On Windows the destructor can wait for
-  the child and its pipe threads.
+  shared locks before dropping them. On Windows the destructor waits for the
+  child to end (`taskkill /T /F`), but not for its pipe threads.
+
+### Windows pipe threads of a retired provider
+
+- **Scope** — Windows passes every inheritable handle to a `CreateProcess`
+  child. A process the provider started (a dev server, an app launched with
+  `--detach`) inherits the provider's stdio pipes and keeps them open after
+  the provider ends, so a reader never sees EOF.
+- **Contract** — `impl Drop for Wire` on Windows terminates the child, then
+  hands the writer and reader threads to `retire_pipe_threads` on a new thread.
+  That waits `PIPE_EOF_GRACE`, then calls `CancelIoEx` on duplicates of the
+  pipe handles taken at spawn (std waits for overlapped pipe I/O in an
+  alertable sleep, which `CancelSynchronousIo` does not reach), and joins only
+  finished threads. The dropping thread (a turn
+  worker when no idle agent is kept, or the pool reaper) never waits for EOF.
+- **Why** — With `idle_agents = 0` the turn worker drops the wire itself. A
+  blocking join there kept the session busy until the inheriting process
+  exited, and queued follow-ups were never sent.
+- **Regression check** —
+  `provider::parked::windows_tests::drop_does_not_wait_for_a_grandchild_holding_the_pipes`.
+- **Known gap** — A provider that exits mid-turn while such a process holds its
+  stdout is not detected: the turn loop waits for `Disconnected`. Child exit
+  alone is not a safe signal, because some launchers exit while the real
+  provider keeps the pipe.
 
 ## Platform differences you must handle
 
