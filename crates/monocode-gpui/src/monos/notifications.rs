@@ -4,15 +4,12 @@ use super::*;
 pub(crate) struct NotificationChanged;
 impl EventEmitter<NotificationChanged> for Monos {}
 
-/// Capture before dispatch starts another queued turn or a finished run is
-/// removed. Consumers need no live entity borrow to deliver this completion.
-pub(crate) struct NotificationFinished {
+/// The habit's final state, available after removing its live conversation.
+pub(crate) struct HabitFinished {
     pub summary: Session,
-    pub body: String,
-    pub habit: bool,
-    pub was_cancelled: bool,
+    pub outcome: monocode_core::agent_status::Outcome,
 }
-impl EventEmitter<NotificationFinished> for Monos {}
+impl EventEmitter<HabitFinished> for Monos {}
 
 /// A Mono wrote to its chat on its own, as a habit's or heartbeat's report.
 /// Its main chat session and what it said, for paired phones.

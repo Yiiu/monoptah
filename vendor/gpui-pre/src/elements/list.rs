@@ -520,6 +520,15 @@ impl ListState {
         self.splice_focusable(old_range, (0..count).map(|_| None))
     }
 
+    /// Splice new items with a height estimate until they are first measured.
+    pub fn splice_with_height_hint(&self, old_range: Range<usize>, count: usize, height: Pixels) {
+        self.splice_focusable_with_hint(
+            old_range,
+            (0..count).map(|_| None),
+            Some(size(px(0.), height)),
+        );
+    }
+
     /// Register with the list state that the items in `old_range` have been replaced
     /// by new items. As opposed to [`Self::splice`], this method allows an iterator of optional focus handles
     /// to be supplied to properly integrate with items in the list that can be focused. If a focused item
@@ -528,6 +537,15 @@ impl ListState {
         &self,
         old_range: Range<usize>,
         focus_handles: impl IntoIterator<Item = Option<FocusHandle>>,
+    ) {
+        self.splice_focusable_with_hint(old_range, focus_handles, None);
+    }
+
+    fn splice_focusable_with_hint(
+        &self,
+        old_range: Range<usize>,
+        focus_handles: impl IntoIterator<Item = Option<FocusHandle>>,
+        size_hint: Option<Size<Pixels>>,
     ) {
         let state = &mut *self.0.borrow_mut();
 
@@ -540,7 +558,7 @@ impl ListState {
             focus_handles.into_iter().map(|focus_handle| {
                 spliced_count += 1;
                 ListItem::Unmeasured {
-                    size_hint: None,
+                    size_hint,
                     focus_handle,
                 }
             }),
@@ -752,6 +770,25 @@ impl ListState {
             }
         }
         None
+    }
+
+    /// Get the measured or estimated bounds of an item, even outside the viewport.
+    /// Items without a measurement or size hint have no estimated bounds.
+    pub fn estimated_bounds_for_item(&self, ix: usize) -> Option<Bounds<Pixels>> {
+        let state = self.0.borrow();
+        let viewport = state.last_layout_bounds?;
+        let scroll_top = state.scroll_top(&state.logical_scroll_top());
+        let mut cursor = state.items.cursor::<Dimensions<Count, Height>>(());
+        cursor.seek(&Count(ix), Bias::Right);
+        let &Dimensions(Count(index), Height(top), _) = cursor.start();
+        let item = cursor.item()?.size_hint()?;
+        if index != ix {
+            return None;
+        }
+        Some(Bounds::new(
+            point(viewport.left(), viewport.top() + top - scroll_top),
+            size(viewport.size.width, item.height),
+        ))
     }
 
     /// Call this method when the user starts dragging the scrollbar.

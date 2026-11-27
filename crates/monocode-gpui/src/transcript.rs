@@ -15,6 +15,7 @@ mod follow_tests;
 pub(crate) mod git_turns;
 mod goal;
 mod history;
+mod mono_decisions;
 pub(crate) use history::{HistoryPager, PreparedHistory};
 mod links;
 mod live_phase;
@@ -53,7 +54,7 @@ use monocode_core::tool::{ToolCall, ToolState, tasks::Panel};
 use monocode_core::transcript::Row;
 use monocode_core::user_links::{UserMessageLink, parse_user_message_link};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     sync::Arc,
     time::Instant,
 };
@@ -700,6 +701,66 @@ impl PhaseLayout {
     }
 }
 
+#[derive(Default)]
+struct LiveTurnRows {
+    prompts: BTreeSet<usize>,
+    tools: BTreeSet<usize>,
+    epoch: u64,
+}
+
+impl LiveTurnRows {
+    fn update(&mut self, at: usize, row: &Row) {
+        if row.first && row.is_prompt() {
+            self.prompts.insert(at);
+        } else {
+            self.prompts.remove(&at);
+        }
+        if row.first && row.role == "tool" {
+            self.tools.insert(at);
+        } else {
+            self.tools.remove(&at);
+        }
+    }
+
+    fn reset(&mut self) {
+        self.prompts.clear();
+        self.tools.clear();
+        self.epoch = self.epoch.wrapping_add(1);
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct LiveStep {
+    source: Option<(u64, usize)>,
+    id_prefix: Option<String>,
+    label: Option<String>,
+    tool: Option<ToolCall>,
+    cwd: String,
+    next_refresh: u64,
+    #[cfg(test)]
+    parses: usize,
+}
+
+impl LiveStep {
+    fn refresh_label(&mut self, cwd: &str, now: u64) {
+        self.cwd.clear();
+        self.cwd.push_str(cwd);
+        self.next_refresh = now.saturating_add(15_000);
+        self.label = self
+            .tool
+            .as_ref()
+            .map(|tool| {
+                let shown = tool.presentation_in(Some(cwd));
+                [shown.action, shown.target]
+                    .into_iter()
+                    .filter(|part| !part.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .filter(|label| !label.is_empty());
+    }
+}
+
 pub(crate) struct TranscriptView {
     selection: selection::Selection,
     selection_focus: Option<gpui::FocusHandle>,
@@ -707,6 +768,7 @@ pub(crate) struct TranscriptView {
     work_item_cards: user_links::Cards,
     source: Vec<Row>,
     source_bytes: usize,
+    live_turn_rows: LiveTurnRows,
     /// Panel classifications from the first row of a tool message.
     tool_agents: HashMap<usize, bool>,
     attachment_images: HashMap<String, gpui::Entity<attachments::Photo>>,
@@ -739,6 +801,7 @@ pub(crate) struct TranscriptView {
     history_preview_scrolled: Option<bool>,
     prepared_parsers: HashMap<usize, MarkdownParser>,
     mono: bool,
+    mono_decisions: mono_decisions::Decisions,
     /// The Mono's emoji library, for `:emo[..]` tokens in its replies.
     emoji: Option<emoji::MonoEmoji>,
     /// How many times a changed library laid every message out again.
@@ -922,6 +985,7 @@ impl TranscriptView {
             return;
         }
         self.mono = true;
+        self.refresh_legacy_mono_decisions();
         self.anchor_prompts = false;
         self.chat_layout = true;
         // A short chat rests on the composer, like `justify-end`.
@@ -1085,43 +1149,65 @@ impl TranscriptView {
         });
         view
     }
-    /// liveAgents.ts's toLiveAgent: the last turn's latest tool, as "Read
-    /// src/app.rs", when that turn was sent, and how long it ran once done.
-    pub(crate) fn live_turn(&self, cwd: &str) -> (Option<String>, Option<u64>, Option<u64>) {
-        let Some(prompt) = self.source.iter().rposition(|r| r.first && r.is_prompt()) else {
-            return (None, None, None);
-        };
+    /// The latest tool in the last prompt's turn, as "Read src/app.rs".
+    /// Provider text batches can revisit a tool row while streaming its output.
+    pub(crate) fn live_turn(&self, cwd: &str, now: u64, cached: &mut LiveStep) -> Option<String> {
+        let prompt = *self.live_turn_rows.prompts.last()?;
+        let at = *self
+            .live_turn_rows
+            .tools
+            .last()
+            .filter(|&&at| at > prompt)?;
+        let source = (self.live_turn_rows.epoch, at);
+        let first = &self.source[at].text;
+        if cached.source == Some(source)
+            && cached
+                .id_prefix
+                .as_ref()
+                .is_none_or(|prefix| first.starts_with(prefix.as_str()))
+        {
+            if cached.cwd != cwd && now >= cached.next_refresh {
+                cached.refresh_label(cwd, now);
+            }
+            return cached.label.clone();
+        }
+        let end = (at + 1..self.source.len())
+            .find(|&i| self.source[i].first)
+            .unwrap_or(self.source.len());
+        let text: String = self.source[at..end]
+            .iter()
+            .map(|r| r.text.as_str())
+            .collect();
+        #[cfg(test)]
+        {
+            cached.parses += 1;
+        }
+        let call = serde_json::from_str::<ToolCall>(&text).ok();
+        cached.source = Some(source);
+        // Native tool rows serialize the id first. Recognize a replacement at
+        // the same index without decoding its streamed input or output.
+        cached.id_prefix = call.as_ref().and_then(|tool| {
+            let id = serde_json::to_string(&tool.id).ok()?;
+            let prefix = format!("{{\"id\":{id},");
+            first.starts_with(prefix.as_str()).then_some(prefix)
+        });
+        cached.tool = call.map(|mut tool| {
+            tool.output = String::new();
+            tool
+        });
+        cached.refresh_label(cwd, now);
+        cached.label.clone()
+    }
+
+    pub(crate) fn live_turn_duration(&self) -> Option<u64> {
+        let prompt = *self.live_turn_rows.prompts.last()?;
         let turn = (prompt + 1..self.source.len())
             .find(|&at| self.source[at].first)
             .unwrap_or(self.source.len());
-        let tool = (turn..self.source.len())
-            .rev()
-            .find(|&at| self.source[at].first && self.source[at].role == "tool")
-            .and_then(|at| {
-                let end = (at + 1..self.source.len())
-                    .find(|&i| self.source[i].first)
-                    .unwrap_or(self.source.len());
-                let text: String = self.source[at..end]
-                    .iter()
-                    .map(|r| r.text.as_str())
-                    .collect();
-                serde_json::from_str::<ToolCall>(&text).ok()
-            })
-            .map(|tool| {
-                let shown = tool.presentation_in(Some(cwd));
-                [shown.action, shown.target]
-                    .into_iter()
-                    .filter(|part| !part.is_empty())
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            })
-            .filter(|label| !label.is_empty());
-        let duration = self
-            .turns
+        self.turns
             .get(&turn)
             .filter(|info| info.has_duration())
-            .map(|info| info.duration_ms);
-        (tool, self.source[prompt].sent_at, duration)
+            .map(|info| info.duration_ms)
     }
     /// Follow-ups delivered during a provider run share its original receipt.
     pub(crate) fn active_turn(&self) -> Option<usize> {
@@ -1974,6 +2060,7 @@ impl TranscriptView {
         }
         let from = self.source.iter().rposition(|r| r.is_prompt()).unwrap_or(0);
         if self.source.is_empty() {
+            self.refresh_legacy_mono_decisions();
             self.rows.clear();
             self.messages.clear();
             self.push_pending(0);
@@ -2707,6 +2794,7 @@ impl TranscriptView {
             work_item_cards: Default::default(),
             source: Vec::new(),
             source_bytes: 0,
+            live_turn_rows: Default::default(),
             tool_agents: HashMap::new(),
             attachment_images: HashMap::new(),
             visuals: HashMap::new(),
@@ -2728,6 +2816,7 @@ impl TranscriptView {
             history_preview_scrolled: None,
             prepared_parsers: HashMap::new(),
             mono: false,
+            mono_decisions: Default::default(),
             emoji: None,
             #[cfg(test)]
             emoji_rebuilds: 0,
@@ -3290,6 +3379,7 @@ impl TranscriptView {
             });
         for (ix, row) in rows.into_iter().enumerate() {
             let ix = start + ix;
+            self.live_turn_rows.update(ix, &row);
             let bytes = row.text.capacity().saturating_add(row.role.capacity());
             if ix < self.source.len() {
                 let old = &self.source[ix];
@@ -3487,6 +3577,7 @@ impl TranscriptView {
         {
             self.rebuild_passes += 1;
         }
+        self.refresh_legacy_mono_decisions();
         self.phase_layouts.clear();
         let now = Instant::now();
         let following = self.list.is_following_tail();
@@ -5244,17 +5335,6 @@ impl TranscriptView {
             )
             .into_any_element()
     }
-    /// The first reply the user sent after `message`, queued ones included,
-    /// which answers any choices that message offered.
-    fn reply_after(&self, message: usize) -> Option<String> {
-        self.messages
-            .get(message + 1..)?
-            .iter()
-            .find(|m| m.role == "user")
-            .and_then(|m| self.source.get(m.start))
-            .map(|row| row.text.clone())
-            .or_else(|| self.pending.first().map(|p| p.text.to_string()))
-    }
     fn row_body(
         &mut self,
         ix: usize,
@@ -5389,10 +5469,10 @@ impl TranscriptView {
                     .into_any_element()
             }
             Body::Goal(ref notice) => self.goal_row(message_start, notice, cx),
-            Body::MonoCard(ref value) => {
-                let chosen = self.reply_after(row.message);
-                crate::monos::cards::render(value, chosen.as_deref(), cx)
+            Body::MonoCard(ref value) if value["type"] == "choices" => {
+                self.mono_decision(value, cx)
             }
+            Body::MonoCard(ref value) => crate::monos::cards::render(value, cx),
             Body::MonoDivider => mono_divider::render(),
             Body::Pending(_)
             | Body::Launch(_)
@@ -6627,6 +6707,43 @@ mod mono_status_tests {
     }
     fn label(rows: Vec<Row>) -> String {
         mono_work_label(&rows, 0)
+    }
+
+    #[gpui::test]
+    fn streaming_step_parses_only_when_the_latest_tool_changes(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let transcript = cx.new(|_| TranscriptView::new());
+            transcript.update(cx, |view, cx| {
+                let mut cached = LiveStep::default();
+                let call = |id, path| {
+                    let mut tool = ToolCall::new(id, "Read");
+                    tool.input = serde_json::json!({"file_path": path}).to_string();
+                    row("tool", &serde_json::to_string(&tool).unwrap())
+                };
+                view.patch(
+                    0,
+                    vec![row("user", "Read a file"), call("tool-a", "/repo/a.rs")],
+                    cx,
+                );
+                let label = view.live_turn("/repo", 0, &mut cached).unwrap();
+                assert!(label.contains("a.rs"), "{label}");
+                for frame in 0..100 {
+                    view.patch(2, vec![row("assistant", &format!("Batch {frame}"))], cx);
+                    assert_eq!(
+                        view.live_turn("/repo", 0, &mut cached).as_deref(),
+                        Some(label.as_str())
+                    );
+                }
+                assert_eq!(cached.parses, 1);
+                view.patch(1, vec![call("tool-b", "/repo/b.rs")], cx);
+                let label = view.live_turn("/repo", 0, &mut cached).unwrap();
+                assert!(label.contains("b.rs"), "{label}");
+                assert_eq!(cached.parses, 2);
+                view.patch(3, vec![row("user", "Start another turn")], cx);
+                assert_eq!(view.live_turn("/repo", 0, &mut cached), None);
+                assert_eq!(cached.parses, 2);
+            });
+        });
     }
 
     #[test]

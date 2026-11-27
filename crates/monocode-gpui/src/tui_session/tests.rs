@@ -468,6 +468,43 @@ fn a_removed_account_refuses_to_launch_and_saves_nothing() {
 
 // the entity
 
+#[gpui::test]
+fn output_keeps_a_long_running_terminal_fresh_and_is_throttled(cx: &mut TestAppContext) {
+    use monocode_core::agent_status::{Activity, StatusInput, derive};
+    let fixture = Fixture::new(cx, "claude", None);
+    fixture.start(cx);
+    let terminal = fixture.terminal(cx);
+    fixture.events.borrow_mut().clear();
+    let started = monocode_core::time::now_ms();
+    let now = started + 31 * 60 * 1_000;
+    terminal.update(cx, |terminal, cx| {
+        terminal.note_output(now - 500, cx);
+        terminal.note_output(now, cx);
+    });
+    cx.run_until_parked();
+    let last = fixture.session.read_with(cx, |s, _| s.last_output_at());
+    assert_eq!(last, Some(now - 500));
+    assert_eq!(
+        fixture
+            .events()
+            .iter()
+            .filter(|event| **event == TuiEvent::Output)
+            .count(),
+        1
+    );
+    let status = derive(&StatusInput {
+        streaming: true,
+        state_since: started,
+        now,
+        last_event_at: last.unwrap(),
+        ..Default::default()
+    });
+    assert!(matches!(
+        status.activity,
+        Activity::Running { stale: false, .. }
+    ));
+}
+
 struct Fixture {
     session: Entity<TuiSession>,
     events: Rc<RefCell<Vec<TuiEvent>>>,

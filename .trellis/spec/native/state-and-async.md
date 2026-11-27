@@ -102,6 +102,47 @@ Child processes are owned by core: quitting calls `monos::begin_quit` and then
 `stop_processes`), and `process::guard` kills CLIs left by a crashed run. Do not spawn
 long-lived processes directly from a view; go through the core service that owns them.
 
+## Agent activity and turn receipts
+
+- Read `Shell::agent_status(id)` for user-facing activity, counts, filters and mobile
+  projections. `is_busy()` covers Running and BackgroundWait. Use
+  `Activity::is_animating()` for spinners. NeedsYou takes precedence over both.
+- A Claude `TurnActivity::Completed` can leave the provider connection open with a live shell.
+  `Event::Done` ends the receive loop. The next top-level assistant output can resume activity
+  on the same connection. Use Conversation transport flags when stopping a process, saving
+  its final transcript, or deciding whether Mono can report a launched session as settled.
+- `Shell::update_agent_status` combines provider progress, terminal hooks, remote activity and
+  the persisted receipt. Provider-only progress refreshes this cache without re-running the
+  broader `SessionChanged` effects. A clock marks Running stale after 30 minutes of silence.
+- The ordered writer records `begin_session_turn(id, started_at)`,
+  `finish_session_turn(id, started_at, TurnEnd)` and
+  `see_session_turn(id, turn_ended_at, seen_at)`. The times are Unix milliseconds.
+  Startup calls `restore_session_activity(now)`. The native sidecar keeps the receipt and
+  acknowledges only the completion the user saw. A foreground visible pane needs input in
+  the preceding three minutes to acknowledge it. Opening from a notification acknowledges it.
+- Cover shell-only completion and wake in provider tests, old read records and interrupted
+  turns in store tests, and visible-but-idle panes in shell tests. Mobile catalog and watch
+  project the same status through the existing `busy` and `waiting` fields.
+
+## Tree layout, progress, and Mono patrol
+
+- Resolve Classic, Focused, and Tree through `Workspace::navigation_layout()`. Keep reading the
+  saved `classic_layout` flag for old workspaces. `new_layout_boxy` is the frame style for
+  Focused and Tree. Project order, groups, pins, session folders, filters, and worktree focus
+  use the existing workspace data. Opening a Tree session applies its worktree focus before
+  calling the usual session opener so tabs and the right pane use the same scope.
+- The activity writer saves a completion and its fallback summary with
+  `finish_session_turn_with_summary`. A model result goes through `update_progress_summary`
+  with the exact completed turn timestamp. Tree and Mono read `Shell::progress_summary`.
+- Automatic archiving in Tree needs evidence tied to the stored worktree path and an unchanged,
+  settled session. Git inspection and writes run off the UI thread. Preserve drafts, recheck before
+  applying the archive, and save the evidence so restoring a session keeps it visible after a repeat
+  scan of the same worktree state.
+- Pending Mono decisions use durable per-card identities. Record an answer before removing
+  the request from shared activity. Heartbeat patrol compares scoped snapshots of the projects and
+  sessions against the last acknowledged baseline. Advance the baseline after a successful report
+  so failed dispatches can retry, and keep unchanged patrols quiet.
+
 ## Transcript updates and row caches
 
 `TranscriptView::patch` applies contiguous updates using source row offsets.

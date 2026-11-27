@@ -70,6 +70,8 @@ const REMOVED_ACCOUNT: &str =
 pub(crate) enum TuiEvent {
     /// The CLI process is running.
     Started,
+    /// The terminal grid received a new batch of output.
+    Output,
     /// The pane settled on an exit (or on a launch that failed).
     Exited(Exit),
     /// The CLI's title, cleaned: words only, capped.
@@ -343,6 +345,7 @@ pub(crate) struct TuiSession {
     /// Counts launches; a result for an older one is dropped.
     attempt: u64,
     terminal: Option<Entity<Terminal>>,
+    last_output_at: Option<u64>,
     _events: Option<Subscription>,
     launched_at: Option<Instant>,
     /// The launch used an id saved earlier, by resuming or by claiming it.
@@ -385,6 +388,7 @@ impl TuiSession {
             phase: Phase::Idle,
             attempt: 0,
             terminal: None,
+            last_output_at: None,
             _events: None,
             launched_at: None,
             reused_id: false,
@@ -406,11 +410,13 @@ impl TuiSession {
     pub(crate) fn busy(&self) -> bool {
         self.busy
     }
+    pub(crate) fn last_output_at(&self) -> Option<u64> {
+        self.last_output_at
+    }
     /// The prompt the first launch starts the CLI with; set before it is shown.
     pub(crate) fn set_initial_prompt(&mut self, prompt: String) {
         self.initial_prompt = Some(prompt).filter(|prompt| !prompt.trim().is_empty());
     }
-    #[cfg(test)]
     pub(crate) fn exit(&self) -> Option<&Exit> {
         self.exit.as_ref()
     }
@@ -522,6 +528,7 @@ impl TuiSession {
         self.phase = Phase::Preparing;
         self.exit = None;
         self.terminal = None;
+        self.last_output_at = None;
         self._events = None;
         // A relaunch (claim, restart) ends whatever turn the old process had.
         if std::mem::take(&mut self.busy) {
@@ -622,6 +629,10 @@ impl TuiSession {
     fn on_terminal(&mut self, event: TerminalEvent, cx: &mut Context<Self>) {
         match event {
             TerminalEvent::Started { .. } => cx.emit(TuiEvent::Started),
+            TerminalEvent::Output(at) => {
+                self.last_output_at = Some(at);
+                cx.emit(TuiEvent::Output);
+            }
             TerminalEvent::Title(raw) => {
                 if let Some(title) = tui_launch::clean_title(&raw) {
                     cx.emit(TuiEvent::Title(title));

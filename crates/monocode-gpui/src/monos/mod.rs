@@ -74,7 +74,7 @@ pub(crate) struct ShowDetails(pub String);
 pub(crate) struct ShowEmojiLibrary;
 /// A Mono's chat has opened, so a paired phone can follow it.
 pub(crate) struct ChatOpened;
-pub(crate) use notifications::{NotificationChanged, NotificationFinished, NotificationPosted};
+pub(crate) use notifications::{HabitFinished, NotificationChanged, NotificationPosted};
 pub(crate) use workflow_schedule::begin_quit;
 #[derive(Clone, PartialEq)]
 pub(crate) struct OverviewChrome {
@@ -572,13 +572,43 @@ impl Monos {
                 }
             }
         }));
-        if this.prefs.monos
-            && let Some(id) = active.filter(|id| this.roster.get(id).is_some())
-        {
-            this.active = Some(id.clone());
-            this.ensure_chat(&id, cx);
-            this.reload_files(&id, cx);
+        if this.prefs.monos {
+            if let Some(id) = active.filter(|id| this.roster.get(id).is_some()) {
+                this.active = Some(id.clone());
+                this.ensure_chat(&id, cx);
+                this.reload_files(&id, cx);
+            }
+            let pending: Vec<_> = this
+                .roster
+                .monos
+                .iter()
+                .filter(|mono| {
+                    mono.session_id.is_some()
+                        && (mono
+                            .decision_cards
+                            .values()
+                            .any(|card| card.answers.is_empty())
+                            || mono
+                                .pending_reports
+                                .iter()
+                                .any(|report| report.starts_with("mono-card:")))
+                })
+                .map(|mono| mono.id.clone())
+                .collect();
+            for id in pending {
+                this.ensure_chat(&id, cx);
+            }
         }
+        let launched = this
+            .roster
+            .monos
+            .iter()
+            .flat_map(|mono| mono.launches.iter().map(|launch| launch.session_id))
+            .collect();
+        let shell = this.owner.clone();
+        cx.defer(move |cx| {
+            let _ = shell.update(cx, |shell, cx| shell.mono_track_sessions(launched, cx));
+        });
         this
     }
     pub(crate) fn is_mono_session(&self, id: i64) -> bool {
@@ -590,6 +620,20 @@ impl Monos {
                 .iter()
                 .any(|m| m.habit_sessions.contains(&id))
     }
+    fn forget_chat_activity(&self, session: i64, cx: &mut Context<Self>) {
+        let owner = self.owner.clone();
+        cx.defer(move |cx| {
+            let _ = owner.update(cx, |shell, cx| shell.mono_forget_activity(session, cx));
+        });
+    }
+
+    pub(crate) fn tree_launch_mono(&self, id: i64) -> Option<&Mono> {
+        self.roster
+            .monos
+            .iter()
+            .find(|mono| mono.launches.iter().any(|launch| launch.session_id == id))
+    }
+
     pub(crate) fn hidden_session(&self, id: i64) -> bool {
         self.is_mono_session(id)
             || self.roster.monos.iter().any(|m| {
@@ -1013,11 +1057,15 @@ impl Monos {
                 ));
                 let source = id.clone();
                 this.observations
-                    .push(cx.observe(&view, move |this, _, cx| {
+                    .push(cx.observe(&view, move |this, view, cx| {
                         if this.active.as_ref() == Some(&source) {
                             cx.notify();
                         }
-                        this.dispatch(&source, cx);
+                        if view.read(cx).busy {
+                            this.dispatch(&source, cx);
+                        } else {
+                            this.dispatch_after_status(&source, cx);
+                        }
                     }));
                 let source = id.clone();
                 this.observations.push(cx.subscribe(
@@ -1064,6 +1112,7 @@ impl Monos {
                     },
                 ));
                 this.chats.insert(id.clone(), view);
+                cx.emit(NotificationChanged);
                 // Settings may have opened before this chat existed: remember its model now.
                 if this.settings.is_some() && this.active.as_deref() == Some(&id) {
                     this.note_settings_model(cx);
@@ -1139,19 +1188,30 @@ impl Monos {
         internal: bool,
         cx: &mut Context<Self>,
     ) {
-        if let Some(mono) = self.roster.get_mut(id) {
-            mono.outbox.push(Message {
-                id: mono::new_id(),
-                text,
-                sent_at: Some(monocode_core::time::now_ms()),
-                internal,
-                error: None,
-                attachments,
-            });
-            self.save(cx);
-            self.configure_chat(id, cx);
-            self.dispatch(id, cx);
-        }
+        self.enqueue_reporting(id, text, attachments, internal, cx);
+    }
+
+    fn enqueue_reporting(
+        &mut self,
+        id: &str,
+        text: String,
+        attachments: Vec<String>,
+        internal: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<async_channel::Receiver<Result<(), String>>> {
+        let mono = self.roster.get_mut(id)?;
+        mono.outbox.push(Message {
+            id: mono::new_id(),
+            text,
+            sent_at: Some(monocode_core::time::now_ms()),
+            internal,
+            error: None,
+            attachments,
+        });
+        let saved = self.save_reporting(cx);
+        self.configure_chat(id, cx);
+        self.dispatch(id, cx);
+        Some(saved)
     }
     fn dispatch(&mut self, id: &str, cx: &mut Context<Self>) {
         let delivered = self
@@ -1210,6 +1270,14 @@ impl Monos {
                         .strip_prefix("mono-card:")
                         .map(|s| ("mono-card", s.to_string()))
                         .unwrap_or_else(|| ("assistant", report.clone()));
+                    let decision = if role == "mono-card" {
+                        serde_json::from_str(&text)
+                            .ok()
+                            .as_ref()
+                            .and_then(mono::cards::question)
+                    } else {
+                        None
+                    };
                     let body = (role == "assistant").then(|| {
                         text.strip_prefix("**Habit report**")
                             .unwrap_or(&text)
@@ -1220,6 +1288,18 @@ impl Monos {
                         self.error = Some(error);
                         self.failed_reports.insert(id.into());
                         failed.push(report);
+                    } else if let Some(decision) = decision
+                        && let Some(mono) = self.roster.get_mut(id)
+                    {
+                        let now = monocode_core::time::now_ms();
+                        mono.decision_cards.entry(decision.id).or_insert(
+                            mono::cards::DecisionRecord {
+                                question: decision.title,
+                                answers: Vec::new(),
+                                updated_at: Some(now),
+                            },
+                        );
+                        mono.prune_decisions(now);
                     } else if let Some(body) = body {
                         let session = view.read(cx).summary.id;
                         cx.emit(NotificationPosted { session, body });
@@ -1229,6 +1309,7 @@ impl Monos {
                     mono.pending_reports.extend(failed);
                 }
                 self.save(cx);
+                self.configure_chat(id, cx);
             }
         }
         let Some(view) = self.chats.get(id).cloned() else {
@@ -1273,17 +1354,7 @@ impl Monos {
         let view = view.read(cx);
         let row_count = view.mono_rows(cx).len();
         let finished = !view.busy;
-        let completion =
-            (finished && self.inflight.contains_key(id)).then(|| NotificationFinished {
-                summary: view.summary.clone(),
-                body: view.notification_reply_text(cx),
-                habit: false,
-                was_cancelled: view.notification_was_cancelled(),
-            });
         cx.emit(NotificationChanged);
-        if let Some(completion) = completion {
-            cx.emit(completion);
-        }
         if self.active.as_deref() == Some(id)
             && let Some(mono) = self.roster.get_mut(id)
         {
@@ -1309,8 +1380,20 @@ impl Monos {
             self.check_completions(cx);
             self.reload_files(id, cx);
         }
-        self.dispatch(id, cx);
+        if finished {
+            self.dispatch_after_status(id, cx);
+        } else {
+            self.dispatch(id, cx);
+        }
         self.changed(cx);
+    }
+    fn dispatch_after_status(&self, id: &str, cx: &mut Context<Self>) {
+        // Let the shell observe the completed turn before a queued prompt starts another.
+        let monos = cx.weak_entity();
+        let id = id.to_owned();
+        cx.defer(move |cx| {
+            let _ = monos.update(cx, |this, cx| this.dispatch(&id, cx));
+        });
     }
     pub(crate) fn open(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         if !self.prefs.monos || self.roster.get(id).is_none() {
@@ -1457,7 +1540,10 @@ impl Monos {
         .detach();
     }
     pub(crate) fn rail(&mut self, project: Option<String>, cx: &mut Context<Self>) -> AnyElement {
-        self.rail_impl(project, false, false, cx)
+        self.rail_impl(project, false, false, None, cx)
+    }
+    pub(crate) fn tree_rail(&mut self, heading: gpui::Div, cx: &mut Context<Self>) -> AnyElement {
+        self.rail_impl(None, false, false, Some(heading), cx)
     }
     /// Original navigation lists every Mono, before the projects; the inset
     /// layout continues to list only the current project's Monos.
@@ -1466,13 +1552,14 @@ impl Monos {
         compact: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        self.rail_impl(None, true, compact, cx)
+        self.rail_impl(None, true, compact, None, cx)
     }
     fn rail_impl(
         &mut self,
         project: Option<String>,
         original: bool,
         compact: bool,
+        tree_heading: Option<gpui::Div>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         if !self.prefs.monos {
@@ -1495,7 +1582,10 @@ impl Monos {
             return div().into_any_element();
         }
         let add_project = project.clone();
-        let heading = if original {
+        let tree = tree_heading.is_some();
+        let heading = if let Some(heading) = tree_heading {
+            heading
+        } else if original {
             div()
                 .h(px(30.))
                 .pl(px(10.))
@@ -1528,14 +1618,17 @@ impl Monos {
                     .size(px(20.))
                     // Centred on the sidebar's trailing column, with the
                     // session filter and the navigation hints and counts.
-                    .when(!original, |d| d.mr(px(-3.)))
+                    .when(!original && !tree, |d| d.mr(px(-3.)))
                     .on_click(cx.listener(move |this, _, w, cx| {
                         this.create(add_project.clone().into_iter().collect(), w, cx)
                     })),
             )
-        });
+        })
+        .id("sidebar-mono-heading")
+        .debug_selector(|| "sidebar-mono-heading".into());
         div()
-            .when(!original, |d| d.px_2().pb_3())
+            .when(!original && !tree, |d| d.px_2().pb_3())
+            .when(tree, |d| d.pb_2())
             .when(original && !compact, |d| d.pb_2())
             .when(compact, |d| {
                 d.w_full().flex().flex_col().items_center().gap(px(6.))

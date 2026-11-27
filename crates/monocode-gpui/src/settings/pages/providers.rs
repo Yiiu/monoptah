@@ -110,7 +110,7 @@ impl SettingsView {
             Some("background-model"),
             true,
             "Background model",
-            Some("Writes session titles, worktree branch names, commit messages and pull requests. Automatic uses each session's provider and its quick model.".into()),
+            Some("Writes session titles, progress summaries, worktree branch names, commit messages and pull requests. Automatic uses each session's provider and its quick model.".into()),
             vec![self.select(
                 "background-model",
                 "Background model",

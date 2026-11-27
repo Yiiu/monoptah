@@ -87,7 +87,8 @@ impl SettingsView {
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let p = self.prefs.clone();
-        let inset = !self.ctx.classic;
+        use crate::workspace::NavigationLayout;
+        let inset = self.ctx.layout != NavigationLayout::Classic;
         let light = p.theme == "light"
             || (p.theme == "system"
                 && matches!(
@@ -277,14 +278,18 @@ impl SettingsView {
                 Some("inset-layout"),
                 true,
                 "Layout",
-                Some("Classic keeps everything in one sidebar. Focused adds a project switcher, workspace tabs and a right panel.".into()),
+                Some("Tree groups sessions by project and worktree and keeps the workspace tabs and right panel.".into()),
                 vec![self.segmented(
                     "inset-layout",
                     "Layout",
-                    if inset { "focused" } else { "classic" },
-                    &[("classic", "Classic"), ("focused", "Focused")],
+                    self.ctx.layout.id(),
+                    &[("classic", "Classic"), ("focused", "Focused"), ("tree", "Tree")],
                     cx,
-                    |_, value, cx| cx.emit(SettingsEvent::NewLayout(value == "focused")),
+                    |_, value, cx| {
+                        if let Some(layout) = NavigationLayout::from_id(value) {
+                            cx.emit(SettingsEvent::NewLayout(layout));
+                        }
+                    },
                 )],
             ),
             self.row(

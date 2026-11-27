@@ -10,11 +10,10 @@ pub(super) struct Activities {
     pending: Vec<Value>,
     reported_states: HashMap<String, ToolState>,
     pub(super) background_calls: std::collections::HashSet<String>,
-    pub(super) claude_background: HashMap<String, String>,
-    pub(super) claude_pending: std::collections::HashSet<String>,
+    pub(super) claude_background: std::collections::HashSet<String>,
     /// Every running Claude task in start order, as claude.ts's backgroundTasks.
     pub(super) claude_tasks: Vec<BackgroundTask>,
-    /// What the UI was last told the yielded turn is waiting on.
+    /// Most recent inventory announced to the UI.
     pub(super) published: Vec<BackgroundTask>,
 }
 fn text(value: &Value) -> Option<&str> {
@@ -469,7 +468,6 @@ impl Protocol {
                 value["subtype"].as_str(),
                 Some("task_started" | "task_progress" | "task_updated" | "task_notification")
             )
-            && value["ambient"] != true
         {
             let subtype = value["subtype"].as_str().unwrap_or("");
             let patch = if subtype == "task_updated" {
@@ -477,30 +475,40 @@ impl Protocol {
             } else {
                 value
             };
+            let status = patch["status"].as_str().and_then(state);
+            let terminal = subtype == "task_notification"
+                || status
+                    .as_ref()
+                    .is_some_and(|status| *status != ToolState::Running);
             if let Some(id) = text(&value["task_id"]) {
-                if patch["is_backgrounded"] == true {
-                    self.activities.claude_background.insert(
-                        id.into(),
-                        text(&patch["description"])
-                            .unwrap_or("Background task")
-                            .into(),
-                    );
-                } else if patch["is_backgrounded"] == false {
-                    self.activities.claude_background.remove(id);
+                if value["ambient"] == true || patch["ambient"] == true {
+                    self.remove_claude_task(id);
+                    return true;
                 }
-                if subtype == "task_started" {
-                    self.activities.claude_pending.insert(id.into());
-                }
-                self.track_claude_task(id, subtype, value, patch);
-                if subtype == "task_notification" {
-                    let background = self.activities.claude_background.remove(id).is_some();
-                    self.activities.claude_pending.remove(id);
-                    if background && self.claude_result_seen {
-                        // Claude may wake itself after a background result. The
-                        // desktop adapter leaves a 15s window for that follow-up.
-                        self.claude_resume_at = Some(Instant::now() + Duration::from_secs(15));
+                if terminal {
+                    let kind = self.remove_claude_task(id);
+                    if self.claude_result_seen {
+                        let deadline = Instant::now() + CLAUDE_CONTINUATION_GRACE;
+                        match kind {
+                            Some(TaskKind::Shell) => self.claude_drain_at = Some(deadline),
+                            Some(_) => self.claude_task_wake_at = Some(deadline),
+                            None => {}
+                        }
+                    }
+                } else {
+                    if let Some(backgrounded) = patch["is_backgrounded"].as_bool() {
+                        if backgrounded {
+                            self.activities.claude_background.insert(id.into());
+                        } else {
+                            self.activities.claude_background.remove(id);
+                        }
+                    }
+                    if matches!(subtype, "task_started" | "task_updated") {
+                        self.upsert_claude_task(id, value, patch, subtype == "task_started");
                     }
                 }
+            } else if value["ambient"] == true || patch["ambient"] == true {
+                return true;
             }
             let owner = text(&value["tool_use_id"]).map(str::to_owned).or_else(|| {
                 text(&value["task_id"]).and_then(|id| self.activities.owners.get(id).cloned())
@@ -515,18 +523,12 @@ impl Protocol {
                         }
                         self.activities.owners.insert(id.into(), tool.id.clone());
                     }
-                    let subtype = value["subtype"].as_str().unwrap_or("");
-                    let patch = if subtype == "task_updated" {
-                        &value["patch"]
-                    } else {
-                        value
-                    };
-                    if patch["is_backgrounded"] == true {
-                        self.activities.background_calls.insert(tool.id.clone());
-                    } else if patch["is_backgrounded"] == false || subtype == "task_notification" {
+                    if terminal || patch["is_backgrounded"] == false {
                         self.activities.background_calls.remove(&tool.id);
+                    } else if patch["is_backgrounded"] == true {
+                        self.activities.background_calls.insert(tool.id.clone());
                     }
-                    if let Some(status) = patch["status"].as_str().and_then(state) {
+                    if let Some(status) = status {
                         tool.state = status;
                     } else if subtype == "task_started" {
                         tool.state = ToolState::Running;
@@ -569,89 +571,104 @@ impl Protocol {
         }
         false
     }
-    /// Mirrors claude.ts's backgroundTasks: a task runs from task_started
-    /// until a terminal update, its notification, or a background_tasks_changed
-    /// list that no longer has it.
-    fn track_claude_task(&mut self, id: &str, subtype: &str, value: &Value, patch: &Value) {
+    fn upsert_claude_task(&mut self, id: &str, value: &Value, patch: &Value, insert: bool) {
+        let description = text(&patch["description"]);
+        let kind = text(&patch["task_type"])
+            .or_else(|| text(&value["task_type"]))
+            .map(classify_task);
+        let source = text(&value["tool_use_id"]).and_then(|id| self.tools.get(id));
+        let command = text(&patch["command"]).map(str::to_owned).or_else(|| {
+            source
+                .filter(|tool| tool.name == "Bash")
+                .and_then(|tool| serde_json::from_str::<Value>(&tool.input).ok())
+                .and_then(|input| text(&input["command"]).map(str::to_owned))
+        });
         let tasks = &mut self.activities.claude_tasks;
-        match subtype {
-            "task_started" if !tasks.iter().any(|task| task.id == id) => {
-                let source = text(&value["tool_use_id"]).and_then(|id| self.tools.get(id));
-                let command = source
-                    .filter(|tool| tool.name == "Bash")
-                    .and_then(|tool| serde_json::from_str::<Value>(&tool.input).ok())
-                    .and_then(|input| text(&input["command"]).map(str::to_owned));
-                tasks.push(BackgroundTask {
-                    id: id.into(),
-                    description: text(&value["description"])
-                        .unwrap_or(if command.is_some() {
-                            "Background command"
-                        } else {
-                            "Background task"
-                        })
-                        .into(),
-                    agent: is_agent_task(value["task_type"].as_str()),
-                    command,
-                    started_at: crate::time::now_ms(),
-                });
+        if let Some(task) = tasks.iter_mut().find(|task| task.id == id) {
+            if let Some(description) = description {
+                task.description = description.into();
             }
-            "task_updated" => {
-                if let Some(description) = text(&patch["description"]) {
-                    if let Some(task) = tasks.iter_mut().find(|task| task.id == id) {
-                        task.description = description.into();
-                    }
-                }
-                let status = patch["status"].as_str().unwrap_or("").to_lowercase();
-                if matches!(
-                    status.as_str(),
-                    "completed" | "failed" | "killed" | "stopped"
-                ) {
-                    tasks.retain(|task| task.id != id);
-                }
+            if let Some(kind) = kind {
+                task.kind = kind;
+                task.agent = kind == TaskKind::Agent;
             }
-            "task_notification" => tasks.retain(|task| task.id != id),
-            _ => {}
+            if command.is_some() {
+                task.command = command;
+            }
+        } else if insert {
+            let kind = kind.unwrap_or_else(|| match source.map(|tool| tool.name.as_str()) {
+                Some("Bash") => TaskKind::Shell,
+                Some("Task" | "Agent") => TaskKind::Agent,
+                _ => TaskKind::Other,
+            });
+            tasks.push(BackgroundTask {
+                id: id.into(),
+                description: description
+                    .unwrap_or(if kind == TaskKind::Shell {
+                        "Background command"
+                    } else {
+                        "Background task"
+                    })
+                    .into(),
+                kind,
+                agent: kind == TaskKind::Agent,
+                command,
+                started_at: crate::time::now_ms(),
+            });
         }
     }
+    fn remove_claude_task(&mut self, id: &str) -> Option<TaskKind> {
+        self.activities.claude_background.remove(id);
+        if let Some(owner) = self.activities.owners.get(id) {
+            self.activities.background_calls.remove(owner);
+        }
+        let tasks = &mut self.activities.claude_tasks;
+        let index = tasks.iter().position(|task| task.id == id)?;
+        Some(tasks.remove(index).kind)
+    }
+
     /// Claude's full list of running tasks replaces the tracked one.
-    pub(super) fn claude_background_list(&mut self, value: &Value) {
+    fn claude_background_list(&mut self, value: &Value) {
         if value["type"] != "system" || value["subtype"] != "background_tasks_changed" {
             return;
         }
-        let rows: Vec<&Value> = value["tasks"]
-            .as_array()
-            .into_iter()
-            .flatten()
+        let Some(rows) = value["tasks"].as_array() else {
+            return;
+        };
+        let rows: Vec<_> = rows
+            .iter()
             .filter(|row| row["ambient"] != true)
+            .filter_map(|row| Some((text(&row["task_id"])?, row)))
             .collect();
-        let tasks = &mut self.activities.claude_tasks;
-        tasks.retain(|task| rows.iter().any(|row| row["task_id"] == task.id.as_str()));
-        for row in rows {
-            let Some(id) = text(&row["task_id"]) else {
-                continue;
-            };
-            if !tasks.iter().any(|task| task.id == id) {
-                tasks.push(BackgroundTask {
-                    id: id.into(),
-                    description: text(&row["description"])
-                        .unwrap_or("Background task")
-                        .into(),
-                    agent: is_agent_task(row["task_type"].as_str()),
-                    command: None,
-                    started_at: crate::time::now_ms(),
-                });
-            }
+        let missing: Vec<_> = self
+            .activities
+            .claude_tasks
+            .iter()
+            .filter(|task| !rows.iter().any(|(id, _)| *id == task.id))
+            .map(|task| task.id.clone())
+            .collect();
+        if !missing.is_empty() && self.claude_result_seen {
+            // An inventory removal does not promise Claude will resume. Keep
+            // the wire briefly so a real continuation can still arrive.
+            self.claude_drain_at = Some(Instant::now() + CLAUDE_CONTINUATION_GRACE);
+        }
+        for id in missing {
+            self.remove_claude_task(&id);
+        }
+        self.activities.claude_background = rows.iter().map(|(id, _)| (*id).into()).collect();
+        for (id, row) in rows {
+            self.upsert_claude_task(id, row, row, true);
         }
     }
-    /// Once Claude has yielded, tell the UI which tasks the turn still waits
-    /// on, and clear the list when Claude picks the thread back up.
+    /// Shells stay visible across assistant results and continuations.
     pub(super) fn sync_background(&mut self, events: &mut Vec<Event>) {
-        let waiting = if self.claude_result_seen && !self.done {
-            self.activities.claude_tasks.clone()
-        } else {
-            Vec::new()
-        };
-        if waiting != self.activities.published {
+        let waiting = self.activities.claude_tasks.iter().filter(|task| {
+            self.claude_result_seen
+                || (task.kind == TaskKind::Shell
+                    && self.activities.claude_background.contains(&task.id))
+        });
+        if waiting.clone().ne(self.activities.published.iter()) {
+            let waiting: Vec<_> = waiting.cloned().collect();
             self.activities.published = waiting.clone();
             events.push(Event::Background(waiting));
         }
@@ -678,11 +695,15 @@ impl Protocol {
         );
     }
 }
-fn is_agent_task(task_type: Option<&str>) -> bool {
-    matches!(
-        task_type.map(str::to_lowercase).as_deref(),
-        Some("local_agent" | "remote_agent")
-    )
+fn classify_task(task_type: &str) -> TaskKind {
+    let name = task_type.to_ascii_lowercase();
+    match name.as_str() {
+        "local_bash" | "remote_bash" | "bash" | "shell" => TaskKind::Shell,
+        "local_agent" | "remote_agent" => TaskKind::Agent,
+        _ if name.contains("monitor") => TaskKind::Monitor,
+        _ if name.contains("workflow") => TaskKind::Workflow,
+        _ => TaskKind::Other,
+    }
 }
 fn text_content(value: &Value) -> String {
     value.as_str().map(str::to_owned).unwrap_or_else(|| {
@@ -969,47 +990,183 @@ mod tests {
         assert!(orphan.is_empty());
     }
     #[test]
-    fn claude_background_tasks_show_once_the_answer_yields_and_clear_as_they_finish() {
+    fn claude_reports_shells_during_the_answer_and_subagents_once_it_yields() {
         let mut p = protocol(Kind::Claude);
-        let tick = |p: &mut Protocol| {
-            p.lifecycle_tick(Instant::now(), &mut Vec::new())
-                .unwrap()
-                .into_iter()
-                .find_map(|event| match event {
-                    Event::Background(tasks) => Some(tasks),
-                    _ => None,
-                })
+        let frame = |p: &mut Protocol, value: Value| p.frame(value, &mut Vec::new()).unwrap();
+        let inventory = |events: Vec<Event>| {
+            events.into_iter().find_map(|event| match event {
+                Event::Background(tasks) => Some(tasks),
+                _ => None,
+            })
         };
-        p.frame(json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":"dev-call","name":"Bash","input":{"command":"npm run dev","run_in_background":true}}]}}), &mut Vec::new()).unwrap();
-        p.frame(json!({"type":"system","subtype":"task_started","task_id":"dev","tool_use_id":"dev-call","description":"Start dev server","task_type":"local_bash","is_backgrounded":true}), &mut Vec::new()).unwrap();
-        p.frame(json!({"type":"system","subtype":"task_started","task_id":"review","description":"Review","task_type":"local_agent"}), &mut Vec::new()).unwrap();
+        frame(
+            &mut p,
+            json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":"dev-call","name":"Bash","input":{"command":"npm run dev","run_in_background":true}}]}}),
+        );
+        let shells = inventory(frame(&mut p, json!({"type":"system","subtype":"task_started","task_id":"dev","tool_use_id":"dev-call","description":"Start dev server","task_type":"local_bash","is_backgrounded":true}))).unwrap();
+        assert_eq!(shells.len(), 1);
+        assert_eq!(shells[0].command.as_deref(), Some("npm run dev"));
         // Work the agent is still doing in the foreground is not background.
-        assert_eq!(tick(&mut p), None);
+        assert!(inventory(frame(&mut p, json!({"type":"system","subtype":"task_started","task_id":"review","description":"Review","task_type":"local_agent"}))).is_none());
 
-        p.frame(
-            json!({"type":"result","result":"Started it."}),
-            &mut Vec::new(),
-        )
-        .unwrap();
-        let tasks = tick(&mut p).unwrap();
+        let yielded = frame(&mut p, json!({"type":"result","result":"Started it."}));
+        assert!(
+            yielded.contains(&Event::TurnActivity(TurnActivity::Yielded {
+                wake_tasks: 1
+            }))
+        );
+        let tasks = inventory(yielded).unwrap();
         assert_eq!(tasks.len(), 2);
         assert_eq!(tasks[0].description, "Start dev server");
         assert_eq!(tasks[0].command.as_deref(), Some("npm run dev"));
-        assert!(!tasks[0].agent && tasks[1].agent);
-        assert_eq!(tick(&mut p), None, "an unchanged list is not sent again");
+        assert_eq!(tasks[0].kind, TaskKind::Shell);
+        assert_eq!(tasks[1].kind, TaskKind::Agent);
+        assert!(tasks[1].agent);
+        assert!(inventory(p.lifecycle_tick(Instant::now(), &mut Vec::new()).unwrap()).is_none());
 
-        p.frame(json!({"type":"system","subtype":"task_updated","task_id":"review","patch":{"status":"completed"}}), &mut Vec::new()).unwrap();
-        let tasks = tick(&mut p).unwrap();
+        let tasks = inventory(frame(&mut p, json!({"type":"system","subtype":"task_updated","task_id":"review","patch":{"status":"completed"}}))).unwrap();
         assert_eq!(
             tasks.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
             ["dev"]
         );
 
-        p.frame(
+        let empty = frame(
+            &mut p,
             json!({"type":"system","subtype":"background_tasks_changed","tasks":[]}),
-            &mut Vec::new(),
+        );
+        assert_eq!(inventory(empty), Some(Vec::new()));
+    }
+
+    #[test]
+    fn claude_does_not_wait_for_a_task_missing_from_the_full_inventory() {
+        let mut p = protocol(Kind::Claude);
+        let mut stdin = Vec::new();
+        p.frame(
+            json!({"type":"system","subtype":"task_started","task_id":"review",
+            "task_type":"local_agent","is_backgrounded":true}),
+            &mut stdin,
         )
         .unwrap();
-        assert_eq!(tick(&mut p), Some(Vec::new()));
+        let initial = p
+            .frame(
+                json!({"type":"result","result":"I delegated the review."}),
+                &mut stdin,
+            )
+            .unwrap();
+        assert!(
+            initial.contains(&Event::TurnActivity(TurnActivity::Yielded {
+                wake_tasks: 1
+            }))
+        );
+
+        let inventory = p
+            .frame(
+                json!({"type":"system","subtype":"background_tasks_changed","tasks":[]}),
+                &mut stdin,
+            )
+            .unwrap();
+        assert!(inventory.contains(&Event::Background(Vec::new())));
+        assert!(inventory.contains(&Event::TurnActivity(TurnActivity::Completed)));
+        // The grace period only keeps the wire open for a possible wake.
+        p.claude_drain_at = Some(Instant::now() - Duration::from_secs(1));
+        let subsequent = p.lifecycle_tick(Instant::now(), &mut stdin).unwrap();
+        assert!(subsequent.contains(&Event::Done));
+        assert!(p.done);
+    }
+
+    #[test]
+    fn claude_shell_only_result_is_complete_and_still_receives_its_wake() {
+        let mut p = protocol(Kind::Claude);
+        let mut stdin = Vec::new();
+        let inventory = p
+            .frame(
+                json!({"type":"system","subtype":"background_tasks_changed","tasks":[
+                    {"task_id":"dev","task_type":"local_bash","command":"npm run dev"},
+                    {"task_id":"watch","task_type":"monitor","ambient":true}
+                ]}),
+                &mut stdin,
+            )
+            .unwrap();
+        assert!(inventory
+            .iter()
+            .any(|event| matches!(event, Event::Background(tasks)
+            if tasks.len() == 1 && tasks[0].kind == TaskKind::Shell)));
+        let result = p
+            .frame(
+                json!({"type":"result","result":"Started the server."}),
+                &mut stdin,
+            )
+            .unwrap();
+        assert!(result.contains(&Event::TurnActivity(TurnActivity::Completed)));
+        assert!(!p.done, "the live shell still owns the transport");
+
+        let ended = p.frame(json!({"type":"system","subtype":"task_notification","task_id":"dev","status":"completed"}), &mut stdin).unwrap();
+        assert!(ended.contains(&Event::Background(Vec::new())));
+        assert!(!ended
+            .iter()
+            .any(|event| matches!(event, Event::TurnActivity(_))));
+        p.frame(
+            json!({"type":"system","subtype":"init","session_id":"session"}),
+            &mut stdin,
+        )
+        .unwrap();
+        let replay = p
+            .frame(
+                json!({"type":"result","num_turns":0,"origin":{"kind":"task-notification"}}),
+                &mut stdin,
+            )
+            .unwrap();
+        assert!(!replay
+            .iter()
+            .any(|event| matches!(event, Event::Done | Event::TurnActivity(_))));
+        let woke = p.frame(json!({"type":"assistant","message":{"content":[{"type":"text","text":"The server exited."}]}}), &mut stdin).unwrap();
+        assert!(woke.contains(&Event::TurnActivity(TurnActivity::Running)));
+        assert!(woke.contains(&Event::Text("The server exited.".into())));
+        assert!(p
+            .frame(
+                json!({"type":"result","num_turns":1,"origin":{"kind":"task-notification"}}),
+                &mut stdin
+            )
+            .unwrap()
+            .contains(&Event::Done));
+    }
+
+    #[test]
+    fn claude_waits_for_the_lead_to_wake_and_finishes_after_the_continuation() {
+        let mut p = protocol(Kind::Claude);
+        let mut stdin = Vec::new();
+        p.frame(
+            json!({"type":"system","subtype":"task_started","task_id":"review",
+            "task_type":"local_agent","is_backgrounded":true}),
+            &mut stdin,
+        )
+        .unwrap();
+        let yielded = p
+            .frame(json!({"type":"result","result":"Reviewing…"}), &mut stdin)
+            .unwrap();
+        assert!(
+            yielded.contains(&Event::TurnActivity(TurnActivity::Yielded {
+                wake_tasks: 1
+            }))
+        );
+
+        let terminal = p.frame(json!({"type":"system","subtype":"task_updated","task_id":"review","patch":{"status":"completed"}}), &mut stdin).unwrap();
+        assert!(terminal.contains(&Event::Background(Vec::new())));
+        assert!(!terminal.contains(&Event::Done));
+        let child = p
+            .frame(
+                json!({"type":"assistant","parent_tool_use_id":"review",
+            "message":{"content":[{"type":"text","text":"Reviewed."}]}}),
+                &mut stdin,
+            )
+            .unwrap();
+        assert!(!child.contains(&Event::TurnActivity(TurnActivity::Running)));
+        let lead = p.frame(json!({"type":"assistant","message":{"content":[{"type":"text","text":"Review passed."}]}}), &mut stdin).unwrap();
+        assert!(lead.contains(&Event::TurnActivity(TurnActivity::Running)));
+        assert!(lead.contains(&Event::Text("Review passed.".into())));
+        assert!(p
+            .frame(json!({"type":"result","num_turns":1}), &mut stdin)
+            .unwrap()
+            .contains(&Event::Done));
     }
 }

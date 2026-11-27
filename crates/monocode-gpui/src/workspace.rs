@@ -69,6 +69,41 @@ pub(crate) struct ProjectRailGroup {
     pub mascot: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum NavigationLayout {
+    Classic,
+    #[default]
+    Focused,
+    Tree,
+}
+
+impl NavigationLayout {
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Classic => "classic",
+            Self::Focused => "focused",
+            Self::Tree => "tree",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        match id {
+            "classic" => Some(Self::Classic),
+            "focused" => Some(Self::Focused),
+            "tree" => Some(Self::Tree),
+            _ => None,
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Classic => Self::Focused,
+            Self::Focused => Self::Tree,
+            Self::Tree => Self::Classic,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct Workspace {
@@ -141,6 +176,10 @@ pub(crate) struct Workspace {
     pub last_actions: HashMap<String, String>,
     /// Original layout: separate project and session sidebars.
     pub classic_layout: bool,
+    /// The project tree shares Focused's workspace and right panel.
+    pub tree_sidebar: bool,
+    /// Manual sibling order for Tree sessions, keyed by their sidebar section.
+    pub tree_session_order: HashMap<String, Vec<i64>>,
     /// The new single-sidebar layout can keep its full-height, square frame.
     pub new_layout_boxy: bool,
     pub project_rail_open: bool,
@@ -484,6 +523,8 @@ impl Default for Workspace {
             actions: HashMap::new(),
             last_actions: HashMap::new(),
             classic_layout: false,
+            tree_sidebar: false,
+            tree_session_order: HashMap::new(),
             // Fresh installs start on the boxy frame; saved choices are kept.
             new_layout_boxy: true,
             project_rail_open: true,
@@ -564,6 +605,25 @@ impl Workspace {
             );
             self.projects = projects;
         }
+    }
+
+    pub fn navigation_layout(&self) -> NavigationLayout {
+        if self.classic_layout {
+            NavigationLayout::Classic
+        } else if self.tree_sidebar {
+            NavigationLayout::Tree
+        } else {
+            NavigationLayout::Focused
+        }
+    }
+
+    pub fn tree_layout(&self) -> bool {
+        self.navigation_layout() == NavigationLayout::Tree
+    }
+
+    pub fn set_navigation_layout(&mut self, layout: NavigationLayout) {
+        self.classic_layout = layout == NavigationLayout::Classic;
+        self.tree_sidebar = layout == NavigationLayout::Tree;
     }
 
     pub fn boxy_layout(&self) -> bool {
@@ -786,7 +846,7 @@ impl Workspace {
     /// Projects in the order the current layout shows them. The rail lists
     /// pinned projects, then each group's members, then the rest.
     pub fn visible_project_order(&self) -> Vec<String> {
-        if !self.classic_layout {
+        if self.navigation_layout() == NavigationLayout::Focused {
             return self.projects.clone();
         }
         let unpinned = |p: &&String| !self.project_rail_pinned.contains(*p);
@@ -819,7 +879,10 @@ impl Workspace {
     pub fn project_peers(&self, path: &str) -> Vec<String> {
         self.visible_project_order()
             .into_iter()
-            .filter(|p| !self.classic_layout || self.project_rail_peers(p, path))
+            .filter(|p| {
+                self.navigation_layout() == NavigationLayout::Focused
+                    || self.project_rail_peers(p, path)
+            })
             .collect()
     }
     /// Moves a project to `to` in the saved order. Returns whether it moved.
@@ -1462,6 +1525,24 @@ pub(crate) fn project_name(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn navigation_cycles_and_restores_existing_layouts() {
+        use super::{NavigationLayout as Layout, Workspace};
+        let restore = |saved| Workspace::restore(saved, &[], "/project");
+        assert_eq!(restore(None).navigation_layout(), Layout::Focused);
+        let classic = r#"{"classic_layout":true,"new_layout_boxy":true}"#;
+        assert_eq!(restore(Some(classic)).navigation_layout(), Layout::Classic);
+        assert_eq!(Layout::Classic.next(), Layout::Focused);
+        assert_eq!(Layout::Focused.next(), Layout::Tree);
+        assert_eq!(Layout::Tree.next(), Layout::Classic);
+
+        let mut state = restore(None);
+        state.set_navigation_layout(Layout::Tree);
+        let saved = serde_json::to_string(&state).unwrap();
+        assert!(restore(Some(&saved)).tree_layout());
+        assert!(!state.classic_layout);
+    }
+
+    #[test]
     fn legacy_empty_session_choices_survive_upgrade_and_new_choices_take_precedence() {
         for (preferences, expected) in [
             (serde_json::json!({}), "ink"),
@@ -1519,8 +1600,15 @@ mod tests {
         assert!(state.move_project_to_end("/b", 1));
         assert_eq!(state.project_peers("/d"), ["/d", "/b"]);
         assert!(!state.step_project_order("/e", 1), "/e is the only pin");
-        // The projects row shows the saved order as it is.
-        state.classic_layout = false;
+        state.set_navigation_layout(super::NavigationLayout::Tree);
+        assert_eq!(state.project_peers("/d"), ["/d", "/b"]);
+        assert_eq!(
+            state.visible_project_order(),
+            ["/e", "/d", "/b", "/a", "/f", "/c"]
+        );
+        assert!(!state.step_project_order("/e", 1), "/e is the only pin");
+        // The Focused projects row shows the saved order as it is.
+        state.set_navigation_layout(super::NavigationLayout::Focused);
         assert_eq!(state.visible_project_order(), state.projects);
         assert!(state.move_project_to_end("/e", -1));
         assert_eq!(state.projects[0], "/e");

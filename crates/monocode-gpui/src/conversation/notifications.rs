@@ -23,6 +23,13 @@ impl Conversation {
                     label: question.notification_label().to_owned(),
                 }
             }))
+            .chain(self.transcript.read(cx).mono_attention_decisions().map(
+                |(request_id, record)| PendingInput {
+                    request_id: request_id.clone(),
+                    kind: InputKind::Question,
+                    label: record.question.clone(),
+                },
+            ))
             .collect()
     }
 

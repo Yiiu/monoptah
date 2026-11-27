@@ -136,9 +136,14 @@ mod tests {
         for classic in [false, true] {
             window
                 .update(visual, |shell, _, cx| {
-                    shell.workspace.classic_layout = classic;
-                    shell.invalidate_chrome(cx);
-                    cx.notify();
+                    shell.set_navigation_layout(
+                        if classic {
+                            crate::workspace::NavigationLayout::Classic
+                        } else {
+                            crate::workspace::NavigationLayout::Focused
+                        },
+                        cx,
+                    );
                 })
                 .unwrap();
             visual.run_until_parked();

@@ -70,7 +70,33 @@ fill (`modal::surface`). Do not hand-roll a card.
 - `MenuAction::detail(text)` adds a monospace second line under an option's description.
 - Expand/collapse: `src/disclosure.rs` (`Disclosure`) animates a measured height open and
   closed (same curve as the chevron), keeps content mounted until it has shut, and honours
-  reduce-motion. Use it for any accordion instead of fading content in.
+  reduce-motion. Use it for any accordion instead of fading content in. A close that starts
+  before the content was ever measured begins at the content's own height, not 0 (test
+  `a_close_before_any_measure_starts_at_the_content_height`); a disclosure created at toggle
+  time, as the project tree does, relies on this to avoid a one-frame snap shut.
+- Tree rails: `shell/rails.rs` `step` / `step_tinted` draw the connector through the step's own
+  `py(2.)`. In a virtualized list where each row is its own item (the project tree), put **no**
+  outer spacing around a `step` row: a `pb(2.)` outside it leaves a 2px hole in the spine
+  between every two rows. The tree's `tree_row` adds `pb(2.)` to every row except
+  `TreeRow::Session`.
+- Tree reorder uses unshifted headers to pick a sibling target and the viewport to bound
+  the dragged header. Keep measured rows stable while the pointer is held. Apply the
+  relative inset to a child of the virtual list item so GPUI keeps the slot in its
+  layout and paints the row at the drag offset. Regression tests check rendered row
+  positions before mouse-up. Use the block's total height to shift its peers and hold
+  its overlay through the tab strip's `TabShift` settlement. Tree sessions reorder
+  vertically within their section and use the existing folder and pane targets when
+  pulled out of that strip.
+- A navigation layout must keep every entry point of the layout it replaces. Focused reaches
+  Settings only through its project header menu (Windows has no app menu bar), so the Tree
+  layout, which drops that header, carries a Settings button in the expanded tree and Peek
+  footer (`tree-settings`) and supports the global shortcut while hidden (test
+  `tree_layout_reaches_settings_open_in_peek_and_by_shortcut`). When adding or replacing a
+  layout, list the old header/footer/menu actions and map each one before shipping.
+- Tree and Focused hide the sidebar on collapse and open Peek from the window's left edge or
+  title-bar toggle. Tree lays out the pin beside Search, or in a separate header row when Search
+  is hidden. The `tree_shortcuts_hide_the_sidebar_and_allow_peek` regression checks the hidden
+  layout and Peek edge, and compares the widths of Today and Inbox with their docked widths.
 - Hover needs an element id: GPUI keeps hover state per id, so a `.hover(..)` on a div without
   `.id(..)` only repaints when something else redraws the view (hover appears "sometimes").
 

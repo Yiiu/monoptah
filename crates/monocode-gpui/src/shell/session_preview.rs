@@ -1,7 +1,8 @@
 //! Hover cards for unopened sessions do not construct conversation entities.
-use crate::{pickers::cached_model_name, theme::*};
+use crate::{pickers::cached_model_name, session_mark::activity_color, theme::*};
 use gpui::{AnyElement, FontWeight, div, prelude::*, px};
 use monocode_core::{
+    agent_status::{Activity, AgentStatus},
     provider::Kind,
     store::{Session, SessionPreviewData},
 };
@@ -10,7 +11,7 @@ use std::path::Path;
 pub(super) fn render(
     summary: &Session,
     data: Option<&SessionPreviewData>,
-    done: bool,
+    status: &AgentStatus,
 ) -> AnyElement {
     let model = data
         .and_then(|data| data.model.as_deref())
@@ -18,6 +19,14 @@ pub(super) fn render(
     let name = cached_model_name(Kind::from_id(&summary.provider), model.as_deref());
     let worktree = data.and_then(|data| data.worktree_cwd.as_deref());
     let cwd = worktree.unwrap_or(&summary.cwd);
+    let now = monocode_core::time::now_ms();
+    let label = status.label(now).unwrap_or_else(|| {
+        let at = match status.activity {
+            Activity::Done { at, .. } => at,
+            _ => summary.updated_at,
+        };
+        monocode_core::time::relative(at, now)
+    });
     let directory = std::env::var_os("HOME")
         .and_then(|home| {
             Path::new(cwd).strip_prefix(home).ok().map(|path| {
@@ -53,21 +62,12 @@ pub(super) fn render(
                 )
                 .child(
                     div()
-                        .flex_shrink_0()
+                        .max_w(gpui::relative(0.65))
+                        .min_w_0()
+                        .truncate()
                         .text_size(px(11.))
-                        .text_color(if done {
-                            gpui::rgb(0x34d399).into()
-                        } else {
-                            content(0.45)
-                        })
-                        .child(if done {
-                            "Done".to_owned()
-                        } else {
-                            monocode_core::time::relative(
-                                summary.updated_at,
-                                monocode_core::time::now_ms(),
-                            )
-                        }),
+                        .text_color(activity_color(&status.activity))
+                        .child(label),
                 ),
         )
         .child(

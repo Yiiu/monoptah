@@ -126,7 +126,7 @@ impl Shell {
                 .unwrap_or_default(),
             catalogs,
             agent_updates: self.notification_state.harness.read(cx).settings_rows(),
-            classic: self.workspace.classic_layout,
+            layout: self.workspace.navigation_layout(),
             new_layout_boxy: self.workspace.new_layout_boxy,
             no_terminal_sessions: !self.surface_supported,
             cwd: self.workspace.project.clone(),
@@ -239,11 +239,8 @@ impl Shell {
                     this.invalidate_chrome(cx);
                     cx.notify();
                 }
-                SettingsEvent::NewLayout(on) => {
-                    if this.workspace.classic_layout == *on {
-                        this.toggle_layout(cx);
-                    }
-                    this.sync_settings(cx);
+                SettingsEvent::NewLayout(layout) => {
+                    this.set_navigation_layout(*layout, cx);
                 }
                 SettingsEvent::NewLayoutBoxy(boxy) => {
                     this.workspace.new_layout_boxy = *boxy;
@@ -717,7 +714,24 @@ impl Shell {
                 monocode_core::worktree_management::remove(Path::new(&main.path),Path::new(&worker_path))?;
                 locked(&store)?.detach_worktree(&worker_path,&main.path)
             });let result=work.await;
-            let _=this.update(cx,|this,cx|{let result=result.map(|detached|{for(summary,settings)in detached{this.session_summaries.insert(summary.id, summary.clone());this.session_worktrees.insert(summary.id,settings.worktree_cwd.clone());if let Some(view)=this.sessions.get(&summary.id){view.update(cx,|v,cx|v.worktree_deleted(summary,settings,cx));}}this.worktree_focus.retain(|_,focus|!is_equal_or_inside(&focus.path,&path));});this.finish_worktree_action(&path,result,cx);});
+            let _ = this.update(cx, |this, cx| {
+                let result = result.map(|detached| {
+                    let mut ids = Vec::with_capacity(detached.len());
+                    for (summary, settings) in detached {
+                        ids.push(summary.id);
+                        this.session_summaries.insert(summary.id, summary.clone());
+                        this.session_worktrees
+                            .insert(summary.id, settings.worktree_cwd.clone());
+                        if let Some(view) = this.sessions.get(&summary.id) {
+                            view.update(cx, |view, cx| view.worktree_deleted(summary, settings, cx));
+                        }
+                    }
+                    this.worktree_focus
+                        .retain(|_, focus| !is_equal_or_inside(&focus.path, &path));
+                    this.archive_cleaned_worktree_sessions(&ids, cx);
+                });
+                this.finish_worktree_action(&path, result, cx);
+            });
         }).detach();
         let _ = window;
     }

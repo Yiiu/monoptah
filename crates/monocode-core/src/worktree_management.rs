@@ -1,5 +1,129 @@
 //! Settings worktree guards; removal keeps the branch and commits.
 use std::path::{Path, PathBuf};
+
+pub fn removed_worktree(path: &str) -> String {
+    format!("removed:{}", crate::files::path_key(path))
+}
+
+/// A merge needs a clean registered working copy and evidence for the exact
+/// branch head. A linked GitHub pull request covers squash and rebase merges.
+pub fn completed_worktree(
+    cwd: &Path,
+    trees: &[crate::git::Worktree],
+    path: &str,
+    base: Option<&str>,
+    linked_pr: Option<&crate::session_groups::WorkItem>,
+) -> Option<String> {
+    let main = trees.first().filter(|tree| tree.main && !tree.missing)?;
+    if crate::files::path_key(path) == crate::files::path_key(&main.path) {
+        return None;
+    }
+    let linked = trees
+        .iter()
+        .filter(|tree| !tree.main && crate::files::is_equal_or_inside(path, &tree.path))
+        .max_by_key(|tree| tree.path.len());
+    let tree = linked.filter(|tree| !tree.missing)?;
+    let branch = tree.branch.as_deref()?;
+    let base = base
+        .filter(|branch| !branch.is_empty() && *branch != "HEAD")
+        .or(main.branch.as_deref())?;
+    if branch == base || tree.head.is_empty() {
+        return None;
+    }
+    let branch_ref = format!("refs/heads/{branch}");
+    let has_commits = crate::git::git(cwd, &["reflog", "show", "--format=%H", &branch_ref])
+        .is_ok_and(|log| {
+            log.lines()
+                .rfind(|line| !line.is_empty())
+                .is_some_and(|start| start != tree.head)
+        });
+    let merged = has_commits
+        && [
+            format!("refs/heads/{base}"),
+            format!("refs/remotes/origin/{base}"),
+        ]
+        .iter()
+        .any(|reference| {
+            crate::git::git(cwd, &["merge-base", "--is-ancestor", &tree.head, reference]).is_ok()
+        });
+    if (!merged && linked_pr.is_none()) || !clean_worktree(tree) {
+        return None;
+    }
+    (merged || linked_pr.is_some_and(|pr| linked_pr_merged(pr, branch, &tree.head, base)))
+        .then(|| merged_worktree_key(tree, branch))
+}
+
+/// A branch may have been switched or gained a commit or edits since a probe started.
+pub fn worktree_archive_evidence_current(path: &str, evidence: &str) -> bool {
+    if evidence == removed_worktree(path) {
+        return matches!(Path::new(path).try_exists(), Ok(false));
+    }
+    crate::git::worktrees(Path::new(path)).is_ok_and(|trees| {
+        trees.iter().any(|tree| {
+            !tree.main
+                && !tree.missing
+                && crate::files::is_equal_or_inside(path, &tree.path)
+                && tree.branch.as_deref().is_some_and(|branch| {
+                    merged_worktree_key(tree, branch) == evidence && clean_worktree(tree)
+                })
+        })
+    })
+}
+
+fn merged_worktree_key(tree: &crate::git::Worktree, branch: &str) -> String {
+    format!(
+        "merged:{}:{branch}:{}",
+        crate::files::path_key(&tree.path),
+        tree.head
+    )
+}
+
+fn clean_worktree(tree: &crate::git::Worktree) -> bool {
+    crate::git::git(
+        Path::new(&tree.path),
+        &[
+            "--no-optional-locks",
+            "status",
+            "--porcelain",
+            "--untracked-files=normal",
+        ],
+    )
+    .is_ok_and(|status| status.is_empty())
+}
+
+fn linked_pr_merged(
+    item: &crate::session_groups::WorkItem,
+    branch: &str,
+    head: &str,
+    base: &str,
+) -> bool {
+    use crate::codespaces::{GhRunner, SystemGh};
+    let Some(item) =
+        crate::session_groups::parse_github_work_item(&item.url).filter(|item| item.kind == "pr")
+    else {
+        return false;
+    };
+    let args = [
+        "pr".into(),
+        "view".into(),
+        "--json".into(),
+        "state,headRefName,headRefOid,baseRefName".into(),
+        "--".into(),
+        item.url,
+    ];
+    SystemGh
+        .run(&args, None)
+        .is_ok_and(|out| out.success && merged_pr_matches(&out.stdout, branch, head, base))
+}
+
+fn merged_pr_matches(json: &str, branch: &str, head: &str, base: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(json).is_ok_and(|pr| {
+        pr["state"] == "MERGED"
+            && pr["headRefName"] == branch
+            && pr["headRefOid"] == head
+            && pr["baseRefName"] == base
+    })
+}
 pub fn default_root(main: &Path) -> PathBuf {
     main.with_file_name(format!(
         "{}-worktrees",
@@ -118,6 +242,55 @@ mod tests {
         git(&["add", "file"]);
         git(&["commit", "-m", "Initial"]);
         dir
+    }
+    #[test]
+    fn an_empty_or_dirty_branch_is_not_a_completed_worktree() {
+        let dir = repo();
+        let tree = crate::git::create_named_worktree(dir.path(), "progress").unwrap();
+        let check = || {
+            let trees = crate::git::worktrees(dir.path()).unwrap();
+            completed_worktree(dir.path(), &trees, &tree.path, Some("main"), None)
+        };
+        assert_eq!(check(), None, "just creating the worktree is not a merge");
+        let branch = Path::new(&tree.path);
+        std::fs::write(branch.join("file"), "finished").unwrap();
+        crate::git::git(branch, &["commit", "-am", "Finish work"]).unwrap();
+        assert_eq!(check(), None, "the change is still unique to the worktree");
+        crate::git::git(dir.path(), &["merge", "progress"]).unwrap();
+        assert!(check().is_some(), "the work is present in main");
+        std::fs::write(branch.join("draft"), "unsaved").unwrap();
+        assert_eq!(check(), None, "the checkout still has uncommitted work");
+        std::fs::remove_file(branch.join("draft")).unwrap();
+        remove_clean(branch).unwrap();
+        let _ = std::fs::remove_dir(default_root(dir.path()));
+    }
+
+    #[test]
+    fn a_missing_path_alone_does_not_confirm_a_merge() {
+        let dir = repo();
+        let tree = crate::git::create_named_worktree(dir.path(), "cleanup").unwrap();
+        remove_clean(Path::new(&tree.path)).unwrap();
+        let trees = crate::git::worktrees(dir.path()).unwrap();
+        assert_eq!(
+            completed_worktree(dir.path(), &trees, &tree.path, None, None),
+            None
+        );
+        let _ = std::fs::remove_dir(default_root(dir.path()));
+    }
+
+    #[test]
+    fn pull_request_evidence_requires_a_merge_of_the_exact_current_head() {
+        let merged = r#"{"state":"MERGED","headRefName":"work","headRefOid":"new-head","baseRefName":"main"}"#;
+        assert!(merged_pr_matches(merged, "work", "new-head", "main"));
+        assert!(!merged_pr_matches(merged, "work", "later-head", "main"));
+        assert!(!merged_pr_matches(merged, "other", "new-head", "main"));
+        assert!(!merged_pr_matches(merged, "work", "new-head", "release"));
+        assert!(!merged_pr_matches(
+            &merged.replace("MERGED", "OPEN"),
+            "work",
+            "new-head",
+            "main"
+        ));
     }
     #[test]
     fn removal_guards_and_branch_retention() {

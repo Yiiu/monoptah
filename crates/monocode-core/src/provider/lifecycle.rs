@@ -177,17 +177,47 @@ impl Protocol {
             if !self.claude_prompt_sent && started.elapsed() >= Duration::from_secs(8) {
                 self.claude_prompt(stdin)?;
             }
-            self.sync_background(&mut events);
-            if self.claude_result_seen
-                && self.activities.claude_background.is_empty()
-                && self.activities.claude_pending.is_empty()
-                && self.claude_resume_at.is_none_or(|at| Instant::now() >= at)
-            {
-                self.done = true;
-                events.push(Event::Done);
-            }
+            self.sync_claude_result(&mut events);
         }
         Ok(events)
+    }
+
+    pub(super) fn set_claude_turn_activity(&mut self, next: TurnActivity, events: &mut Vec<Event>) {
+        if self.claude_turn_activity != next {
+            self.claude_turn_activity = next;
+            events.push(Event::TurnActivity(next));
+        }
+    }
+
+    pub(super) fn sync_claude_result(&mut self, events: &mut Vec<Event>) {
+        self.sync_background(events);
+        if !self.claude_result_seen || self.done {
+            return;
+        }
+        let now = Instant::now();
+        let wake_tasks = self
+            .activities
+            .claude_tasks
+            .iter()
+            .filter(|task| task.kind != TaskKind::Shell)
+            .count() as u32;
+        let wake_tasks = wake_tasks.max(u32::from(
+            self.claude_task_wake_at.is_some_and(|at| at > now),
+        ));
+        if wake_tasks > 0 {
+            self.set_claude_turn_activity(TurnActivity::Yielded { wake_tasks }, events);
+        } else if self.claude_resume_at.is_some_and(|at| at > now) {
+            self.set_claude_turn_activity(TurnActivity::Running, events);
+        } else if !self.activities.claude_tasks.is_empty()
+            || self.claude_drain_at.is_some_and(|at| at > now)
+        {
+            // Completing the visible turn does not close the wire. The same
+            // CLI can still wake when a shell emits its background result.
+            self.set_claude_turn_activity(TurnActivity::Completed, events);
+        } else {
+            self.done = true;
+            events.push(Event::Done);
+        }
     }
 
     /// A user Stop uses the provider's cancellation API before transport teardown.
@@ -232,7 +262,7 @@ impl Protocol {
                         stdin,
                     )?;
                 }
-                let tasks: Vec<_> = self.activities.claude_background.keys().cloned().collect();
+                let tasks: Vec<_> = self.activities.claude_background.iter().cloned().collect();
                 for (ix, task) in tasks.iter().enumerate() {
                     write_json(
                         stdin,
