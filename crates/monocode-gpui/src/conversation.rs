@@ -516,7 +516,31 @@ impl Conversation {
         self.loaded
             .then(|| (self.model_label(), self.branch.clone()))
     }
-    pub(crate) fn preview(&self, status: &monocode_core::agent_status::AgentStatus) -> AnyElement {
+    fn preview_label(
+        &self,
+        status: &monocode_core::agent_status::AgentStatus,
+        tree: bool,
+        now: u64,
+    ) -> String {
+        if tree
+            && let Some(label) = crate::session_mark::finished_preview_label(&status.activity, now)
+        {
+            return label;
+        }
+        status.label(now).unwrap_or_else(|| {
+            if self.loading {
+                "Loading…".to_owned()
+            } else {
+                monocode_core::time::relative(self.summary.updated_at, now)
+            }
+        })
+    }
+
+    pub(crate) fn preview(
+        &self,
+        status: &monocode_core::agent_status::AgentStatus,
+        tree: bool,
+    ) -> AnyElement {
         let kind = Kind::from_id(&self.summary.provider);
         let model = self.resolved_model.as_deref().or(self.model.as_deref());
         let name = self
@@ -589,18 +613,7 @@ impl Conversation {
                             .flex_shrink_0()
                             .text_size(px(11.))
                             .text_color(crate::session_mark::activity_color(&status.activity))
-                            .child(status.label(monocode_core::time::now_ms()).unwrap_or_else(
-                                || {
-                                    if self.loading {
-                                        "Loading…".to_owned()
-                                    } else {
-                                        monocode_core::time::relative(
-                                            self.summary.updated_at,
-                                            monocode_core::time::now_ms(),
-                                        )
-                                    }
-                                },
-                            )),
+                            .child(self.preview_label(status, tree, monocode_core::time::now_ms())),
                     ),
             )
             .child(
@@ -4819,6 +4832,42 @@ mod tests {
 }
 
 #[cfg(test)]
+mod preview_tests {
+    use super::*;
+    use monocode_core::agent_status::{Activity, AgentStatus, Outcome};
+
+    #[gpui::test]
+    fn loaded_tree_preview_uses_the_receipt_instead_of_the_last_update(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let window = menu_tests::conversation(cx);
+        window
+            .update(cx, |view, _, _| {
+                let now = 5_000_000;
+                view.summary.updated_at = now - 2_000;
+                for unread in [true, false] {
+                    let status = AgentStatus {
+                        activity: Activity::Done {
+                            at: now - 79 * 60_000,
+                            outcome: Outcome::Completed,
+                            unread,
+                        },
+                        ..Default::default()
+                    };
+                    assert_eq!(
+                        view.preview_label(&status, true, now),
+                        "Finished 1h 19m ago"
+                    );
+                    if !unread {
+                        assert_eq!(view.preview_label(&status, false, now), "now");
+                    }
+                }
+            })
+            .unwrap();
+    }
+}
+
+#[cfg(test)]
 mod menu_tests {
     use super::*;
     use gpui::{TestAppContext, WindowHandle, point};
@@ -5176,7 +5225,7 @@ mod menu_tests {
             .unwrap();
     }
 
-    fn conversation(cx: &mut TestAppContext) -> WindowHandle<Conversation> {
+    pub(super) fn conversation(cx: &mut TestAppContext) -> WindowHandle<Conversation> {
         let store = Store::open(Path::new(":memory:")).unwrap();
         let summary = store.create("claude", "/work/monocode").unwrap();
         let store = Arc::new(Mutex::new(store));

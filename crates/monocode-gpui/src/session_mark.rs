@@ -73,6 +73,19 @@ impl State {
     }
 }
 
+pub(crate) fn finished_preview_label(activity: &Activity, now: u64) -> Option<String> {
+    let Activity::Done { at, .. } = activity else {
+        return None;
+    };
+    let relative = monocode_core::time::relative(*at, now);
+    Some(match relative.as_str() {
+        "" => "Finished".to_owned(),
+        "now" => "Finished just now".to_owned(),
+        elapsed if elapsed.ends_with(['m', 'h', 'd']) => format!("Finished {elapsed} ago"),
+        date => format!("Finished {date}"),
+    })
+}
+
 pub(crate) fn activity_color(activity: &Activity) -> Hsla {
     match activity {
         Activity::NeedsYou { .. }

@@ -991,16 +991,9 @@ mod tests {
         };
         visual.refresh().unwrap();
         assert_eq!(gutter(visual), px(6.));
-        for (row, hint) in [
-            ("sidebar-search-field", "sidebar-search-hint"),
-            ("sidebar-navigation-New", "sidebar-navigation-trailing-New"),
-        ] {
-            assert_eq!(
-                visual.debug_bounds(row).unwrap().right()
-                    - visual.debug_bounds(hint).unwrap().right(),
-                px(8.),
-            );
-        }
+        let search = visual.debug_bounds("sidebar-search-field").unwrap();
+        let hint = visual.debug_bounds("sidebar-search-hint").unwrap();
+        assert_eq!(search.right() - hint.right(), px(8.));
 
         window
             .update(visual, |shell, _, cx| {
@@ -1093,7 +1086,11 @@ mod tests {
         visual.refresh().unwrap();
         assert!(visual.debug_bounds("sidebar-search-field").is_none());
         let pin = visual.debug_bounds("tree-peek-pin").unwrap();
-        assert!(visual.debug_bounds(navigation_rows[0]).unwrap().top() >= pin.bottom());
+        let today = visual.debug_bounds(navigation_rows[0]).unwrap();
+        let options = visual.debug_bounds("sidebar-options").unwrap();
+        assert_eq!(today.center().y, pin.center().y);
+        assert_eq!(options.center().y, pin.center().y);
+        assert!(today.right() < pin.left() && pin.right() < options.left());
         assert_eq!(
             navigation_rows.map(|row| visual.debug_bounds(row).unwrap().size.width),
             docked_widths,

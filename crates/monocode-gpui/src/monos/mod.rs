@@ -40,6 +40,7 @@ mod workflow_runner;
 mod workflow_schedule;
 mod workflows_ui;
 use crate::{
+    cloud_mark::CloudTip,
     conversation::{Conversation, MonoSubmitted, SessionChanged},
     input::{self, Input},
     popover::{Anchor, AnchorSlot, Menu, MenuEvent, menu_popover, popover},
@@ -67,6 +68,11 @@ use std::{
     path::PathBuf,
     time::Duration,
 };
+const TREE_MONOS_HEIGHT: f32 = 32.;
+const TREE_MONO_AVATAR_SIZE: f32 = 22.;
+const TREE_MONO_AVATAR_GAP: f32 = 6.;
+const TREE_MONO_STATUS_SIZE: f32 = 6.;
+
 pub(crate) struct Changed;
 pub(crate) struct TabOpened(pub String);
 pub(crate) struct ShowDetails(pub String);
@@ -1576,16 +1582,16 @@ impl Monos {
         for mono in &roster {
             self.rail_bounds.entry(mono.id.clone()).or_default();
         }
+        if let Some(heading) = tree_heading {
+            return self.tree_mono_rail(heading, roster, cx);
+        }
         let count = roster.len();
         let has = count > 0;
         if original && !has && compact {
             return div().into_any_element();
         }
         let add_project = project.clone();
-        let tree = tree_heading.is_some();
-        let heading = if let Some(heading) = tree_heading {
-            heading
-        } else if original {
+        let heading = if original {
             div()
                 .h(px(30.))
                 .pl(px(10.))
@@ -1618,7 +1624,7 @@ impl Monos {
                     .size(px(20.))
                     // Centred on the sidebar's trailing column, with the
                     // session filter and the navigation hints and counts.
-                    .when(!original && !tree, |d| d.mr(px(-3.)))
+                    .when(!original, |d| d.mr(px(-3.)))
                     .on_click(cx.listener(move |this, _, w, cx| {
                         this.create(add_project.clone().into_iter().collect(), w, cx)
                     })),
@@ -1627,8 +1633,7 @@ impl Monos {
         .id("sidebar-mono-heading")
         .debug_selector(|| "sidebar-mono-heading".into());
         div()
-            .when(!original && !tree, |d| d.px_2().pb_3())
-            .when(tree, |d| d.pb_2())
+            .when(!original, |d| d.px_2().pb_3())
             .when(original && !compact, |d| d.pb_2())
             .when(compact, |d| {
                 d.w_full().flex().flex_col().items_center().gap(px(6.))
@@ -1852,6 +1857,112 @@ impl Monos {
             })
             .into_any_element()
     }
+    fn tree_mono_rail(
+        &self,
+        heading: gpui::Div,
+        roster: Vec<Mono>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let avatars = roster.into_iter().map(|mono| {
+            let id = mono.id.clone();
+            let options = id.clone();
+            let drag = id.clone();
+            let active = self.active.as_deref() == Some(id.as_str());
+            let state = self
+                .chats
+                .get(&id)
+                .map_or("idle", |chat| chat.read(cx).mono_status());
+            let (status, dot) = match state {
+                "working" => ("Working", Some(accent_color())),
+                "needs-you" => ("Needs you", Some(warning_color())),
+                _ => ("Idle", None),
+            };
+            let label: SharedString = format!("{} · {status}", mono.label()).into();
+            let selector = format!("mono-rail-{id}");
+            div()
+                .id(SharedString::from(selector.clone()))
+                .debug_selector(move || selector.clone())
+                .role(Role::Button)
+                .aria_label(label.clone())
+                .aria_selected(active)
+                .cursor_pointer()
+                .size(px(TREE_MONO_AVATAR_SIZE))
+                .flex_shrink_0()
+                .relative()
+                .rounded_md()
+                .bg(content(if active { 0.10 } else { 0.04 }))
+                .hover(|d| d.bg(content(0.10)))
+                .tooltip(move |_, cx| cx.new(|_| CloudTip(label.clone())).into())
+                .child(avatar::avatar(
+                    &mono.mascot,
+                    mono.color,
+                    state,
+                    TREE_MONO_AVATAR_SIZE,
+                    true,
+                ))
+                .when_some(dot, |d, color| {
+                    d.child(
+                        div()
+                            .absolute()
+                            .bottom_0()
+                            .right_0()
+                            .size(px(TREE_MONO_STATUS_SIZE))
+                            .rounded_full()
+                            .bg(color),
+                    )
+                })
+                .child(self.rail_bounds[&id].probe())
+                .on_click(cx.listener(move |this, _, w, cx| {
+                    if !std::mem::take(&mut this.skip_click) {
+                        this.open(&id, w, cx);
+                    }
+                }))
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, event: &gpui::MouseDownEvent, w, cx| {
+                        this.open_options(&options, Some(event.position), w, cx);
+                    }),
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event: &gpui::MouseDownEvent, _, _| {
+                        this.skip_click = false;
+                        this.drag = Some((drag.clone(), event.position, None));
+                    }),
+                )
+        });
+        div()
+            .id("sidebar-mono-heading")
+            .debug_selector(|| "sidebar-mono-heading".into())
+            .h(px(TREE_MONOS_HEIGHT))
+            .pl(px(6.))
+            .flex()
+            .items_center()
+            .gap(px(TREE_MONO_AVATAR_GAP))
+            .child(heading.flex_none())
+            .child(
+                div()
+                    .id("tree-mono-avatars")
+                    .flex()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_x_scroll()
+                    .gap(px(TREE_MONO_AVATAR_GAP))
+                    .children(avatars),
+            )
+            .child(
+                icon_button("new-mono", "New mono", "plus")
+                    .debug_selector(|| "sidebar-mono-button".into())
+                    .size(px(20.))
+                    .on_click(cx.listener(|this, _, w, cx| this.create(Vec::new(), w, cx))),
+            )
+            .when(self.current().is_none(), |d| {
+                d.children(self.options_surface(cx))
+                    .children(self.background_modal())
+            })
+            .into_any_element()
+    }
+
     pub(crate) fn title_tab(&self, id: &str, width: f32, cx: &Context<Self>) -> Option<AnyElement> {
         self.roster.get(id).map(|mono| {
             let id = mono.id.clone();

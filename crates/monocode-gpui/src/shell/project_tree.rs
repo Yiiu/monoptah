@@ -51,7 +51,13 @@ impl Counts {
 enum ProjectEntry {
     Heading(&'static str),
     Group(String),
-    Project(String),
+    Project(TreeProject),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TreeProject {
+    path: String,
+    group: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -73,7 +79,7 @@ enum TreeRow {
     Worktree {
         project: String,
         path: String,
-        branch: Option<String>,
+        title: WorktreeTitle,
         open: bool,
         counts: Counts,
     },
@@ -186,7 +192,10 @@ const ARCHIVED_KEY: &str = "archived";
 /// Whether `row` starts the next block after a dragged project (or group).
 fn ends_block(row: &TreeRow, kind: &RailDragKind) -> bool {
     match (row, kind) {
-        (TreeRow::Header(ProjectEntry::Project(_)), RailDragKind::Group) => false,
+        (
+            TreeRow::Header(ProjectEntry::Project(TreeProject { group: Some(_), .. })),
+            RailDragKind::Group,
+        ) => false,
         (TreeRow::Header(_) | TreeRow::Archived(_) | TreeRow::Monos, _) => true,
         (
             TreeRow::Session {
@@ -211,7 +220,10 @@ fn ends_block(row: &TreeRow, kind: &RailDragKind) -> bool {
 
 fn drag_block_id<'a>(row: &'a TreeRow, kind: &RailDragKind) -> Option<Cow<'a, str>> {
     match (row, kind) {
-        (TreeRow::Header(ProjectEntry::Project(path)), RailDragKind::Project)
+        (
+            TreeRow::Header(ProjectEntry::Project(TreeProject { path, .. })),
+            RailDragKind::Project,
+        )
         | (TreeRow::Header(ProjectEntry::Group(path)), RailDragKind::Group) => {
             Some(Cow::Borrowed(path))
         }
@@ -262,6 +274,7 @@ pub(super) struct TreeState {
     rows: Vec<TreeRow>,
     counts: HashMap<String, Counts>,
     requests: Vec<i64>,
+    closing_requests: Vec<i64>,
     request_disclosure: Disclosure,
     projects: HashMap<String, bool>,
     worktrees: HashSet<String>,
@@ -272,6 +285,7 @@ pub(super) struct TreeState {
     last_request: Option<i64>,
     row_anchors: RefCell<Vec<AnchorSlot>>,
     diffs: tree_diffs::Diffs,
+    worktree_titles: TreeWorktrees,
     /// The project, folder and session blocks a row moves with during reordering.
     owners: Vec<Option<TreeRowOwner>>,
     /// Nodes opening or closing, by node key.
@@ -284,6 +298,8 @@ pub(super) struct TreeState {
 }
 
 mod tree_diffs;
+mod tree_worktrees;
+use tree_worktrees::{TreeWorktrees, WorktreeTitle};
 
 impl TreeState {
     pub(super) fn new(cx: &mut Context<Shell>) -> Self {
@@ -301,6 +317,7 @@ impl TreeState {
             rows: Vec::new(),
             counts: HashMap::new(),
             requests: Vec::new(),
+            closing_requests: Vec::new(),
             request_disclosure: Disclosure::new(false),
             projects: HashMap::new(),
             worktrees: HashSet::new(),
@@ -311,6 +328,7 @@ impl TreeState {
             last_request: None,
             row_anchors: RefCell::new(Vec::new()),
             diffs: Default::default(),
+            worktree_titles: TreeWorktrees::default(),
             owners: Vec::new(),
             disclosures: HashMap::new(),
             lingering: HashSet::new(),
@@ -338,6 +356,13 @@ impl TreeState {
             .map_or(if open { 1. } else { 0. }, |d| d.fraction(now))
     }
 
+    fn project_gap_at(&self, index: usize) -> Pixels {
+        render::project_gap(
+            &self.rows[index],
+            index.checked_sub(1).and_then(|index| self.rows.get(index)),
+        )
+    }
+
     /// Each block spans its header and child rows, using the list's height
     /// estimates until those rows have been measured. Bounds are unshifted.
     pub(super) fn drag_blocks(
@@ -361,9 +386,13 @@ impl TreeState {
                 .list
                 .estimated_bounds_for_item(end - 1)
                 .map_or(head.bottom(), |last| last.bottom());
+            let mut origin = head.origin;
+            // The space before a header belongs to the slot, so it stays put
+            // when the first and second blocks exchange their positions.
+            origin.y += self.project_gap_at(ix);
             blocks.push((
                 id.into_owned(),
-                Bounds::from_corners(head.origin, gpui::point(head.right(), bottom)),
+                Bounds::from_corners(origin, gpui::point(head.right(), bottom)),
             ));
         }
         blocks
@@ -422,7 +451,7 @@ impl TreeState {
             .iter()
             .map(|row| {
                 match row {
-                    TreeRow::Header(ProjectEntry::Project(path)) => {
+                    TreeRow::Header(ProjectEntry::Project(TreeProject { path, .. })) => {
                         project = Some(path);
                         folder = None;
                         session = None;
@@ -498,7 +527,7 @@ impl TreeState {
         }
         if let Some(project) = self.reveal_project.take()
             && let Some(ix) = self.rows.iter().position(|row| {
-                matches!(row, TreeRow::Header(ProjectEntry::Project(path)) if path == &project)
+                matches!(row, TreeRow::Header(ProjectEntry::Project(TreeProject { path, .. })) if path == &project)
             })
         {
             self.list.scroll_to(ListOffset { item_ix: ix, offset_in_item: px(0.) });
@@ -670,13 +699,19 @@ impl Shell {
 
     fn tree_project_entries(&self, show_collapsed_groups: bool) -> Vec<ProjectEntry> {
         let workspace = &self.workspace;
-        let mut entries = Vec::new();
+        let mut entries = vec![ProjectEntry::Heading("Projects")];
         let pinned = |path: &String| workspace.project_rail_pinned.contains(path);
-        let project = |path: &String| ProjectEntry::Project(path.clone());
-        if workspace.projects.iter().any(pinned) {
-            entries.push(ProjectEntry::Heading("Pinned"));
-            entries.extend(workspace.projects.iter().filter(|p| pinned(p)).map(project));
-        }
+        let project = |path: &String| {
+            ProjectEntry::Project(TreeProject {
+                path: path.clone(),
+                group: if pinned(path) {
+                    None
+                } else {
+                    workspace.project_rail_group(path).map(str::to_owned)
+                },
+            })
+        };
+        entries.extend(workspace.projects.iter().filter(|p| pinned(p)).map(project));
         for group in &workspace.project_rail_groups {
             entries.push(ProjectEntry::Group(group.id.clone()));
             if show_collapsed_groups || !group.collapsed {
@@ -692,7 +727,6 @@ impl Shell {
                 );
             }
         }
-        entries.push(ProjectEntry::Heading("Projects"));
         entries.extend(
             workspace
                 .projects
@@ -738,11 +772,14 @@ impl Shell {
                 ProjectEntry::Group(id) => {
                     let open = self.tree_group_open(&id);
                     let key = group_key(&id);
-                    rows.push(TreeRow::Header(ProjectEntry::Group(id)));
+                    rows.push(TreeRow::Header(ProjectEntry::Group(id.clone())));
                     let mut projects = Vec::new();
-                    while matches!(entries.peek(), Some(ProjectEntry::Project(_))) {
-                        if let Some(ProjectEntry::Project(path)) = entries.next() {
-                            projects.push(path);
+                    while matches!(
+                        entries.peek(),
+                        Some(ProjectEntry::Project(TreeProject { group: Some(group), .. })) if group == &id
+                    ) {
+                        if let Some(ProjectEntry::Project(project)) = entries.next() {
+                            projects.push(project);
                         }
                     }
                     self.tree_children(&mut rows, key, open, |rows| {
@@ -751,8 +788,8 @@ impl Shell {
                         }
                     });
                 }
-                ProjectEntry::Project(path) => {
-                    self.tree_project_block(&mut rows, path, catalog, cx)
+                ProjectEntry::Project(project) => {
+                    self.tree_project_block(&mut rows, project, catalog, cx)
                 }
                 heading => rows.push(TreeRow::Header(heading)),
             }
@@ -782,19 +819,20 @@ impl Shell {
     fn tree_project_block(
         &self,
         rows: &mut Vec<TreeRow>,
-        path: String,
+        project: TreeProject,
         catalog: &TreeCatalog,
         cx: &App,
     ) {
-        let ids = catalog.projects.get(&path).map_or(&[][..], Vec::as_slice);
+        let path = &project.path;
+        let ids = catalog.projects.get(path).map_or(&[][..], Vec::as_slice);
         if ids.is_empty() && self.tree_filtered() {
             return;
         }
-        let open = self.tree_project_open(&path);
-        let key = project_key(&path);
-        rows.push(TreeRow::Header(ProjectEntry::Project(path.clone())));
+        let open = self.tree_project_open(path);
+        let key = project_key(path);
+        rows.push(TreeRow::Header(ProjectEntry::Project(project.clone())));
         self.tree_children(rows, key, open, |rows| {
-            self.tree_project_rows(rows, &path, ids, catalog, cx);
+            self.tree_project_rows(rows, path, ids, catalog, cx);
         });
     }
 
@@ -1050,15 +1088,12 @@ impl Shell {
         for (copy, members) in by_worktree {
             let open = !self.tree.worktrees.contains(&copy) || self.tree_filtered();
             let counts = copies.get(&path_key(&copy)).copied().unwrap_or_default();
-            let branch = members
-                .iter()
-                .filter(|&&id| !self.is_cloud(id))
-                .find_map(|id| self.tree_branch(*id, cx));
+            let title = self.tree_worktree_title(path, &copy, &members, cx);
             let key = worktree_key(&copy);
             rows.push(TreeRow::Worktree {
                 project: path.to_owned(),
                 path: copy,
-                branch,
+                title,
                 open,
                 counts,
             });
@@ -1174,6 +1209,21 @@ impl Shell {
         ids
     }
 
+    fn tree_worktree_title(
+        &self,
+        project: &str,
+        path: &str,
+        members: &[i64],
+        cx: &App,
+    ) -> WorktreeTitle {
+        self.tree.worktree_titles.title(project, path, || {
+            members
+                .iter()
+                .filter(|&&id| !self.is_cloud(id))
+                .find_map(|&id| self.tree_branch(id, cx))
+        })
+    }
+
     pub(super) fn focus_tree_session_worktree(&mut self, id: i64, cx: &App) {
         let Some(summary) = self.session_summaries.get(&id) else {
             return;
@@ -1183,7 +1233,10 @@ impl Shell {
         if path_key(&path) == path_key(&project) || project.starts_with("remote://") {
             self.worktree_focus.remove(&project);
         } else {
-            let branch = self.tree_branch(id, cx);
+            let branch = self
+                .tree_worktree_title(&project, &path, &[id], cx)
+                .branch()
+                .map(str::to_owned);
             self.worktree_focus.insert(
                 project,
                 crate::worktree_switcher::WorktreeFocus { path, branch },
@@ -1253,7 +1306,7 @@ impl Shell {
             .tree_project_entries(true)
             .into_iter()
             .filter_map(|item| match item {
-                ProjectEntry::Project(path) => Some(path),
+                ProjectEntry::Project(project) => Some(project.path),
                 _ => None,
             })
             .collect();
@@ -1406,7 +1459,7 @@ mod tests {
         let visual = &mut VisualTestContext::from_window(window.into(), cx);
         visual.simulate_resize(size(px(1400.), px(900.)));
         for (layout, height) in [
-            (NavigationLayout::Tree, 26.),
+            (NavigationLayout::Tree, 32.),
             (NavigationLayout::Focused, 28.),
             (NavigationLayout::Classic, 30.),
         ] {
@@ -1556,19 +1609,54 @@ mod tests {
     }
 
     #[gpui::test]
-    fn needs_you_uses_a_neutral_empty_state_and_discloses_requests(cx: &mut TestAppContext) {
-        use monocode_core::agent_status::Ask;
+    fn needs_you_collapses_when_empty_and_shows_44_pixel_requests(cx: &mut TestAppContext) {
+        let (window, mut visual, id, _) = tree_window(cx);
+        let item = format!("tree-needs-you-{id}").leak();
+        let nav = visual.debug_bounds("tree-nav-strip").unwrap();
+        let monos = visual.debug_bounds("sidebar-mono-heading").unwrap();
+        assert_eq!(monos.top() - nav.bottom(), px(12.));
+        assert!(visual.debug_bounds("tree-next-request").is_none());
+        assert!(visual.debug_bounds(item).is_none());
+
+        window
+            .update(&mut visual, |shell, _, cx| {
+                shell.agent_statuses.insert(
+                    id,
+                    AgentStatus {
+                        activity: Activity::NeedsYou {
+                            kind: Ask::Question,
+                        },
+                        ..Default::default()
+                    },
+                );
+                shell.notify_sidebar(cx);
+            })
+            .unwrap();
+        visual.refresh().unwrap();
+        assert!(visual.debug_bounds("tree-next-request").is_some());
+        assert_eq!(visual.debug_bounds(item).unwrap().size.height, px(44.));
+        assert!(visual.debug_bounds("sidebar-mono-heading").unwrap().top() > monos.top());
+        window
+            .update(&mut visual, |shell, _, cx| {
+                shell.agent_statuses.remove(&id);
+                shell.notify_sidebar(cx);
+            })
+            .unwrap();
+        visual.refresh().unwrap();
+        assert!(visual.debug_bounds("tree-next-request").is_none());
+        assert_eq!(
+            visual.debug_bounds("sidebar-mono-heading").unwrap().top(),
+            monos.top()
+        );
+    }
+
+    #[gpui::test]
+    fn tree_request_disclosure_animates_open_and_closed(cx: &mut TestAppContext) {
         let (window, id, _) = crate::shell::tests::window(cx);
         window
             .update(cx, |shell, _, cx| {
-                assert_eq!(render::needs_you_color(0), content(0.4));
-                assert_eq!(render::needs_you_color(1), warning_color());
-                for reduce_motion in [false, true] {
+                for reduce_motion in [true, false] {
                     cx.set_reduce_motion(reduce_motion);
-                    shell.agent_statuses.remove(&id);
-                    shell.tree_sidebar(cx);
-                    assert!(shell.tree.requests.is_empty());
-                    assert!(!shell.tree.request_disclosure.mounted(Instant::now()));
                     shell.agent_statuses.insert(
                         id,
                         AgentStatus {
@@ -1583,9 +1671,296 @@ mod tests {
                     let now = Instant::now();
                     assert!(shell.tree.request_disclosure.mounted(now));
                     assert_eq!(shell.tree.request_disclosure.animating(now), !reduce_motion);
+                    shell.agent_statuses.remove(&id);
+                    shell.tree_sidebar(cx);
+                    assert!(shell.tree.requests.is_empty());
+                    assert_eq!(
+                        shell.tree.request_disclosure.mounted(Instant::now()),
+                        !reduce_motion
+                    );
+                    assert!(
+                        !shell
+                            .tree
+                            .request_disclosure
+                            .mounted(Instant::now() + disclosure::DURATION)
+                    );
                 }
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn tree_mono_avatars_share_a_row_and_open_the_clicked_mono(cx: &mut TestAppContext) {
+        let (window, mut visual, _, _) = tree_window(cx);
+        let ids = window
+            .update(&mut visual, |shell, _, cx| {
+                let ids = shell.mono_manager().update(cx, |monos, cx| {
+                    let ids = std::array::from_fn::<_, 2, _>(|_| {
+                        monos.roster.create(Vec::new()).id.clone()
+                    });
+                    cx.notify();
+                    ids
+                });
+                shell.notify_sidebar(cx);
+                ids
+            })
+            .unwrap();
+        visual.run_until_parked();
+        let [first, second] = ids.each_ref().map(|id| {
+            visual
+                .debug_bounds(format!("mono-rail-{id}").leak())
+                .expect("avatar")
+        });
+        let add = visual
+            .debug_bounds("sidebar-mono-button")
+            .expect("New mono");
+        assert_eq!(first.top(), second.top());
+        assert_eq!(second.center().y, add.center().y);
+        assert_eq!(first.size, gpui::size(px(22.), px(22.)));
+        visual.simulate_click(second.center(), Default::default());
+        visual.run_until_parked();
+        window
+            .read_with(&mut visual, |shell, cx| {
+                let monos = shell.monos.as_ref().unwrap().read(cx);
+                assert_eq!(monos.current().unwrap().id, ids[1]);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn tree_pins_move_above_groups_without_absorbing_ungrouped_projects(cx: &mut TestAppContext) {
+        let (window, mut visual, _, _) = tree_window(cx);
+        let grouped = "/work/monocode";
+        let loose = "/work/another-project";
+        window
+            .update(&mut visual, |shell, _, cx| {
+                shell
+                    .workspace
+                    .project_rail_groups
+                    .push(crate::workspace::ProjectRailGroup {
+                        id: "release".into(),
+                        name: "Release".into(),
+                        ..Default::default()
+                    });
+                shell
+                    .workspace
+                    .project_rail_assignments
+                    .insert(grouped.into(), "release".into());
+                shell.toggle_project_rail_pin(grouped, cx);
+            })
+            .unwrap();
+        visual.refresh().unwrap();
+
+        let heading = visual.debug_bounds("tree-projects-heading").unwrap();
+        let group = visual.debug_bounds("tree-group-release").unwrap();
+        let pin = visual.debug_bounds("tree-project-/work/monocode").unwrap();
+        let ungrouped = visual
+            .debug_bounds("tree-project-/work/another-project")
+            .unwrap();
+        assert!(heading.bottom() <= pin.top());
+        assert!(pin.bottom() < group.top() && group.bottom() < ungrouped.top());
+        window
+            .update(&mut visual, |shell, _, cx| {
+                assert!(
+                    !shell
+                        .tree
+                        .rows
+                        .iter()
+                        .any(|row| matches!(row, TreeRow::Header(ProjectEntry::Heading("Pinned"))))
+                );
+                shell.toggle_project_rail_pin(grouped, cx);
+            })
+            .unwrap();
+        visual.refresh().unwrap();
+
+        let group = visual.debug_bounds("tree-group-release").unwrap();
+        let member = visual.debug_bounds("tree-project-/work/monocode").unwrap();
+        assert_eq!(member.top() - group.bottom(), px(2.));
+        window
+            .read_with(&mut visual, |shell, _| {
+                let block = shell
+                    .tree
+                    .drag_block_rows(&RailDragKind::Group, "release")
+                    .unwrap();
+                assert!(matches!(
+                    &shell.tree.rows[block.end],
+                    TreeRow::Header(ProjectEntry::Project(project)) if project.path == loose
+                ));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn read_finished_tree_rows_clear_the_status_and_keep_hover_and_rail(cx: &mut TestAppContext) {
+        use monocode_core::agent_status::Outcome;
+
+        let (window, mut visual, id, _) = tree_window(cx);
+        let row_id = format!("sidebar-session-{id}").leak();
+        let trailing_id = format!("tree-session-trailing-{id}").leak();
+        let step_id = format!("tree-session-step-{id}").leak();
+        let archive_id = format!("archive-session-{id}").leak();
+        window
+            .update(&mut visual, |shell, _, cx| {
+                shell.agent_statuses.insert(
+                    id,
+                    AgentStatus {
+                        activity: Activity::Done {
+                            at: 1_000,
+                            outcome: Outcome::Completed,
+                            unread: false,
+                        },
+                        ..Default::default()
+                    },
+                );
+                shell.selected_sessions.insert(id);
+                shell.notify_sidebar(cx);
+            })
+            .unwrap();
+        visual.refresh().unwrap();
+        let step = visual.debug_bounds(step_id).unwrap();
+        let row = visual.debug_bounds(row_id).unwrap();
+        assert_eq!(step.size.height, px(30.));
+        assert_eq!(row.size.height, px(26.));
+        // The connector extends from x=6 to x=15 inside the step.
+        assert!(row.left() > step.left() + px(15.));
+        assert!(visual.debug_bounds(trailing_id).is_none());
+        visual.simulate_mouse_move(row.center(), None, Default::default());
+        visual.run_until_parked();
+        assert!(visual.debug_bounds(archive_id).is_some());
+        assert_eq!(visual.debug_bounds(row_id).unwrap().left(), row.left());
+        visual.executor().advance_clock(Duration::from_millis(400));
+        visual.run_until_parked();
+        assert!(visual.debug_bounds("session-preview-content").is_some());
+    }
+
+    #[gpui::test]
+    fn tree_worktree_rows_follow_the_live_branch_and_detached_state(cx: &mut TestAppContext) {
+        use monocode_core::git::Worktree;
+
+        let (window, mut visual, main, topic) = tree_window(cx);
+        let project = "/work/another-project";
+        let copy = "/work/another-project-topic";
+        window
+            .update(&mut visual, |shell, _, cx| {
+                let summary = shell.session_summaries.get_mut(&topic).unwrap();
+                summary.cwd = project.into();
+                summary.has_messages = true;
+                shell.sessions[&topic].clone().update(cx, |view, _| {
+                    view.summary.cwd = project.into();
+                    view.summary.has_messages = true;
+                });
+                assert_eq!(shell.tree_branch(main, cx), None);
+                assert_eq!(shell.tree_branch(topic, cx), None);
+                shell.session_worktrees.insert(topic, Some(copy.into()));
+                shell.tree.worktree_titles.remember(
+                    project.into(),
+                    Some(vec![
+                        Worktree {
+                            path: project.into(),
+                            branch: Some("main".into()),
+                            main: true,
+                            ..Default::default()
+                        },
+                        Worktree {
+                            path: copy.into(),
+                            branch: Some("feat/x".into()),
+                            ..Default::default()
+                        },
+                    ]),
+                );
+                shell.notify_sidebar(cx);
+            })
+            .unwrap();
+        visual.refresh().unwrap();
+        let read_title = |visual: &mut gpui::VisualTestContext, worktree: &str| {
+            window
+                .read_with(visual, |shell, _| {
+                    shell
+                        .tree
+                        .rows
+                        .iter()
+                        .find_map(|row| match row {
+                            TreeRow::Worktree { path, title, .. } if path == worktree => {
+                                Some(title.clone())
+                            }
+                            _ => None,
+                        })
+                        .expect("rendered worktree")
+                })
+                .unwrap()
+        };
+        assert_eq!(
+            read_title(&mut visual, project),
+            WorktreeTitle::Branch("main".into())
+        );
+        assert_eq!(
+            read_title(&mut visual, copy),
+            WorktreeTitle::Branch("feat/x".into())
+        );
+
+        for (row, tip, previous_tip) in [
+            (
+                "tree-worktree-/work/another-project",
+                "project-tooltip-/work/another-project",
+                "project-tooltip-/work/another-project-topic",
+            ),
+            (
+                "tree-worktree-/work/another-project-topic",
+                "project-tooltip-/work/another-project-topic",
+                "project-tooltip-/work/another-project",
+            ),
+        ] {
+            let bounds = visual.debug_bounds(row).expect("worktree row");
+            visual.simulate_mouse_move(
+                gpui::point(bounds.left() + px(40.), bounds.center().y),
+                None,
+                Default::default(),
+            );
+            visual.run_until_parked();
+            visual.executor().advance_clock(Duration::from_secs(1));
+            visual.run_until_parked();
+            visual.refresh().unwrap();
+            assert!(visual.debug_bounds(tip).is_some(), "missing {tip}");
+            assert!(
+                visual.debug_bounds(previous_tip).is_none(),
+                "stale {previous_tip}"
+            );
+        }
+
+        window
+            .update(&mut visual, |shell, _, cx| {
+                shell.tree.worktree_titles.remember(
+                    project.into(),
+                    Some(vec![
+                        Worktree {
+                            path: project.into(),
+                            branch: Some("renamed".into()),
+                            main: true,
+                            ..Default::default()
+                        },
+                        Worktree {
+                            path: copy.into(),
+                            ..Default::default()
+                        },
+                    ]),
+                );
+                shell.focus_tree_session_worktree(topic, cx);
+                assert_eq!(shell.worktree_focus[project].branch, None);
+                shell.notify_sidebar(cx);
+            })
+            .unwrap();
+        visual.refresh().unwrap();
+        assert_eq!(
+            read_title(&mut visual, project),
+            WorktreeTitle::Branch("renamed".into())
+        );
+        assert_eq!(
+            read_title(&mut visual, copy),
+            WorktreeTitle::Directory {
+                name: "another-project-topic".into(),
+                detached: true,
+            }
+        );
     }
 
     #[gpui::test]
@@ -2207,8 +2582,8 @@ mod tests {
     }
 
     /// While a project is dragged its whole block follows the pointer on a
-    /// lifted plate, and the block it passes steps aside by the dragged
-    /// block's height. Dropping saves the order shared with Classic.
+    /// lifted plate. The block it passes moves to the first slot, including
+    /// the spacing between the two headers. Dropping saves the order shared with Classic.
     #[gpui::test]
     fn dragging_a_project_block_steps_the_next_one_aside(cx: &mut TestAppContext) {
         use gpui::{Modifiers, MouseButton, point, px};
@@ -2253,8 +2628,8 @@ mod tests {
             .update(visual, |shell, _, _| {
                 assert_eq!(
                     shell.project_rail_project_offset(&second),
-                    -first_block.size.height.as_f32(),
-                    "the passed block steps up by the dragged block's height"
+                    (first_block.top() - second_block.top()).as_f32(),
+                    "the passed block's header steps up to the first slot"
                 );
                 assert_eq!(
                     shell.project_rail_project_offset(&first),
@@ -2318,7 +2693,7 @@ mod tests {
                     .rows
                     .iter()
                     .position(|row| {
-                        matches!(row, TreeRow::Header(ProjectEntry::Project(id)) if id == &first)
+                        matches!(row, TreeRow::Header(ProjectEntry::Project(TreeProject { path: id, .. })) if id == &first)
                     })
                     .unwrap();
                 shell.tree.list.scroll_to(ListOffset {

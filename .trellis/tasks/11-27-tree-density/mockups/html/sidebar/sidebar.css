@@ -1,0 +1,111 @@
+html, body { margin: 0; height: 100%; }
+body {
+  background: var(--surface);
+  color: var(--content-85);
+  font-family: var(--font-ui);
+  font-size: 13px;
+  overflow: hidden;
+}
+.side { width: 216px; height: 905px; display: flex; flex-direction: column; box-sizing: border-box; padding: 8px 8px 0; }
+.scroll { flex: 1; overflow: hidden; }
+
+/* Search + nav icon strip */
+.search { height: 32px; border-radius: var(--radius); background: var(--content-04); display: flex; align-items: center; gap: 8px; padding: 0 8px; color: var(--content-50); }
+.search .kbd { margin-left: auto; font-size: 11px; color: var(--content-35); }
+.nav { display: flex; align-items: center; gap: 2px; margin: 4px 0 8px; }
+.nav button { all: unset; width: 26px; height: 26px; border-radius: var(--radius); display: grid; place-items: center; color: var(--content-50); position: relative; cursor: pointer; }
+.nav button:hover, .nav button.on { background: var(--content-10); color: var(--content-100); }
+.nav .more { margin-left: auto; }
+.nav .badge { position: absolute; top: 3px; right: 3px; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
+
+/* Section header */
+.sec { height: 24px; display: flex; align-items: center; gap: 4px; padding: 0 4px 0 6px; margin-top: 6px; font-size: 11px; font-weight: 600; letter-spacing: .04em; color: var(--content-35); text-transform: uppercase; }
+.sec .tools { margin-left: auto; display: flex; gap: 2px; }
+.sec .tools span { width: 22px; height: 22px; display: grid; place-items: center; border-radius: 4px; color: var(--content-35); }
+.sec .count { color: var(--attention); font-weight: 600; }
+
+/* Monos strip */
+.monos { height: 28px; display: flex; align-items: center; gap: 6px; padding: 0 4px 0 6px; }
+.monos .label { font-size: 11px; font-weight: 600; letter-spacing: .04em; color: var(--content-35); text-transform: uppercase; margin-right: 2px; }
+.mono { width: 22px; height: 22px; border-radius: 6px; display: grid; place-items: center; background: var(--content-06); position: relative; }
+.mono .dot { position: absolute; right: -1px; bottom: -1px; width: 7px; height: 7px; border-radius: 50%; border: 2px solid var(--surface); }
+.monos .add { margin-left: auto; color: var(--content-35); width: 22px; height: 22px; display: grid; place-items: center; }
+
+/* Rows */
+.row { height: var(--row-h); display: flex; align-items: center; gap: 6px; padding: 0 6px; border-radius: var(--radius); white-space: nowrap; }
+.row:hover { background: var(--content-06); }
+.row.sel { background: var(--content-10); color: var(--content-100); }
+.row .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.row .meta { flex-shrink: 0; font-size: 11px; color: var(--content-35); }
+.row .meta.run { color: var(--accent); max-width: 64px; overflow: hidden; text-overflow: ellipsis; }
+.row .meta.ask { color: var(--attention); }
+.proj { font-weight: 600; color: var(--content-85); }
+.proj .chev { color: var(--content-35); width: 12px; }
+.proj .pin { color: var(--content-35); }
+.proj .counts { font-size: 11px; display: flex; gap: 6px; }
+.av { width: 18px; height: 18px; border-radius: 5px; display: grid; place-items: center; flex-shrink: 0; }
+.sess { padding-left: 24px; color: var(--content-70); position: relative; }
+.sess::before { content: ""; position: absolute; left: 14px; top: 0; bottom: 0; border-left: 1px solid var(--content-10); }
+.sess.unread { color: var(--content-100); font-weight: 600; }
+.tile { width: 14px; height: 14px; border-radius: 4px; flex-shrink: 0; display: grid; place-items: center; color: #fff; }
+.tile.claude { background: var(--claude); }
+.tile.codex { background: var(--codex); border-radius: 50%; }
+.tile.running { box-shadow: 0 0 0 1.5px var(--surface), 0 0 0 3px var(--accent); }
+.udot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); flex-shrink: 0; }
+.hovertime { display: none; }
+.row:hover .hovertime, .row.force-hover .hovertime { display: inline; }
+.row.force-hover { background: var(--content-06); }
+.archived { margin-left: 24px; font-size: 11px; color: var(--content-35); height: 24px; display: flex; align-items: center; }
+
+/* Needs you */
+.need { height: 40px; display: flex; align-items: center; gap: 8px; padding: 0 6px; border-radius: var(--radius); background: rgba(224, 164, 58, .10); margin-bottom: 2px; }
+.need .txt { flex: 1; min-width: 0; line-height: 1.2; }
+.need .t1 { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--content-100); }
+.need .t2 { font-size: 11px; color: var(--content-50); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.footer { height: 36px; display: flex; align-items: center; padding: 0 4px; color: var(--content-35); border-top: 1px solid var(--content-06); }
+
+/* Menu (option B) */
+.menu { position: absolute; left: 60px; top: 70px; width: 150px; background: #363636; border: 1px solid var(--content-10); border-radius: 8px; padding: 4px; box-shadow: 0 8px 24px rgba(0,0,0,.4); z-index: 5; }
+.menu .mi { height: 26px; display: flex; align-items: center; gap: 8px; padding: 0 6px; border-radius: 4px; color: var(--content-85); }
+.menu .mi .chk { margin-left: auto; color: var(--accent); }
+.menu .sep { height: 1px; background: var(--content-10); margin: 4px 2px; }
+.navrow { height: 30px; display: flex; align-items: center; gap: 8px; padding: 0 6px; color: var(--content-50); border-radius: var(--radius); }
+.navrow .kbd { margin-left: auto; font-size: 11px; color: var(--content-35); }
+
+/* Round 3: worktree nodes (R6), hover archive + tooltip (R5), running-shell chip (R7) */
+.wtn { height: 25px; display: flex; align-items: center; gap: 6px; padding: 0 6px 0 18px; color: var(--content-70); border-radius: var(--radius); white-space: nowrap; }
+.wtn .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.wtn .det { color: var(--content-35); font-size: 11px; flex-shrink: 0; }
+.wtn .chev { color: var(--content-35); }
+.sess.deep { padding-left: 38px; }
+.sess.deep::before { left: 28px; }
+.shellchip { flex-shrink: 0; display: inline-flex; align-items: center; gap: 2px; font-size: 10px; padding: 0 3px; height: 15px; border-radius: 4px; background: var(--content-10); color: var(--content-70); }
+.archive { flex-shrink: 0; width: 20px; height: 20px; display: grid; place-items: center; border-radius: 4px; color: var(--content-70); }
+.row.force-hover .archive { background: var(--content-10); }
+.tip { position: absolute; left: 84px; z-index: 6; padding: 4px 8px; border-radius: 6px; background: #3a3a3a; border: 1px solid var(--content-10); color: var(--content-85); font-size: 11px; white-space: nowrap; box-shadow: 0 6px 16px rgba(0,0,0,.4); }
+.scroll { position: relative; }
+
+/* Round 4: looser rhythm. Row height and project gap come from the board's Parameters. */
+.side { padding: 10px 10px 0; }
+.row { height: calc(var(--tweak-row, 30) * 1px); }
+.proj:not(:first-child) { margin-top: calc(var(--tweak-gap, 6) * 1px); }
+.sec { height: 26px; margin-top: 12px; }
+.nav { gap: 4px; margin: 6px 0 10px; }
+.nav button { width: 28px; height: 28px; }
+.monos { height: 32px; margin-top: 2px; }
+.wtn { height: calc((var(--tweak-row, 30) - 2) * 1px); }
+.need { height: 44px; margin-bottom: 4px; }
+.search { height: 34px; }
+
+/* Round 5: keep the tree rail visible. Session highlight starts right of the rail, as in the app today. */
+.sess { isolation: isolate; }
+.sess:hover, .sess.sel, .sess.force-hover { background: transparent; }
+.sess::after { content: ""; position: absolute; z-index: -1; top: 1px; bottom: 1px; right: 0; left: 20px; border-radius: var(--radius); background: transparent; }
+.sess.deep::after { left: 34px; }
+.sess:hover::after, .sess.force-hover::after { background: var(--content-06); }
+.sess.sel::after { background: var(--content-10); }
+.sess { padding-left: 26px; }
+.sess.deep { padding-left: 40px; }
+
+.sess.force-hover { z-index: 5; }

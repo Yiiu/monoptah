@@ -1,0 +1,11 @@
+{"file": ".trellis/spec/native/index.md", "reason": "native-dev profile commands, one test pass per task, Linux CI"}
+{"file": ".trellis/spec/native/component-guidelines.md", "reason": "theme tokens, icon_button, popover/AnchorSlot, Disclosure, Tree rails step spacing and reorder rules"}
+{"file": ".trellis/spec/native/state-and-async.md", "reason": "background git reads for R6, agent_status Done/unread semantics for R5, Tree uses shared workspace data"}
+{"file": ".trellis/spec/native/testing.md", "reason": "shell::tests::window fixture, VisualTestContext, Linux-portable paths and keys"}
+{"file": ".trellis/spec/native/directory-structure.md", "reason": "where new modules go (tree_worktrees.rs), core vs GPUI split"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "reuse icon_button, CloudTip, sidebar_options_menu_items, git_cache instead of copies"}
+{"file": ".trellis/tasks/11-27-tree-density/research/r1-nav-strip.md", "reason": "R1 touch points and tests to update"}
+{"file": ".trellis/tasks/11-27-tree-density/research/r2-r3-needs-you-monos.md", "reason": "R2/R3 touch points and tests to update"}
+{"file": ".trellis/tasks/11-27-tree-density/research/r4-pinned.md", "reason": "R4 entry order, drag peers, pin redraw"}
+{"file": ".trellis/tasks/11-27-tree-density/research/r5-r7-session-row.md", "reason": "R5 trailing area, preview popover time source"}
+{"file": ".trellis/tasks/11-27-tree-density/research/r6-worktree-titles.md", "reason": "R6 title path, git::worktrees, git_cache, tree_diffs pattern"}
