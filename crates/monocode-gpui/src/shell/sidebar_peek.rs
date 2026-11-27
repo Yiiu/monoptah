@@ -1,4 +1,4 @@
-// Sidebar.tsx's peek: in the Focused layout (rounded or boxy) a collapsed
+// Sidebar.tsx's peek: in Focused and Tree (rounded or boxy) a hidden
 // sidebar slides out over the workspace while the pointer rests on the
 // window's left edge or on the sidebar toggle, and puts itself away once the
 // pointer leaves it.
@@ -130,25 +130,10 @@ impl Shell {
         }));
     }
 
-    fn peek_left(&self) -> f32 {
-        if self.workspace.tree_layout() {
-            super::project_tree::COLLAPSED_WIDTH
-        } else {
-            PEEK_INSET
-        }
-    }
-
     fn peek_area_contains(&self, position: Point<Pixels>) -> bool {
         let (x, y) = (position.x.as_f32(), position.y.as_f32());
-        let panel_left = self.peek_left();
-        // Tree's project buttons and the panel form one hover area.
-        let left = if self.workspace.tree_layout() {
-            0.
-        } else {
-            panel_left
-        };
-        x >= left
-            && x <= panel_left + self.workspace.sidebar_width
+        x >= PEEK_INSET
+            && x <= PEEK_INSET + self.workspace.sidebar_width
             && y >= TITLE_BAR_HEIGHT
             && y <= self.viewport_height - PEEK_INSET
     }
@@ -274,21 +259,13 @@ impl Shell {
                 ));
         let mut dim: gpui::Hsla = rgba(0x000000ff).into();
         dim.a = if light { 0.18 } else { 0.4 } * progress;
-        let backdrop = div().absolute().right_0().bottom_0().bg(dim);
-        if self.workspace.tree_layout() {
-            backdrop
-                .left(px(self.peek_left()))
-                .top(px(TITLE_BAR_HEIGHT))
-        } else {
-            backdrop.left_0().top_0()
-        }
+        div().absolute().inset_0().bg(dim)
     }
 
     fn peek_panel(&self, progress: f32, window: &mut Window) -> gpui::Stateful<gpui::Div> {
         // Tree uses its floating surface in every appearance, including when
         // the rest of the window is glass. The badge rim takes this same fill.
         let tree = self.workspace.tree_layout();
-        let drift = if tree { PEEK_DRIFT } else { -PEEK_DRIFT };
         let glass = !tree && self.window_glass == Some(true) && !is_light();
         // The blur marker carries no alpha for opacity to fade, so the blur
         // itself eases with the panel; at full strength to the last frame it
@@ -312,7 +289,7 @@ impl Shell {
             // Closing, it lets the pointer through to the workspace.
             .when(self.peek_open(), |d| d.occlude())
             .absolute()
-            .left(px(self.peek_left() + drift * (1. - progress)))
+            .left(px(PEEK_INSET - PEEK_DRIFT * (1. - progress)))
             .top(px(TITLE_BAR_HEIGHT))
             .bottom(px(PEEK_INSET))
             .w(px(self.workspace.sidebar_width))

@@ -101,14 +101,13 @@ impl Shell {
             .h(px(36.))
             .flex()
             .items_center()
+            .pl(px(12.))
             .child(
-                div().w(px(COLLAPSED_WIDTH)).flex().justify_center().child(
-                    icon_button("tree-settings", "Settings", "settings")
-                        .debug_selector(|| "tree-settings".into())
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.open_settings(crate::settings::Section::General, window, cx)
-                        })),
-                ),
+                icon_button("tree-settings", "Settings", "settings")
+                    .debug_selector(|| "tree-settings".into())
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.open_settings(crate::settings::Section::General, window, cx)
+                    })),
             )
             .into_any()
     }
@@ -509,7 +508,7 @@ impl Shell {
                 )
                 .text_color(content(0.42)),
             )
-            .child(self.tree_project_avatar(&path, counts, 16., false))
+            .child(self.tree_project_avatar(&path, counts))
             .child(div().flex_1().min_w_0().truncate().child(name))
             .child(counts_row(counts))
             .child(
@@ -582,9 +581,9 @@ impl Shell {
         row.into_any()
     }
 
-    fn tree_project_avatar(&self, path: &str, counts: Counts, side: f32, dot: bool) -> AnyElement {
+    fn tree_project_avatar(&self, path: &str, counts: Counts) -> AnyElement {
+        let side = 16.;
         div()
-            .relative()
             .size(px(side + 6.))
             .flex_shrink_0()
             .flex()
@@ -599,17 +598,6 @@ impl Shell {
                 icon("globe", side).text_color(content(0.55)).into_any()
             } else {
                 self.project_mark(path, side)
-            })
-            .when_some(counts.color().filter(|_| dot), |d, color| {
-                d.child(
-                    div()
-                        .absolute()
-                        .bottom_0()
-                        .right_0()
-                        .size(px(7.))
-                        .rounded_full()
-                        .bg(color),
-                )
             })
             .into_any()
     }
@@ -1179,212 +1167,6 @@ impl Shell {
                 }),
             )
             .into_any()
-    }
-
-    pub(in crate::shell) fn tree_status_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        // Opening another session demotes a lingering row even while the tree is
-        // collapsed, so it does not replay when the tree comes back.
-        self.tree_settle_unread(cx);
-        let catalog = self.tree_catalog(cx);
-        let requests = catalog.requests.len();
-        let request_color = needs_you_color(requests);
-        let monos = self
-            .monos
-            .clone()
-            .map(|monos| monos.update(cx, |monos, cx| monos.project_navigation_rail(true, cx)));
-        let entries = self.tree_project_entries(true);
-        let navigation = self.tree_status_navigation(cx);
-        div()
-            .id("tree-status-bar")
-            .debug_selector(|| "tree-status-bar".into())
-            .w(px(COLLAPSED_WIDTH))
-            .h_full()
-            .flex_shrink_0()
-            // Share the expanded sidebar frame background.
-            .flex()
-            .flex_col()
-            .items_center()
-            .gap(px(2.))
-            .px(px(5.))
-            .pt(px(4.))
-            .children(navigation)
-            .child(div().w_full().h_px().my_1().bg(content(0.08)))
-            .child(
-                div()
-                    .id("tree-compact-needs-you")
-                    .role(Role::Button)
-                    .aria_label(format!("Needs you {requests}"))
-                    .text_size(px(11.))
-                    .text_color(request_color)
-                    .rounded(px(6.))
-                    .h(px(28.))
-                    .px(px(3.))
-                    .flex()
-                    .items_center()
-                    .gap_px()
-                    .hover(|d| d.bg(content(0.05)))
-                    .child(icon("hand", 13.).text_color(request_color))
-                    .child(requests.to_string())
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.open_next_tree_request(window, cx)),
-                    ),
-            )
-            .child(
-                div()
-                    .id("tree-status-projects")
-                    .flex_1()
-                    .min_h_0()
-                    .w_full()
-                    .overflow_y_scroll()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap(px(2.))
-                    .children(monos)
-                    .children(entries.into_iter().map(|item| {
-                        match item {
-                            ProjectEntry::Heading(_) => {
-                                div().h_px().w(px(20.)).my_1().bg(content(0.10)).into_any()
-                            }
-                            ProjectEntry::Group(id) => div()
-                                .h(px(2.))
-                                .w(px(16.))
-                                .my_1()
-                                .rounded_full()
-                                .bg(self.tree_group_color(&id))
-                                .into_any(),
-                            ProjectEntry::Project(path) => {
-                                let counts = catalog.counts.get(&path).copied().unwrap_or_default();
-                                let label = rollup_label(&self.project_label(&path), counts);
-                                let tooltip = label.clone();
-                                div()
-                                    .id(SharedString::from(format!("tree-status-project-{path}")))
-                                    .role(Role::Button)
-                                    .aria_label(label)
-                                    .size(px(30.))
-                                    .rounded(px(6.))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .hover(|d| d.bg(content(0.05)))
-                                    .child(self.tree_project_avatar(&path, counts, 16., true))
-                                    .tooltip(move |_, cx| {
-                                        cx.new(|_| project_rail::ProjectTooltip(tooltip.clone()))
-                                            .into()
-                                    })
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.reveal_tree_project(path.clone(), cx);
-                                        this.set_peek(true, cx);
-                                    }))
-                                    .into_any()
-                            }
-                        }
-                    })),
-            )
-            .child(
-                // Focused reached Settings through its project header, which Tree drops.
-                icon_button("tree-status-settings", "Settings", "settings")
-                    .debug_selector(|| "tree-status-settings".into())
-                    .flex_shrink_0()
-                    .mb(px(6.))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.open_settings(crate::settings::Section::General, window, cx)
-                    })),
-            )
-            .into_any()
-    }
-
-    fn tree_group_color(&self, id: &str) -> gpui::Hsla {
-        self.workspace
-            .project_rail_groups
-            .iter()
-            .find(|group| group.id == id)
-            .and_then(|group| {
-                group
-                    .custom_color
-                    .as_deref()
-                    .and_then(|c| u32::from_str_radix(c.trim_start_matches('#'), 16).ok())
-                    .or_else(|| {
-                        group.color_index.and_then(|ix| {
-                            monocode_core::project_appearance::COLORS.get(ix).copied()
-                        })
-                    })
-            })
-            .map_or(content(0.22), |color| rgb(color).into())
-    }
-
-    fn tree_status_navigation(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let workspace = &self.workspace;
-        [
-            ("Search", "search", workspace.sidebar_search_visible),
-            ("Today", "clock", workspace.sidebar_today_visible),
-            ("New session", "square-plus", true),
-            ("Inbox", "inbox", workspace.sidebar_inbox_visible),
-            (
-                "Notes",
-                "note",
-                workspace.preferences.notes && workspace.sidebar_notes_visible,
-            ),
-            ("Automations", "zap", workspace.sidebar_automations_visible),
-            (
-                "Contributors",
-                "chart-square",
-                workspace.sidebar_contributors_visible,
-            ),
-        ]
-        .into_iter()
-        .filter(|(_, _, visible)| *visible)
-        .map(|(label, glyph, _)| {
-            let inbox_unread = label == "Inbox"
-                && self
-                    .inbox
-                    .as_ref()
-                    .is_some_and(|inbox| inbox.read(cx).unread_count() > 0);
-            let count = match label {
-                "Today" => self
-                    .today
-                    .as_ref()
-                    .map_or(0, |today| today.read(cx).open_count()),
-                "Notes" => self.note_count.unwrap_or(0),
-                _ => 0,
-            };
-            icon_button(label, label, glyph)
-                .relative()
-                .when(inbox_unread, |d| {
-                    d.child(
-                        div()
-                            .absolute()
-                            .right_0()
-                            .top_0()
-                            .child(tree_dot(accent_color())),
-                    )
-                })
-                .when(count > 0, |d| {
-                    d.child(
-                        div()
-                            .absolute()
-                            .right_0()
-                            .top_0()
-                            .bg(shell_fill())
-                            .rounded_full()
-                            .text_size(px(9.))
-                            .px(px(2.))
-                            .child(count.to_string()),
-                    )
-                })
-                .on_click(cx.listener(move |this, _, window, cx| match label {
-                    "Search" => this.focus_search(window, cx),
-                    "Today" => this.open_today(window, cx),
-                    "New session" => this.new_chat(cx),
-                    "Inbox" => this.open_inbox(window, cx),
-                    "Notes" => this.open_notes(window, cx),
-                    "Automations" => this.open_automations(window, cx),
-                    "Contributors" => this.open_contributors(None, None, window, cx),
-                    _ => (),
-                }))
-                .into_any()
-        })
-        .collect()
     }
 }
 

@@ -17,8 +17,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub(super) const COLLAPSED_WIDTH: f32 = 48.;
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct Counts {
     pub needs_you: usize,
@@ -1340,11 +1338,9 @@ mod tests {
             .unwrap();
     }
 
-    /// The Tree layout drops Focused's project header, whose menu was the only
-    /// visible way into Settings on Windows. The tree must offer its own, both
-    /// open and collapsed, and the shortcut must keep working.
+    /// Settings is available from the open tree, Peek, and the global shortcut.
     #[gpui::test]
-    fn tree_layout_reaches_settings_open_collapsed_and_by_shortcut(cx: &mut TestAppContext) {
+    fn tree_layout_reaches_settings_open_in_peek_and_by_shortcut(cx: &mut TestAppContext) {
         use gpui::{VisualTestContext, px, size};
         cx.update(|cx| cx.set_reduce_motion(true));
         cx.update(crate::shell::bind_keys);
@@ -1373,28 +1369,27 @@ mod tests {
             .update(visual, |shell, window, cx| {
                 shell.close_settings(window, cx);
                 shell.toggle_primary_sidebar(window, cx);
-            })
-            .unwrap();
-        visual.run_until_parked();
-        let gear = visual
-            .debug_bounds("tree-status-settings")
-            .expect("the collapsed status bar shows a Settings button");
-        visual.simulate_click(gear.center(), Default::default());
-        visual.run_until_parked();
-        assert!(
-            window
-                .update(visual, |shell, _, _| shell.settings.is_some())
-                .unwrap()
-        );
-
-        window
-            .update(visual, |shell, window, cx| {
-                shell.close_settings(window, cx);
                 shell.focus_active(window, cx);
             })
             .unwrap();
         visual.run_until_parked();
+        assert!(visual.debug_bounds("sidebar-frame").is_none());
+        assert!(visual.debug_bounds("tree-settings").is_none());
         visual.simulate_keystrokes("secondary-,");
+        visual.run_until_parked();
+
+        window
+            .update(visual, |shell, window, cx| {
+                assert!(shell.settings.is_some());
+                shell.close_settings(window, cx);
+                shell.set_peek(true, cx);
+            })
+            .unwrap();
+        visual.run_until_parked();
+        let gear = visual
+            .debug_bounds("tree-settings")
+            .expect("the Peek tree shows a Settings button");
+        visual.simulate_click(gear.center(), Default::default());
         visual.run_until_parked();
         assert!(
             window

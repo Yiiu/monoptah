@@ -18,7 +18,6 @@ use std::collections::HashMap;
 
 const CARD_RADIUS: f32 = 10.;
 const INSET_PANE_GUTTER: f32 = 6.;
-const TREE_RAIL_FADE_START: f32 = 0.25;
 
 // GPUI overflow clips rectangles. Capture outside the bordered frame so the
 // final mask includes its background, border and children at the outer radius.
@@ -151,39 +150,11 @@ fn panel_button(enabled: bool, dot: bool) -> gpui::Stateful<gpui::Div> {
 
 impl Shell {
     pub(super) fn session_sidebar_width(&self) -> f32 {
-        let collapsed = if self.tree_sidebar_has_rail() {
-            super::project_tree::COLLAPSED_WIDTH
-        } else {
-            0.
-        };
-        collapsed + (self.workspace.sidebar_width - collapsed) * self.sidebar_fraction
+        self.workspace.sidebar_width * self.sidebar_fraction
     }
 
-    fn tree_sidebar_has_rail(&self) -> bool {
+    fn tree_workspace(&self) -> bool {
         self.workspace.tree_layout() && self.settings.is_none()
-    }
-
-    fn tree_rail_layer(&mut self, cx: &mut Context<Self>) -> Option<gpui::Div> {
-        if !self.tree_sidebar_has_rail() || self.sidebar_fraction >= TREE_RAIL_FADE_START {
-            return None;
-        }
-        // Fade in the fixed-width rail while the full-width tree slides behind the clip.
-        let opacity = 1. - self.sidebar_fraction / TREE_RAIL_FADE_START;
-        Some(
-            div()
-                .absolute()
-                .left_0()
-                .top_0()
-                .w(px(super::project_tree::COLLAPSED_WIDTH))
-                .h_full()
-                .flex()
-                .flex_col()
-                .opacity(opacity)
-                .when(self.workspace.boxy_layout(), |d| {
-                    d.child(titlebar_drag_area().h(px(TITLE_BAR_HEIGHT)).flex_shrink_0())
-                })
-                .child(div().flex_1().min_h_0().child(self.tree_status_bar(cx))),
-        )
     }
 
     pub(super) fn classic_titlebar_spans_window(&self, cx: &gpui::App) -> bool {
@@ -289,7 +260,7 @@ impl Shell {
                 cx,
             )];
         }
-        let tree_sidebar = self.tree_sidebar_has_rail();
+        let tree_sidebar = self.tree_workspace();
         let gutter = if tree_sidebar {
             INSET_PANE_GUTTER
         } else {
@@ -347,19 +318,16 @@ impl Shell {
                             .h_full()
                             .overflow_hidden()
                             .bg(inset_chrome_wash())
-                            .when(!tree_sidebar || self.sidebar_fraction > 0., |d| {
-                                d.child(
-                                    div()
-                                        .absolute()
-                                        .left_0()
-                                        .top_0()
-                                        .w(px(self.workspace.sidebar_width))
-                                        .h_full()
-                                        .opacity(self.sidebar_fraction)
-                                        .child(self.sidebar_contents()),
-                                )
-                            })
-                            .children(self.tree_rail_layer(cx)),
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left_0()
+                                    .top_0()
+                                    .w(px(self.workspace.sidebar_width))
+                                    .h_full()
+                                    .opacity(self.sidebar_fraction)
+                                    .child(self.sidebar_contents()),
+                            ),
                     )
                 })
                 .child(div().w(px(sidebar_width)).h_full().flex_shrink_0())
@@ -445,7 +413,7 @@ impl Shell {
         let show_navigation = !spans_window;
         let navigation = show_navigation.then(|| self.navigation(cx));
         let corner = (self.settings.is_none() && !original).then(|| self.panel_toggle(window, cx));
-        let tree_sidebar = self.tree_sidebar_has_rail();
+        let tree_sidebar = self.tree_workspace();
         let body = div()
             .flex_1()
             .min_h_0()
@@ -471,33 +439,30 @@ impl Shell {
                             crate::right_panel::stroke()
                         })
                         .when(original, |d| d.bg(pane_fill()))
-                        .when(!tree_sidebar || self.sidebar_fraction > 0., |d| {
-                            d.child(
-                                // Full width while it slides; the frame clips it.
-                                div()
-                                    .absolute()
-                                    .left_0()
-                                    .top_0()
-                                    .w(px(self.workspace.sidebar_width))
-                                    .h_full()
-                                    .flex()
-                                    .flex_col()
-                                    .opacity(self.sidebar_fraction)
-                                    .when(!original, |d| {
-                                        d.child(
-                                            // The traffic lights head the sidebar, where
-                                            // the window's top is; the toggle floats
-                                            // above them (see below).
-                                            titlebar_drag_area()
-                                                .w_full()
-                                                .h(px(TITLE_BAR_HEIGHT))
-                                                .flex_shrink_0(),
-                                        )
-                                    })
-                                    .child(div().flex_1().min_h_0().child(self.sidebar_contents())),
-                            )
-                        })
-                        .children(self.tree_rail_layer(cx)),
+                        .child(
+                            // Full width while it slides; the frame clips it.
+                            div()
+                                .absolute()
+                                .left_0()
+                                .top_0()
+                                .w(px(self.workspace.sidebar_width))
+                                .h_full()
+                                .flex()
+                                .flex_col()
+                                .opacity(self.sidebar_fraction)
+                                .when(!original, |d| {
+                                    d.child(
+                                        // The traffic lights head the sidebar, where
+                                        // the window's top is; the toggle floats
+                                        // above them (see below).
+                                        titlebar_drag_area()
+                                            .w_full()
+                                            .h(px(TITLE_BAR_HEIGHT))
+                                            .flex_shrink_0(),
+                                    )
+                                })
+                                .child(div().flex_1().min_h_0().child(self.sidebar_contents())),
+                        ),
                 )
             })
             .child(
@@ -752,7 +717,7 @@ impl Shell {
                 + self.workspace.sidebar_width
                 + if self.workspace.boxy_layout() {
                     -0.5
-                } else if self.tree_sidebar_has_rail() {
+                } else if self.tree_workspace() {
                     INSET_PANE_GUTTER / 2.
                 } else {
                     0.5
@@ -1010,7 +975,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[gpui::test]
-    fn tree_sidebar_handoff_keeps_the_content_gutter_and_settings_aligned(cx: &mut TestAppContext) {
+    fn tree_sidebar_keeps_the_content_gutter_while_closing(cx: &mut TestAppContext) {
         let (window, _, _) = window(cx);
         let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
         visual.simulate_resize(gpui::size(px(1450.), px(900.)));
@@ -1026,7 +991,6 @@ mod tests {
         };
         visual.refresh().unwrap();
         assert_eq!(gutter(visual), px(6.));
-        let settings = visual.debug_bounds("tree-settings").unwrap().center();
         for (row, hint) in [
             ("sidebar-search-field", "sidebar-search-hint"),
             ("sidebar-navigation-New", "sidebar-navigation-trailing-New"),
@@ -1050,13 +1014,6 @@ mod tests {
             .unwrap();
         visual.refresh().unwrap();
         assert_eq!(gutter(visual), px(6.));
-        assert_eq!(
-            visual
-                .debug_bounds("tree-status-settings")
-                .unwrap()
-                .center(),
-            settings,
-        );
 
         window
             .update(visual, |shell, _, cx| {
@@ -1066,19 +1023,16 @@ mod tests {
             })
             .unwrap();
         visual.refresh().unwrap();
-        assert_eq!(gutter(visual), px(6.));
+        assert!(visual.debug_bounds("sidebar-frame").is_none());
         assert_eq!(
-            visual
-                .debug_bounds("tree-status-settings")
-                .unwrap()
-                .center(),
-            settings,
+            visual.debug_bounds("rounded-main-pane").unwrap().left(),
+            px(6.)
         );
         assert!(visual.debug_bounds("project-tree-sidebar").is_none());
     }
 
     #[gpui::test]
-    fn tree_uses_the_layout_shortcut_and_retains_a_collapsed_status_bar(cx: &mut TestAppContext) {
+    fn tree_shortcuts_hide_the_sidebar_and_allow_peek(cx: &mut TestAppContext) {
         cx.update(|cx| {
             crate::shell::bind_keys(cx);
             cx.set_reduce_motion(true);
@@ -1107,18 +1061,21 @@ mod tests {
                 })
                 .unwrap();
             visual.refresh().unwrap();
-            let status = visual
-                .debug_bounds("tree-status-bar")
-                .expect("collapsed status bar");
-            assert_eq!(status.size.width, px(48.));
+            assert!(visual.debug_bounds("sidebar-frame").is_none());
+            assert!(visual.debug_bounds("project-tree-sidebar").is_none());
+            assert_eq!(
+                visual.debug_bounds("main-pane-frame").unwrap().left(),
+                px(0.)
+            );
         }
-        window
-            .update(visual, |shell, _, cx| shell.set_peek(true, cx))
-            .unwrap();
+        visual.simulate_mouse_move(
+            gpui::point(px(1.), px(TITLE_BAR_HEIGHT + 50.)),
+            None,
+            Default::default(),
+        );
         visual.refresh().unwrap();
-        let status = visual.debug_bounds("tree-status-bar").unwrap();
         let peek = visual.debug_bounds("sidebar-peek").expect("open Tree peek");
-        assert_eq!(peek.left(), status.right());
+        assert_eq!(peek.left(), px(6.));
         let pin = visual.debug_bounds("tree-peek-pin").unwrap();
         let search = visual.debug_bounds("sidebar-search-field").unwrap();
         assert!(search.right() < pin.left());
@@ -1141,7 +1098,7 @@ mod tests {
             navigation_rows.map(|row| visual.debug_bounds(row).unwrap().size.width),
             docked_widths,
         );
-        visual.simulate_mouse_move(status.center(), None, Default::default());
+        visual.simulate_mouse_move(peek.center(), None, Default::default());
         visual.executor().advance_clock(Duration::from_millis(500));
         visual.run_until_parked();
         assert!(visual.debug_bounds("sidebar-peek").is_some());
@@ -1150,7 +1107,6 @@ mod tests {
         visual.run_until_parked();
         visual.refresh().unwrap();
         assert!(visual.debug_bounds("project-tree-sidebar").is_some());
-        assert!(visual.debug_bounds("tree-status-bar").is_none());
         assert!(visual.debug_bounds("sidebar-peek").is_none());
     }
 
