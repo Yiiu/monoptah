@@ -63,7 +63,7 @@ pub fn prepare_prompt(
 ) -> Result<String, String> {
     let text = native_prompt(kind, text);
     if matches!(kind, Kind::Omp | Kind::Devin) && text.trim_start().starts_with('/') {
-        crate::composer::validate_attachments(attachments)?;
+        crate::composer::validate_attachment_paths(attachments, true)?;
         return Ok(text);
     }
     crate::composer::prepare_prompt(&text, cwd, attachments)
@@ -255,12 +255,14 @@ mod tests {
     }
     #[test]
     fn raw_provider_commands_preserve_their_arguments_without_local_expansion() {
+        let folder = tempfile::tempdir().unwrap();
+        let attachments = [folder.path().to_path_buf()];
         assert_eq!(
             prepare_prompt(
                 Kind::Omp,
                 "/omp:plan @missing-file",
                 "/missing-project",
-                &[]
+                &attachments
             )
             .unwrap(),
             "/plan @missing-file"
@@ -270,7 +272,7 @@ mod tests {
                 Kind::Devin,
                 "/custom @missing-file",
                 "/missing-project",
-                &[]
+                &attachments
             )
             .unwrap(),
             "/custom @missing-file"
