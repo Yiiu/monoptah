@@ -148,6 +148,11 @@ pub fn rank_files<'a>(files: &'a [ProjectFile], query: &str, limit: usize) -> Ve
     matches.into_iter().map(|(_, file)| file).collect()
 }
 pub fn validate_attachments(paths: &[PathBuf]) -> Result<(), String> {
+    validate_attachment_paths(paths, false)
+}
+
+/// Local agents can resolve directory references without uploading their contents.
+pub fn validate_attachment_paths(paths: &[PathBuf], allow_folders: bool) -> Result<(), String> {
     if paths.len() > MAX_ATTACHMENTS {
         return Err(format!("Attach up to {MAX_ATTACHMENTS} files at a time."));
     }
@@ -156,6 +161,9 @@ pub fn validate_attachments(paths: &[PathBuf]) -> Result<(), String> {
         let meta = path
             .metadata()
             .map_err(|e| format!("{}: {e}", path.display()))?;
+        if allow_folders && meta.is_dir() {
+            continue;
+        }
         if !meta.is_file() {
             return Err(format!("{} is not a file.", path.display()));
         }
@@ -174,6 +182,10 @@ pub fn image_mime(path: &Path) -> Option<&'static str> {
         "webp" => Some("image/webp"),
         _ => None,
     }
+}
+
+pub fn attachment_image_mime(path: &Path) -> Option<&'static str> {
+    image_mime(path).filter(|_| !path.is_dir())
 }
 pub fn image_data(path: &Path) -> Result<String, String> {
     use base64::Engine;
@@ -240,7 +252,7 @@ fn scaled_bgra(image: image::DynamicImage, scale: f64) -> image::RgbaImage {
 /// Resolve only exact, boundary-delimited known skill invocations. The original
 /// draft remains the visible user message; these instructions travel on the wire.
 pub fn prepare_prompt(text: &str, cwd: &str, attachments: &[PathBuf]) -> Result<String, String> {
-    validate_attachments(attachments)?;
+    validate_attachment_paths(attachments, true)?;
     let mut blocks = Vec::new();
     let mut context_bytes = 0;
     if text.split_whitespace().any(|word| word.starts_with('/')) {
@@ -269,6 +281,10 @@ pub fn prepare_prompt(text: &str, cwd: &str, attachments: &[PathBuf]) -> Result<
         }
     }
     for path in attachments {
+        if path.is_dir() {
+            blocks.push(format!("Attached folder: {}", path.display()));
+            continue;
+        }
         let mut block = format!("Attached file: {}", path.display());
         if image_mime(path).is_none() {
             if let Ok(body) = read_text(path, 128 * 1024) {
@@ -287,7 +303,7 @@ pub fn prepare_prompt(text: &str, cwd: &str, attachments: &[PathBuf]) -> Result<
         blocks.push(block);
     }
     let text = if text.trim().is_empty() && !attachments.is_empty() {
-        "The user attached these files. Use the conversation to determine what to do with them; ask if the intent is unclear."
+        "The user attached these files or folders. Use the conversation to determine what to do with them. Ask if the intent is unclear."
     } else {
         text
     };
@@ -444,5 +460,28 @@ mod tests {
         assert!(prompt.contains("Inspect before edits."));
         assert!(prompt.contains("useful context"));
         assert!(prompt.ends_with("/native-test-skill do it"));
+    }
+
+    #[test]
+    fn local_folder_attachments_are_references_without_uploading_children() {
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("screenshots.png");
+        std::fs::create_dir(&folder).unwrap();
+        let child = std::fs::File::create(folder.join("large.bin")).unwrap();
+        child.set_len(MAX_EMBED_BYTES + 1).unwrap();
+        drop(child);
+        let paths = std::slice::from_ref(&folder);
+
+        assert!(validate_attachment_paths(paths, true).is_ok());
+        assert!(validate_attachments(paths).is_err());
+        assert!(attachment_image_mime(&folder).is_none());
+        let prompt =
+            prepare_prompt("Inspect the folder", temp.path().to_str().unwrap(), paths).unwrap();
+        assert!(prompt.contains(&format!("Attached folder: {}", folder.display())));
+        assert!(!prompt.contains("large.bin"));
+        assert!(prompt.ends_with("Inspect the folder"));
+        let saved = crate::transcript::attachments::from_paths(paths);
+        assert_eq!(saved[0]["kind"], "file");
+        assert_eq!(saved[0]["mimeType"], "inode/directory");
     }
 }

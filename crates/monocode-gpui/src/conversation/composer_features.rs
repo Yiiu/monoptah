@@ -186,6 +186,7 @@ impl Conversation {
         let id = self.summary.id;
         let mut all = self.attachments.clone();
         let existing = all.len();
+        let allow_folders = !self.is_remote();
         let work = cx.background_executor().spawn(async move {
             if all.len() + images.len() > monocode_core::composer::MAX_ATTACHMENTS
                 || images.iter().map(|i| i.bytes().len() as u64).sum::<u64>()
@@ -207,7 +208,7 @@ impl Conversation {
                 std::fs::write(&path, image.bytes()).map_err(|e| e.to_string())?;
                 all.push(path);
             }
-            monocode_core::composer::validate_attachments(&all)?;
+            monocode_core::composer::validate_attachment_paths(&all, allow_folders)?;
             Ok(all.split_off(existing))
         });
         cx.spawn(async move |this, cx| {
@@ -238,8 +239,10 @@ impl Conversation {
         let mut all = self.attachments.clone();
         all.extend(incoming.iter().cloned());
         self.attaching = true;
+        let allow_folders = !self.is_remote();
         let work = cx.background_executor().spawn(async move {
-            monocode_core::composer::validate_attachments(&all).map(|_| incoming)
+            monocode_core::composer::validate_attachment_paths(&all, allow_folders)
+                .map(|_| incoming)
         });
         cx.spawn(async move |this, cx| {
             let result = work.await;

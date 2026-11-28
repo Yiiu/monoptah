@@ -63,6 +63,9 @@ pub fn prepare_prompt(
 ) -> Result<String, String> {
     let text = native_prompt(kind, text);
     if matches!(kind, Kind::Omp | Kind::Devin) && text.trim_start().starts_with('/') {
+        if attachments.iter().any(|path| path.is_dir()) {
+            return Err("Use the folder path as an argument to the slash command.".into());
+        }
         crate::composer::validate_attachments(attachments)?;
         return Ok(text);
     }
@@ -275,6 +278,18 @@ mod tests {
             .unwrap(),
             "/custom @missing-file"
         );
+    }
+
+    #[test]
+    fn raw_provider_commands_reject_folder_references_before_sending() {
+        let folder = tempfile::tempdir().unwrap();
+        let attachments = [folder.path().to_path_buf()];
+        for (kind, command) in [(Kind::Omp, "/omp:plan"), (Kind::Devin, "/custom")] {
+            assert_eq!(
+                prepare_prompt(kind, command, "/missing-project", &attachments).unwrap_err(),
+                "Use the folder path as an argument to the slash command."
+            );
+        }
     }
     #[test]
     fn pi_command_probe_never_starts_or_resumes_a_user_prompt() {
