@@ -360,7 +360,8 @@ impl Conversation {
         )
     }
     pub(crate) fn ready_for_external(&self, cx: &gpui::App) -> bool {
-        self.history_ready()
+        !crate::saving_for_shutdown(cx)
+            && self.history_ready()
             && !self.editing_last_turn.pending()
             && !self.busy
             && !self.stopping
