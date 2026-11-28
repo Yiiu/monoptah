@@ -6,11 +6,16 @@ pub(crate) struct StopOrchestration;
 #[cfg(test)]
 #[gpui::test]
 fn attachment_validation_resumes_when_shutdown_fails(test: &mut gpui::TestAppContext) {
-    let selected = tempfile::NamedTempFile::new().unwrap();
-    let queued = tempfile::NamedTempFile::new().unwrap();
+    use monocode_core::store::Store;
+    use std::sync::Mutex;
+
+    let root = std::env::current_dir().unwrap();
+    let selected = root.join("Cargo.toml");
+    let queued = root.join("Cargo.lock");
     let store = Store::open(std::path::Path::new(":memory:")).unwrap();
     let summary = store.create("codex", "/project").unwrap();
     let window = test.update(|cx| {
+        crate::input::bind(cx);
         cx.default_global::<crate::QuitGate>()
             .0
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -22,8 +27,8 @@ fn attachment_validation_resumes_when_shutdown_fails(test: &mut gpui::TestAppCon
     window
         .update(test, |view, _, cx| {
             view.attaching = true;
-            view.pending_attachments.push(queued.path().into());
-            view.finish_attachment_read(Ok(vec![selected.path().into()]), cx);
+            view.pending_attachments.push(queued.clone());
+            view.finish_attachment_read(Ok(vec![selected.clone()]), cx);
             view.add_attachments(vec!["ignored-during-shutdown".into()], cx);
             assert!(view.attachments.is_empty());
             assert!(view.attaching);
@@ -33,7 +38,7 @@ fn attachment_validation_resumes_when_shutdown_fails(test: &mut gpui::TestAppCon
     test.run_until_parked();
     window
         .update(test, |view, _, _| {
-            assert_eq!(view.attachments, [selected.path(), queued.path()]);
+            assert_eq!(view.attachments, [selected, queued]);
             assert!(!view.attaching);
         })
         .unwrap();
