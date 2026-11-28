@@ -18,6 +18,7 @@ mod handoff;
 #[cfg(all(test, unix))]
 mod handoff_tests;
 mod persistence;
+pub(crate) mod recovery;
 pub(crate) mod remote;
 mod visual_discovery;
 #[cfg(all(test, unix))]
@@ -59,6 +60,8 @@ pub(crate) struct Update {
     pub(crate) handoff: Option<Option<monocode_core::agent::Handoff>>,
     pub(crate) status: String,
     pub(crate) finished: bool,
+    /// A completed provider turn whose final reply still needs to be written.
+    pub(crate) reply_pending: bool,
 }
 fn publish(
     tx: &async_channel::Sender<Update>,
@@ -227,6 +230,12 @@ fn run_turn_using(
         let _ = tx.send_blocking(remote::failed(error));
         return;
     }
+    if let Err(error) = recovery::save_pending(&store, summary.id) {
+        let _ = tx.send_blocking(remote::failed(format!(
+            "The last reply isn't saved yet. Wait for the save and try again. {error}"
+        )));
+        return;
+    }
     if settings.account.root.is_none() && settings.account.id != monocode_core::accounts::DEFAULT {
         settings.account.root = locked(&store)
             .ok()
@@ -337,7 +346,7 @@ fn run_turn_using(
             .iter()
             .rposition(Row::is_prompt)
             .map_or(0, |at| at + 1);
-        persistence::save_turn_receipt(&store, summary.id, turn, info.clone())?;
+        pending.save_turn_receipt(&store, summary.id, turn, info.clone())?;
         turn_receipt = Some((turn, info));
         initial_delivery = settings.mono_message_id.clone();
         let creating_worktree = settings.new_worktree && settings.worktree_cwd.is_none();
@@ -379,6 +388,7 @@ fn run_turn_using(
                 }
                 .into(),
                 finished: false,
+                reply_pending: false,
             },
         )?;
         if creating_worktree {
@@ -429,6 +439,7 @@ fn run_turn_using(
                     handoff: None,
                     status: "Connecting…".into(),
                     finished: false,
+                    reply_pending: false,
                 },
             )?;
         }
@@ -479,6 +490,7 @@ fn run_turn_using(
                     handoff: None,
                     status: "Preparing handoff…".into(),
                     finished: false,
+                    reply_pending: false,
                 },
             )?;
             let root = locked(&store)?.data_dir().map(std::path::Path::to_path_buf);
@@ -541,6 +553,7 @@ fn run_turn_using(
                     handoff: Some(Some(prepared)),
                     status: "Connecting…".into(),
                     finished: false,
+                    reply_pending: false,
                 },
             )?;
         }
@@ -961,7 +974,7 @@ fn run_turn_using(
                                     provider_turn_id: root.provider_turn_id.clone(),
                                     ..Default::default()
                                 };
-                                persistence::save_turn_receipt(&store, summary.id, turn, steer)?;
+                                pending.save_turn_receipt(&store, summary.id, turn, steer)?;
                             }
                         }
                         Event::FollowUpFailed { id, error } => {
@@ -1208,6 +1221,7 @@ fn run_turn_using(
                                 handoff,
                                 status,
                                 finished: false,
+                                reply_pending: false,
                             },
                         )
                     };
@@ -1344,6 +1358,7 @@ fn run_turn_using(
             store.finish_turn(&session, cwd, id)
         });
     }
+    let mut reply_pending = false;
     let (start, rows, mut status) = if !history_loaded {
         // A rejected preflight has no row baseline. Writing an error at row 0
         // would replace a real conversation's first saved message.
@@ -1364,14 +1379,10 @@ fn run_turn_using(
         let start = final_start.min(transcript.begin("error"));
         transcript.append(&error);
         pending.changed(start);
-        let error = match pending.flush(
-            &store,
-            summary.id,
-            &transcript,
-            &context,
-            SaveReason::Final,
-            std::time::Instant::now(),
-        ) {
+        let error = match pending
+            .flush_final(&store, summary.id, &transcript, &context)
+            .0
+        {
             Ok(()) => error,
             Err(storage) => format!("{error} · Saving failed: {storage}"),
         };
@@ -1380,15 +1391,9 @@ fn run_turn_using(
         if final_start < transcript.rows.len() {
             pending.changed(final_start);
         }
-        let status = pending
-            .flush(
-                &store,
-                summary.id,
-                &transcript,
-                &context,
-                SaveReason::Final,
-                std::time::Instant::now(),
-            )
+        let (saved, retained) = pending.flush_final(&store, summary.id, &transcript, &context);
+        reply_pending = retained && !cancelled;
+        let status = saved
             .map(|_| "Ready".into())
             .unwrap_or_else(|error| format!("Saving failed: {error}"));
         (final_start, transcript.rows[final_start..].to_vec(), status)
@@ -1401,7 +1406,7 @@ fn run_turn_using(
         info.duration_known = true;
         info.completed_at = info.started_at.map(|_| completed);
         info.stopped = cancelled;
-        if let Err(error) = persistence::save_turn_receipt(&store, summary.id, turn, info) {
+        if let Err(error) = pending.save_turn_receipt(&store, summary.id, turn, info) {
             status = format!("{status} · Saving turn metadata failed: {error}");
         }
     }
@@ -1447,6 +1452,7 @@ fn run_turn_using(
         handoff,
         status,
         finished: true,
+        reply_pending,
     });
 }
 

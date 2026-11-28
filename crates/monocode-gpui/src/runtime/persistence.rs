@@ -2,6 +2,7 @@
 //! bounded cadence. Delivery receipts and settled turns always flush immediately.
 use super::*;
 use monocode_core::store::DirtyBlock;
+use monocode_core::store::ReplyRecoveryRevision;
 use std::time::Instant;
 
 // Match the desktop's routine-save window. Accepted messages and settled turns
@@ -19,6 +20,7 @@ pub(super) struct PendingSave {
     last_flush: Instant,
     interval: Duration,
     context_owner: Option<(String, String)>,
+    recovery_revision: Option<ReplyRecoveryRevision>,
 }
 
 impl PendingSave {
@@ -34,6 +36,7 @@ impl PendingSave {
                 Duration::ZERO
             },
             context_owner: None,
+            recovery_revision: None,
         }
     }
 
@@ -139,7 +142,9 @@ impl PendingSave {
                 // One call, one transaction: an early edit and a streaming
                 // tail land together, and a blob session's suffix behaves
                 // exactly as the single-range write always did.
+                let previous = store.reply_recovery_revision(session);
                 store.write_row_ranges(session, &ranges)?;
+                self.record_recovery_write(&store, session, previous);
             }
             if self.context_dirty {
                 let selected = if let Some((provider, account)) = &self.context_owner {
@@ -179,6 +184,64 @@ impl PendingSave {
         Ok(())
     }
 
+    fn record_recovery_write(
+        &mut self,
+        store: &Store,
+        session: i64,
+        previous: Option<ReplyRecoveryRevision>,
+    ) {
+        // A view read can refresh the store's guard during a turn. Advance
+        // only when this write followed the last revision owned by the run.
+        if self.recovery_revision.is_none() || self.recovery_revision == previous {
+            self.recovery_revision = store.reply_recovery_revision(session);
+        }
+    }
+
+    pub(super) fn flush_final(
+        &mut self,
+        store: &Database,
+        session: i64,
+        transcript: &Transcript,
+        context: &monocode_core::context::Usage,
+    ) -> (Result<(), String>, bool) {
+        let result = self.flush(
+            store,
+            session,
+            transcript,
+            context,
+            SaveReason::Final,
+            Instant::now(),
+        );
+        let Err(error) = result else {
+            return (result, false);
+        };
+        let ranges = self.pending_ranges(transcript);
+        if !ranges
+            .iter()
+            .flat_map(|(_, rows)| rows.iter())
+            .any(|row| row.role == "assistant" && !row.text.is_empty())
+        {
+            return (Err(error), false);
+        }
+        let Some(revision) = self.recovery_revision else {
+            return (Err(error), false);
+        };
+        match recovery::retain(store, session, revision, &transcript.rows, &ranges) {
+            Ok(Some(true)) => (Err(format!("{error} · {}", recovery::REPLY_RETAINED)), true),
+            Ok(Some(false)) => (
+                Err(format!("{error} · {}", recovery::REPLY_IN_MEMORY)),
+                true,
+            ),
+            Ok(None) => (Err(error), false),
+            Err(recovery) => (
+                Err(format!(
+                    "{error} · Could not preserve the reply: {recovery}"
+                )),
+                false,
+            ),
+        }
+    }
+
     pub(super) fn accept(
         &mut self,
         store: &Database,
@@ -192,8 +255,12 @@ impl PendingSave {
         let wait = Instant::now();
         let mut store = locked(store)?;
         let acquired = Instant::now();
+        let previous = store.reply_recovery_revision(session);
         let result =
             store.write_rows_with_message(session, from, &transcript.rows[from..], message);
+        if result.is_ok() {
+            self.record_recovery_write(&store, session, previous);
+        }
         let sample = store.take_save_sample();
         let held = acquired.elapsed();
         drop(store);
@@ -207,6 +274,24 @@ impl PendingSave {
         self.from = None;
         self.dirty.clear();
         self.last_flush = now;
+        Ok(())
+    }
+
+    pub(super) fn save_turn_receipt(
+        &mut self,
+        store: &Database,
+        session: i64,
+        turn: usize,
+        info: monocode_core::agent::TurnInfo,
+    ) -> Result<(), String> {
+        let store = locked(store)?;
+        let previous = store.reply_recovery_revision(session);
+        // The picker may have changed during the run. Update only its turn
+        // receipts, which can also update the stored prompt block.
+        let mut settings = store.agent_settings(session)?.unwrap_or_default();
+        settings.turns.insert(turn, info);
+        store.save_agent_settings(session, &settings)?;
+        self.record_recovery_write(&store, session, previous);
         Ok(())
     }
 }
@@ -242,20 +327,6 @@ pub(super) fn publish_then_flush(
     } else {
         Ok(())
     }
-}
-
-pub(super) fn save_turn_receipt(
-    store: &Database,
-    session: i64,
-    turn: usize,
-    info: monocode_core::agent::TurnInfo,
-) -> Result<(), String> {
-    let store = locked(store)?;
-    // The picker/composer may have changed during the run. Update only its
-    // immutable turn receipts, using the latest settings revision.
-    let mut settings = store.agent_settings(session)?.unwrap_or_default();
-    settings.turns.insert(turn, info);
-    store.save_agent_settings(session, &settings)
 }
 
 #[cfg(test)]
@@ -450,6 +521,7 @@ mod persistence_safety_tests {
             handoff: None,
             status: "Streaming".into(),
             finished: false,
+            reply_pending: false,
         }
     }
 
@@ -680,27 +752,28 @@ mod tests {
             .save_agent_settings(id, &settings)
             .unwrap();
         let started_at = transcript.rows[0].sent_at.unwrap();
-        save_turn_receipt(
-            &store,
-            id,
-            1,
-            monocode_core::agent::TurnInfo {
-                provider: "codex".into(),
-                model: "Turn Model".into(),
-                model_id: Some("turn-model".into()),
-                provider_turn_id: Some("turn-id".into()),
-                started_at: Some(started_at),
-                duration_ms: 9000,
-                duration_known: true,
-                completed_at: Some(started_at + 9000),
-                metrics: Some(monocode_core::agent::TurnMetrics {
-                    output_tokens: 5,
+        PendingSave::new(true, Instant::now())
+            .save_turn_receipt(
+                &store,
+                id,
+                1,
+                monocode_core::agent::TurnInfo {
+                    provider: "codex".into(),
+                    model: "Turn Model".into(),
+                    model_id: Some("turn-model".into()),
+                    provider_turn_id: Some("turn-id".into()),
+                    started_at: Some(started_at),
+                    duration_ms: 9000,
+                    duration_known: true,
+                    completed_at: Some(started_at + 9000),
+                    metrics: Some(monocode_core::agent::TurnMetrics {
+                        output_tokens: 5,
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }),
-                ..Default::default()
-            },
-        )
-        .unwrap();
+                },
+            )
+            .unwrap();
         let store = locked(&store).unwrap();
         let saved = store.agent_settings(id).unwrap().unwrap();
         assert_eq!(saved.revision, 42);

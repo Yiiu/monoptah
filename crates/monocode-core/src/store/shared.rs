@@ -64,6 +64,16 @@ pub(super) struct Shared {
 /// must still refuse a source edit made by another window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct HistoryRevision([u8; 32]);
+
+/// The exact source revision a successful turn write left behind.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ReplyRecoveryRevision(Option<(native_chunks::StorageMode, ReplySource)>);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReplySource {
+    Blob(HistoryRevision),
+    Chunks(i64),
+}
 impl HistoryRevision {
     pub(crate) fn of(blocks: &[Value]) -> Self {
         let mut hash = Self::start(blocks.len());
@@ -1290,6 +1300,56 @@ impl Store {
                 shared.snapshots.borrow_mut().remove(&id);
             }
         }
+    }
+
+    pub fn reply_recovery_revision(&self, id: i64) -> Option<ReplyRecoveryRevision> {
+        let Some(shared) = &self.shared else {
+            return Some(ReplyRecoveryRevision(None));
+        };
+        let mode = *shared.storage_modes.borrow().get(&id)?;
+        let source = match mode {
+            native_chunks::StorageMode::Blob => {
+                ReplySource::Blob(*shared.snapshots.borrow().get(&id)?)
+            }
+            native_chunks::StorageMode::NativeChunks { .. } => {
+                ReplySource::Chunks(*shared.native_revisions.borrow().get(&id)?)
+            }
+        };
+        Some(ReplyRecoveryRevision(Some((mode, source))))
+    }
+
+    pub(super) fn shared_reply_recovery_baseline(
+        &self,
+        id: i64,
+        revision: ReplyRecoveryRevision,
+    ) -> Result<Option<Transcript>, String> {
+        let Some((expected_mode, source)) = revision.0 else {
+            return Ok(None);
+        };
+        let tx = sql(self.conn.unchecked_transaction())?;
+        let original = self.persisted_session_id(id)?;
+        let mode = native_chunks::session_storage_mode(&self.conn, &original)
+            .map_err(|error| error.to_string())?;
+        if expected_mode != mode {
+            return Ok(None);
+        }
+        let matches = match source {
+            ReplySource::Blob(expected) => {
+                let current = self.shared_blocks(id)?;
+                expected.matches(&current)
+            }
+            ReplySource::Chunks(expected) => {
+                let current = native_chunks::session_revision(&self.conn, &original)
+                    .map_err(|error| error.to_string())?;
+                current == Some(expected)
+            }
+        };
+        if !matches {
+            return Ok(None);
+        }
+        let transcript = self.shared_load(id)?;
+        sql(tx.commit())?;
+        Ok(Some(transcript))
     }
 
     pub(super) fn shared_load(&self, id: i64) -> Result<Transcript, String> {
