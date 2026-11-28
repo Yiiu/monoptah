@@ -271,6 +271,7 @@ pub(crate) struct ReviewPane {
     visible: bool,
     closed: bool,
     deferred: bool,
+    publish_task: Option<Task<()>>,
     /// The deferred body fades from its first rendered frame.
     revealed: Option<PaneReveal>,
     hovered_tab: Option<usize>,
@@ -401,6 +402,7 @@ impl ReviewPane {
             visible: false,
             closed: false,
             deferred: false,
+            publish_task: None,
             revealed: None,
             hovered_tab: None,
             pane_draggable: false,
@@ -1266,7 +1268,7 @@ impl ReviewPane {
                             {
                                 source.loaded.insert(id, loaded);
                             }
-                            this.publish(cx);
+                            this.queue_publish(cx);
                         });
                     }
                 });
@@ -1283,6 +1285,7 @@ impl ReviewPane {
                     source.complete = source.loaded.values().all(|l| l.error.is_none());
                     source.loading = false;
                     refresh = std::mem::take(&mut source.refresh_pending);
+                    this.publish(cx);
                 }
                 if refresh {
                     this.load_active(cx);
@@ -1294,8 +1297,23 @@ impl ReviewPane {
         }
     }
 
+    /// Several workers can finish within one frame. Publish their models in
+    /// batches and flush the last batch as soon as this load settles.
+    fn queue_publish(&mut self, cx: &mut Context<Self>) {
+        if self.publish_task.is_some() {
+            return;
+        }
+        self.publish_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(50))
+                .await;
+            let _ = this.update(cx, Self::publish);
+        }));
+    }
+
     /// WorkingTreeDiff's and CommitDiff's file models.
     fn publish(&mut self, cx: &mut Context<Self>) {
+        self.publish_task = None;
         let ix = self.state.active;
         let Some(source) = self.sources.get(ix) else {
             return;
@@ -2754,6 +2772,62 @@ mod tests {
             unstaged,
         }
     }
+    #[gpui::test]
+    fn finished_file_models_publish_in_a_shared_batch(cx: &mut gpui::TestAppContext) {
+        let git = cx.new(|cx| ProjectGit::new("~".into(), cx));
+        let pane = cx.new(|cx| {
+            ReviewPane::new(
+                git,
+                ReviewState {
+                    tabs: vec![ReviewTab::Changes {
+                        cwd: "~".into(),
+                        path: None,
+                        staged: None,
+                    }],
+                    ..Default::default()
+                },
+                cx,
+            )
+        });
+        let loaded = |text: &str| {
+            let unified = diff::build_unified_file("", text, diff::CONTEXT_DEFAULT);
+            Arc::new(Loaded {
+                version: None,
+                diff: Arc::new(FileDiff::default()),
+                unified: Some(Arc::new(unified.blocks)),
+                additions: unified.additions,
+                deletions: unified.deletions,
+                error: None,
+            })
+        };
+        pane.update(cx, |pane, cx| {
+            pane.sources[0].files = Some(vec![file("a", true, false), file("b", false, true)]);
+            pane.publish(cx);
+            pane.sources[0]
+                .loaded
+                .insert("staged:a".into(), loaded("one\n"));
+            pane.queue_publish(cx);
+        });
+        cx.run_until_parked();
+        let half = std::time::Duration::from_millis(25);
+        cx.background_executor.advance_clock(half);
+        cx.run_until_parked();
+        pane.update(cx, |pane, cx| {
+            pane.sources[0]
+                .loaded
+                .insert("unstaged:b".into(), loaded("two\nthree\n"));
+            pane.queue_publish(cx);
+            assert_eq!(pane.sources[0].view.read(cx).totals, Some((0, 0)));
+        });
+        cx.background_executor.advance_clock(half);
+        cx.run_until_parked();
+        pane.read_with(cx, |pane, cx| {
+            assert!(pane.publish_task.is_none());
+            assert_eq!(pane.sources[0].view.read(cx).totals, Some((3, 0)));
+            assert_eq!(pane.sources[0].view.read(cx).file_count, Some(2));
+        });
+    }
+
     #[test]
     fn entries_put_staged_first_and_scope_to_one_side() {
         let files = [file("a", true, true), file("b", false, true)];
