@@ -48,6 +48,11 @@ fn visual_turn(request: Option<&str>) {
 import json, os, socket, sys, time
 def send(value):
     print(json.dumps(value), flush=True)
+def wait_for_update(path, message):
+    deadline = time.monotonic() + 4
+    while not os.path.exists(path):
+        assert time.monotonic() < deadline, message
+        time.sleep(0.01)
 for line in sys.stdin:
     value = json.loads(line)
     if value.get('id') == 1:
@@ -60,7 +65,8 @@ for line in sys.stdin:
         with open('expected-prompt.txt') as expected:
             assert value['params']['input'] == [{'type': 'text', 'text': expected.read()}], 'The provider must receive the prepared prompt'
         send({'method': 'item/agentMessage/delta', 'params': {'itemId': 'before', 'delta': 'Before the visual.'}})
-        time.sleep(0.05)
+        # The stdout reader and the visual bridge are independent transports.
+        wait_for_update('before-observed', 'Live prose before the visual never arrived')
         address, port = os.environ['MONOCODE_VISUAL_ENDPOINT'].rsplit(':', 1)
         with socket.create_connection((address, int(port)), timeout=4) as connection:
             connection.settimeout(4)
@@ -81,10 +87,7 @@ for line in sys.stdin:
             assert response['result']['saved'] is True, response
             with open('acknowledged.json', 'w') as output:
                 json.dump(response, output)
-        deadline = time.monotonic() + 4
-        while not os.path.exists('saved-observed'):
-            assert time.monotonic() < deadline, 'Live visual update never arrived'
-            time.sleep(0.01)
+        wait_for_update('saved-observed', 'Live visual update never arrived')
         send({'method': 'item/agentMessage/delta', 'params': {'itemId': 'after', 'delta': 'After the visual.'}})
         send({'method': 'turn/completed', 'params': {'turn': {'status': 'completed'}}})
         break
@@ -115,11 +118,22 @@ for line in sys.stdin:
             |_| Some(binary),
         );
     });
+    let mut live_prose = false;
     let mut live_visual = false;
     let final_status = loop {
         let update = receive
             .recv_blocking()
             .expect("Runtime closed before its final update");
+        if !update.finished
+            && !live_prose
+            && update
+                .rows
+                .iter()
+                .any(|row| row.role == "assistant" && row.text == "Before the visual.")
+        {
+            live_prose = true;
+            std::fs::write(fixture.0.join("before-observed"), "").unwrap();
+        }
         if !update.finished && update.rows.iter().any(|row| row.role == "visual") {
             let saved = locked(&store).unwrap().load(session).unwrap();
             let visual_rows = saved
@@ -182,7 +196,10 @@ for line in sys.stdin:
         .iter()
         .position(|row| row.text.contains("After the visual."))
         .unwrap();
-    assert!(before < visual && visual < after);
+    assert!(
+        before < visual && visual < after,
+        "Unexpected transcript order: before={before}, visual={visual}, after={after}"
+    );
     let settings = locked(&store)
         .unwrap()
         .agent_settings(session)
