@@ -266,7 +266,11 @@ for line in sys.stdin:
     };
     worker.join().unwrap();
     assert!(last.status.contains("Saving failed"), "{}", last.status);
-    assert!(last.reply_pending, "{}", last.status);
+    assert!(
+        last.status.contains(recovery::REPLY_RETAINED),
+        "{}",
+        last.status
+    );
     assert!(saw_reply, "{} {:?}", last.status, last.rows);
     let saved = || locked(&store).unwrap().load(session).unwrap().rows;
     let before = saved();
