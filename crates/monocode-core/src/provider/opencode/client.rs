@@ -590,7 +590,10 @@ fn parts(request: &Request) -> Result<Vec<Value>, String> {
         parts.push(json!({"type":"text","text":request.prompt}));
     }
     for path in &request.settings.attachments {
-        let mime = crate::composer::image_mime(path)
+        if path.is_dir() {
+            continue;
+        }
+        let mime = crate::composer::attachment_image_mime(path)
             .map(str::to_owned)
             .or_else(|| {
                 std::fs::read(path)

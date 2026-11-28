@@ -4,17 +4,23 @@ use super::{Row, Transcript};
 use std::path::{Path, PathBuf};
 
 pub const ROLE: &str = "user-attachments";
+pub const FOLDER_MIME: &str = "inode/directory";
 
 pub fn from_paths(paths: &[PathBuf]) -> serde_json::Value {
     serde_json::Value::Array(
         paths
             .iter()
             .map(|path| {
-                let mime = crate::composer::image_mime(path);
+                let mime = crate::composer::attachment_image_mime(path);
+                let fallback = if path.is_dir() {
+                    FOLDER_MIME
+                } else {
+                    "application/octet-stream"
+                };
                 serde_json::json!({
                     "id":path.to_string_lossy(), "path":path,
                     "name":path.file_name().unwrap_or_default().to_string_lossy(),
-                    "mimeType":mime.unwrap_or("application/octet-stream"),
+                    "mimeType":mime.unwrap_or(fallback),
                     "kind":if mime.is_some() { "image" } else { "file" }
                 })
             })
