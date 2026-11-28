@@ -2609,8 +2609,9 @@ impl Conversation {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64;
-        let mut settings = self.settings.clone();
-        settings.model = self.model.clone();
+        // Operator and Mono launches can inherit the live choice before it reaches disk.
+        self.settings.model.clone_from(&self.model);
+        let settings = self.settings.clone();
         let store = self.store.clone();
         let id = self.summary.id;
         let provider = self.summary.provider.clone();

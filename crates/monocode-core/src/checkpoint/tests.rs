@@ -41,6 +41,169 @@ impl Drop for Fixture {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn retained_index_does_not_reuse_a_clean_filter_result() {
+    let f = Fixture::new();
+    f.write(".gitattributes", "filtered.txt filter=checkpoint-fixture\n");
+    f.write("filtered.txt", "original\n");
+    std::fs::File::open(f.repo.join("filtered.txt"))
+        .unwrap()
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_000_000_000)),
+        )
+        .unwrap();
+    let indexes = f.store.index_dir().unwrap();
+    let take = |label: &str, filter: &str| {
+        run_git(
+            &f.repo,
+            &["config", "filter.checkpoint-fixture.clean", filter],
+        )
+        .unwrap();
+        let snapshot =
+            capture_workspace(&f.repo, &f.repo, &format!("refs/test/{label}"), &indexes).unwrap();
+        run_git(&f.repo, &["show", &format!("{snapshot}:filtered.txt")]).unwrap()
+    };
+    assert_eq!(take("first", "sed s/original/first/"), b"first\n");
+    assert_eq!(take("second", "sed s/original/second/"), b"second\n");
+}
+
+#[test]
+fn nested_snapshots_exclude_workspace_edits_outside_the_scope() {
+    let f = Fixture::new();
+    f.write("nested/inside.txt", "inside\n");
+    f.write("a.txt", "previous whole-worktree edit\n");
+    let indexes = f.store.index_dir().unwrap();
+    capture_workspace(&f.repo, &f.repo, "refs/test/whole", &indexes).unwrap();
+    let nested = capture_workspace(
+        &f.repo.join("nested"),
+        &f.repo,
+        "refs/test/nested",
+        &indexes,
+    )
+    .unwrap();
+    assert_eq!(
+        run_git(&f.repo, &["show", &format!("{nested}:a.txt")]).unwrap(),
+        b"original\n"
+    );
+}
+
+#[test]
+fn unused_global_filters_and_overridden_autocrlf_allow_a_private_index() {
+    assert!(!needs_fresh_index(
+        b"filter.lfs.clean\ngit-lfs clean -- %f\0core.autocrlf\ntrue\0core.autocrlf\nfalse\0",
+    ));
+    assert!(needs_fresh_index(
+        b"core.autocrlf\nfalse\0core.autocrlf\ninput\0",
+    ));
+}
+
+#[test]
+fn changed_attributes_recheck_unchanged_line_endings() {
+    let f = Fixture::new();
+    f.write("line-endings.txt", "one\r\ntwo\r\n");
+    set_past_mtime(&f.repo.join("line-endings.txt"));
+    let indexes = f.store.index_dir().unwrap();
+    let take = |label: &str| {
+        let snapshot =
+            capture_workspace(&f.repo, &f.repo, &format!("refs/test/{label}"), &indexes).unwrap();
+        run_git(&f.repo, &["show", &format!("{snapshot}:line-endings.txt")]).unwrap()
+    };
+    assert_eq!(take("raw"), b"one\r\ntwo\r\n");
+    f.write(".gitattributes", "line-endings.txt text eol=lf\n");
+    assert_eq!(take("normalised"), b"one\ntwo\n");
+    std::fs::remove_file(f.repo.join(".gitattributes")).unwrap();
+    assert_eq!(take("raw-again"), b"one\r\ntwo\r\n");
+}
+
+#[test]
+fn checkpoint_keeps_the_new_spelling_of_an_untracked_path() {
+    let f = Fixture::new();
+    run_git(&f.repo, &["config", "core.ignorecase", "true"]).unwrap();
+    f.write("Draft/Note.txt", "untracked\n");
+    let indexes = f.store.index_dir().unwrap();
+    capture_workspace(&f.repo, &f.repo, "refs/test/initial", &indexes).unwrap();
+    std::fs::rename(f.repo.join("Draft"), f.repo.join("tmp-folder")).unwrap();
+    std::fs::rename(f.repo.join("tmp-folder"), f.repo.join("draft")).unwrap();
+    let snapshot = capture_workspace(&f.repo, &f.repo, "refs/test/renamed", &indexes).unwrap();
+    let paths = run_git(&f.repo, &["ls-tree", "-r", "-z", "--name-only", &snapshot]).unwrap();
+    assert!(nul_records(&paths).any(|path| path == b"draft/Note.txt"));
+    assert!(!nul_records(&paths).any(|path| path == b"Draft/Note.txt"));
+}
+
+#[test]
+fn a_cache_only_gitlink_can_return_to_an_ordinary_directory() {
+    let f = Fixture::new();
+    f.write("embedded/file.txt", "nested content\n");
+    let embedded = f.repo.join("embedded");
+    run_git(&embedded, &["init"]).unwrap();
+    run_git(&embedded, &["add", "."]).unwrap();
+    run_git(
+        &embedded,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-m",
+            "initial",
+        ],
+    )
+    .unwrap();
+    let indexes = f.store.index_dir().unwrap();
+    capture_workspace(&f.repo, &f.repo, "refs/test/embedded", &indexes).unwrap();
+    std::fs::rename(embedded.join(".git"), f.dir.join("embedded-git")).unwrap();
+    let snapshot = capture_workspace(&f.repo, &f.repo, "refs/test/ordinary", &indexes).unwrap();
+    assert_eq!(
+        run_git(&f.repo, &["show", &format!("{snapshot}:embedded/file.txt")]).unwrap(),
+        b"nested content\n"
+    );
+}
+
+#[test]
+fn interrupted_capture_rotates_before_an_orphan_git_process_opens_its_lock() {
+    let f = Fixture::new();
+    let indexes = f.store.index_dir().unwrap();
+    capture_workspace(&f.repo, &f.repo, "refs/test/old", &indexes).unwrap();
+    let key = index_key(&f.repo);
+    let previous = index_generation(&indexes, &key).unwrap();
+    let active = indexes.join(format!("{key}.active"));
+    std::fs::write(&active, []).unwrap();
+    capture_workspace(&f.repo, &f.repo, "refs/test/new", &indexes).unwrap();
+    assert_eq!(index_generation(&indexes, &key).unwrap(), previous + 1);
+    assert!(!active.exists());
+}
+
+#[test]
+#[ignore = "checkpoint performance fixture"]
+fn compare_warm_and_fresh_workspace_snapshots() {
+    let f = Fixture::new();
+    let contents = vec![b'x'; 4 * 1024 * 1024];
+    for file in 0..16 {
+        let path = f.repo.join(format!("data-{file}"));
+        std::fs::write(&path, &contents).unwrap();
+        set_past_mtime(&path);
+    }
+    let indexes = f.store.index_dir().unwrap();
+    capture_workspace(&f.repo, &f.repo, "refs/test/prime", &indexes).unwrap();
+    let measure = |capture: &mut dyn FnMut() -> Result<String, String>| {
+        let started = Instant::now();
+        let commit = (0..3).map(|_| capture().unwrap()).last().unwrap();
+        (
+            started.elapsed(),
+            run_git(&f.repo, &["rev-parse", &format!("{commit}^{{tree}}")]).unwrap(),
+        )
+    };
+    let (fresh, expected) =
+        measure(&mut || capture_fresh(&f.repo, &f.repo, "refs/test/fresh", Some("HEAD")));
+    let (warm, actual) =
+        measure(&mut || capture_workspace(&f.repo, &f.repo, "refs/test/warm", &indexes));
+    assert_eq!(actual, expected);
+    eprintln!("Three captures of 64 MiB: fresh {fresh:?}, warm {warm:?}");
+}
+
 #[test]
 fn records_shell_changes_and_preserves_the_index_head_and_saved_result() {
     let f = Fixture::new();
@@ -889,4 +1052,495 @@ fn checkpoints_scope_nested_workspaces_and_repositories_without_head() {
     assert_eq!(f.store.status("unborn", cwd).unwrap().files[0].additions, 1);
     f.store.undo("unborn", cwd, None).unwrap();
     assert!(!unborn.join("new.txt").exists());
+}
+
+fn private_index(f: &Fixture) -> PathBuf {
+    let repo = std::fs::canonicalize(&f.repo).unwrap();
+    let indexes = f.store.index_dir().unwrap();
+    let key = index_key(&repo);
+    let generation = index_generation(&indexes, &key).unwrap();
+    index_file(&indexes, &key, generation)
+}
+
+/// The guard is per worktree, so its path must not follow the generation.
+fn private_guard(f: &Fixture) -> PathBuf {
+    let repo = std::fs::canonicalize(&f.repo).unwrap();
+    f.store
+        .index_dir()
+        .unwrap()
+        .join(format!("{}.capture", index_key(&repo)))
+}
+
+fn git_in_index(repo: &Path, index: &Path, args: &[&str]) -> Vec<u8> {
+    let output = git_command(repo, args)
+        .env("GIT_INDEX_FILE", index)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
+}
+
+/// Git writes the index through a sibling lock file: `x.index.lock`.
+fn index_lock(index: &Path) -> PathBuf {
+    let mut lock = index.as_os_str().to_owned();
+    lock.push(".lock");
+    PathBuf::from(lock)
+}
+
+fn index_paths(repo: &Path, index: &Path) -> Vec<String> {
+    git_in_index(repo, index, &["ls-files", "-z", "--full-name"])
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| String::from_utf8(path.to_vec()).unwrap())
+        .collect()
+}
+
+fn set_past_mtime(path: &Path) {
+    let modified = std::time::SystemTime::now() - std::time::Duration::from_secs(4 * 60 * 60);
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(modified))
+        .unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn reuses_one_private_index_and_its_stat_cache_across_turns() {
+    let f = Fixture::new();
+    f.write("big.big", &"a".repeat(200_000));
+    set_past_mtime(&f.repo.join("big.big"));
+    f.store.begin_turn("session", f.cwd(), "first").unwrap();
+    f.store.finish_turn("session", f.cwd(), "first").unwrap();
+    let index = private_index(&f);
+    assert!(index.exists());
+
+    // The same store and a reopened store both use the worktree's index.
+    f.store.begin_turn("session", f.cwd(), "second").unwrap();
+    f.store.finish_turn("session", f.cwd(), "second").unwrap();
+    assert_eq!(private_index(&f), index);
+    assert!(index.exists());
+    let reopened = Store::new(f.dir.join("checkpoints"));
+    reopened.begin_turn("session", f.cwd(), "third").unwrap();
+    reopened.finish_turn("session", f.cwd(), "third").unwrap();
+
+    // A modified file must be hashed again, and the result must stay exact.
+    reopened.begin_turn("session", f.cwd(), "fourth").unwrap();
+    f.write("big.big", &"b".repeat(200_001));
+    reopened.finish_turn("session", f.cwd(), "fourth").unwrap();
+    assert_eq!(
+        reopened
+            .file_diff("session", f.cwd(), "big.big")
+            .unwrap()
+            .current,
+        "b".repeat(200_001)
+    );
+}
+
+#[test]
+fn records_committed_files_that_the_ignore_rules_match() {
+    let f = Fixture::new();
+    f.write(".gitignore", "*.log\n");
+    run_git(&f.repo, &["add", ".gitignore"]).unwrap();
+    run_git(&f.repo, &["commit", "-m", "ignore logs"]).unwrap();
+    f.write("debug.log", "first\n");
+    // The private index is built while the file is untracked, so it starts
+    // without the entry Git will later track through a forced commit.
+    f.store.begin_turn("session", f.cwd(), "first").unwrap();
+    f.store.finish_turn("session", f.cwd(), "first").unwrap();
+    assert!(f.store.status("session", f.cwd()).unwrap().files.is_empty());
+
+    run_git(&f.repo, &["add", "-f", "debug.log"]).unwrap();
+    run_git(&f.repo, &["commit", "-m", "track the log"]).unwrap();
+    f.store.begin_turn("session", f.cwd(), "second").unwrap();
+    f.write("debug.log", "first\nsecond\n");
+    f.store.finish_turn("session", f.cwd(), "second").unwrap();
+    let status = f.store.status("session", f.cwd()).unwrap();
+    assert_eq!(status.files.len(), 1);
+    assert_eq!(status.files[0].relative, "debug.log");
+    assert_eq!(
+        (status.files[0].additions, status.files[0].deletions),
+        (1, 0)
+    );
+    let diff = f.store.file_diff("session", f.cwd(), "debug.log").unwrap();
+    assert_eq!(diff.original, "first\n");
+    assert_eq!(diff.current, "first\nsecond\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn head_advances_and_branch_switches_keep_the_snapshot_exact() {
+    let f = Fixture::new();
+    f.write("first.big", &"s".repeat(1000));
+    f.write("second.big", &"t".repeat(1000));
+    set_past_mtime(&f.repo.join("first.big"));
+    set_past_mtime(&f.repo.join("second.big"));
+    f.store.begin_turn("session", f.cwd(), "first").unwrap();
+    f.store.finish_turn("session", f.cwd(), "first").unwrap();
+
+    // HEAD advances while the working files stay in place.
+    f.write("a.txt", "committed on main\n");
+    run_git(&f.repo, &["add", "a.txt"]).unwrap();
+    run_git(&f.repo, &["commit", "-m", "commit one file"]).unwrap();
+    f.store.begin_turn("session", f.cwd(), "second").unwrap();
+    f.write("a.txt", "committed on main\nsecond\n");
+    f.store.finish_turn("session", f.cwd(), "second").unwrap();
+    let diff = f.store.file_diff("session", f.cwd(), "a.txt").unwrap();
+    assert_eq!(diff.original, "committed on main\n");
+    assert_eq!(diff.current, "committed on main\nsecond\n");
+
+    // A branch switch keeps the current tree and working edits available.
+    run_git(&f.repo, &["checkout", "-b", "side"]).unwrap();
+    f.store.begin_turn("session", f.cwd(), "third").unwrap();
+    f.write("a.txt", "on the side branch\n");
+    f.store.finish_turn("session", f.cwd(), "third").unwrap();
+    let diff = f.store.file_diff("session", f.cwd(), "a.txt").unwrap();
+    // The new baseline carries the previous turn's pending file, so it starts
+    // from how it looked before the session changed it.
+    assert_eq!(diff.original, "committed on main\n");
+    assert_eq!(diff.current, "on the side branch\n");
+}
+
+#[test]
+fn drops_entries_that_become_ignored_before_recording() {
+    let f = Fixture::new();
+    f.write("debris/log.txt", "first\n");
+    f.store.begin_turn("session", f.cwd(), "first").unwrap();
+    f.store.finish_turn("session", f.cwd(), "first").unwrap();
+    let index = private_index(&f);
+    assert!(index_paths(&f.repo, &index).contains(&"debris/log.txt".to_string()));
+
+    // The sensitive bytes go into the file the index already captured. A new
+    // path would be ignored by `add` either way, so it could not tell a prune
+    // that runs before the add from one that runs after it.
+    let secret = "SENSITIVE-4b0f8f0e\n";
+    f.write(".gitignore", "debris/\n");
+    f.write("debris/log.txt", secret);
+    f.store.begin_turn("session", f.cwd(), "second").unwrap();
+    f.store.finish_turn("session", f.cwd(), "second").unwrap();
+    // The cached index loses the entry instead of being rotated away.
+    assert_eq!(private_index(&f), index);
+    assert!(!index_paths(&f.repo, &index).contains(&"debris/log.txt".to_string()));
+    // Neither the captured-then-ignored file's new bytes nor anything else the
+    // rules now exclude reaches the object database.
+    let oid = String::from_utf8(
+        run_git(
+            &f.repo,
+            &["hash-object", "--no-filters", "--", "debris/log.txt"],
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(f.repo.join("debris/log.txt")).unwrap(),
+        secret
+    );
+    assert!(run_git(&f.repo, &["cat-file", "-e", oid.trim()]).is_err());
+}
+
+#[test]
+fn untracked_nested_ignore_rules_also_drop_entries() {
+    let f = Fixture::new();
+    // A rule file that is itself ignored still applies. Written before the
+    // baseline so the only thing that changes later is the nested rule, which
+    // an `--exclude-standard` listing would hide.
+    f.write(".gitignore", ".gitignore\n");
+    f.write("nested/secret.txt", "visible\n");
+    f.store.begin_turn("session", f.cwd(), "first").unwrap();
+    f.store.finish_turn("session", f.cwd(), "first").unwrap();
+    let index = private_index(&f);
+    assert!(index_paths(&f.repo, &index).contains(&"nested/secret.txt".to_string()));
+
+    f.write("nested/.gitignore", "secret.txt\n");
+    let secret = "SENSITIVE-9c31ab77\n";
+    f.write("nested/secret.txt", secret);
+    f.store.begin_turn("session", f.cwd(), "second").unwrap();
+    f.store.finish_turn("session", f.cwd(), "second").unwrap();
+    assert_eq!(private_index(&f), index);
+    assert!(!index_paths(&f.repo, &index).contains(&"nested/secret.txt".to_string()));
+    let oid = String::from_utf8(
+        run_git(
+            &f.repo,
+            &["hash-object", "--no-filters", "--", "nested/secret.txt"],
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(run_git(&f.repo, &["cat-file", "-e", oid.trim()]).is_err());
+}
+
+#[test]
+fn drops_a_file_git_stopped_tracking_once_a_rule_covers_it() {
+    let f = Fixture::new();
+    f.write(".env", "TOKEN=old\n");
+    run_git(&f.repo, &["add", "-f", ".env"]).unwrap();
+    run_git(&f.repo, &["commit", "-m", "track env"]).unwrap();
+    f.store.begin_turn("session", f.cwd(), "first").unwrap();
+    f.store.finish_turn("session", f.cwd(), "first").unwrap();
+    assert!(index_paths(&f.repo, &private_index(&f)).contains(&".env".to_string()));
+
+    // The rules never change again: the cached entry outlives the tracking.
+    f.write(".gitignore", ".env\n");
+    run_git(&f.repo, &["rm", "--cached", ".env"]).unwrap();
+    run_git(&f.repo, &["commit", "-m", "stop tracking env"]).unwrap();
+    let secret = "TOKEN=SENSITIVE-1d5c7a20\n";
+    f.write(".env", secret);
+    f.store.begin_turn("session", f.cwd(), "second").unwrap();
+    f.store.finish_turn("session", f.cwd(), "second").unwrap();
+    assert!(!index_paths(&f.repo, &private_index(&f)).contains(&".env".to_string()));
+    let oid = String::from_utf8(
+        run_git(&f.repo, &["hash-object", "--no-filters", "--", ".env"]).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(f.repo.join(".env")).unwrap(),
+        secret
+    );
+    assert!(run_git(&f.repo, &["cat-file", "-e", oid.trim()]).is_err());
+}
+
+#[test]
+fn rebuilds_a_missing_or_truncated_private_index_once() {
+    let f = Fixture::new();
+    let head = run_git(&f.repo, &["rev-parse", "HEAD"]).unwrap();
+    let real_index = std::fs::read(f.repo.join(".git/index")).unwrap();
+    f.store.begin_turn("session", f.cwd(), "first").unwrap();
+    f.write("new.txt", "one\n");
+    f.store.finish_turn("session", f.cwd(), "first").unwrap();
+    let index = private_index(&f);
+
+    std::fs::remove_file(&index).unwrap();
+    f.store.begin_turn("session", f.cwd(), "second").unwrap();
+    f.write("new.txt", "one\ntwo\n");
+    f.store.finish_turn("session", f.cwd(), "second").unwrap();
+    assert_eq!(
+        f.store
+            .file_diff("session", f.cwd(), "new.txt")
+            .unwrap()
+            .current,
+        "one\ntwo\n"
+    );
+
+    std::fs::write(&index, b"DIRC").unwrap();
+    f.store.begin_turn("session", f.cwd(), "third").unwrap();
+    assert_ne!(
+        private_index(&f),
+        index,
+        "corruption must move the capture on"
+    );
+    f.write("new.txt", "one\ntwo\nthree\n");
+    f.store.finish_turn("session", f.cwd(), "third").unwrap();
+    let diff = f.store.file_diff("session", f.cwd(), "new.txt").unwrap();
+    // Carried into the baseline as absent: the session created this file.
+    assert_eq!(diff.original, "");
+    assert_eq!(diff.current, "one\ntwo\nthree\n");
+
+    assert_eq!(
+        std::fs::read(f.repo.join(".git/index")).unwrap(),
+        real_index
+    );
+    assert_eq!(run_git(&f.repo, &["rev-parse", "HEAD"]).unwrap(), head);
+}
+
+#[cfg(unix)]
+#[test]
+fn records_nested_unusual_paths_and_symlinks_with_a_persistent_index() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let f = Fixture::new();
+    run_git(&f.repo, &["config", "core.fileMode", "true"]).unwrap();
+    let nested = f.repo.join("nested");
+    std::fs::create_dir_all(&nested).unwrap();
+    f.write("nested/normal.txt", "baseline\n");
+    f.write("nested/mode.sh", "#!/bin/sh\n");
+    run_git(&f.repo, &["add", "nested"]).unwrap();
+    run_git(&f.repo, &["commit", "-m", "nested baseline"]).unwrap();
+    let cwd = nested.to_str().unwrap();
+    let unusual = "tab\tand 中文 name.txt";
+    f.store.begin_turn("session", cwd, "first").unwrap();
+    f.write(&format!("nested/{unusual}"), "new\n");
+    std::fs::remove_file(nested.join("normal.txt")).unwrap();
+    std::fs::set_permissions(
+        nested.join("mode.sh"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    symlink("mode.sh", nested.join("link.txt")).unwrap();
+    f.store.finish_turn("session", cwd, "first").unwrap();
+    let status = f.store.status("session", cwd).unwrap();
+    assert_eq!(
+        status
+            .files
+            .iter()
+            .map(|file| file.relative.as_str())
+            .collect::<Vec<_>>(),
+        ["link.txt", "mode.sh", "normal.txt", unusual]
+    );
+    assert_eq!(
+        f.store.file_diff("session", cwd, unusual).unwrap().current,
+        "new\n"
+    );
+    assert!(
+        status
+            .files
+            .iter()
+            .find(|file| file.relative == "link.txt")
+            .unwrap()
+            .exact
+    );
+}
+
+#[test]
+fn a_leftover_lock_heals_under_the_capture_guard() {
+    let f = Fixture::new();
+    f.store.begin_turn("session", f.cwd(), "first").unwrap();
+    f.store.finish_turn("session", f.cwd(), "first").unwrap();
+    let index = private_index(&f);
+    let lock = index_lock(&index);
+    // A capture that died mid-write leaves its lock behind. The guard its
+    // process held is gone, so the next capture takes a fresh generation
+    // immediately instead of waiting for the lock to look old.
+    std::fs::write(&lock, b"").unwrap();
+    f.store.begin_turn("session", f.cwd(), "second").unwrap();
+    assert_ne!(
+        private_index(&f),
+        index,
+        "the lock must move the capture on"
+    );
+    f.write("new.txt", "one\n");
+    f.store.finish_turn("session", f.cwd(), "second").unwrap();
+    let status = f.store.status("session", f.cwd()).unwrap();
+    assert_eq!(
+        status
+            .files
+            .iter()
+            .find(|file| file.relative == "new.txt")
+            .map(|file| file.additions),
+        Some(1)
+    );
+}
+
+#[test]
+fn concurrent_captures_of_one_workspace_serialize() {
+    let f = Fixture::new();
+    f.write("new.txt", "one\n");
+    let repo = std::fs::canonicalize(&f.repo).unwrap();
+    let indexes = f.store.index_dir().unwrap();
+    let captures = (0..2)
+        .map(|n| {
+            let repo = repo.clone();
+            let indexes = indexes.clone();
+            std::thread::spawn(move || {
+                capture_workspace(&repo, &repo, &format!("refs/monocode/test/{n}"), &indexes)
+            })
+        })
+        .collect::<Vec<_>>();
+    let results = captures
+        .into_iter()
+        .map(|capture| capture.join().unwrap())
+        .collect::<Vec<_>>();
+    assert!(results.iter().all(|result| result.is_ok()), "{results:?}");
+    // Both saw the same workspace, so neither read the other's half-written
+    // index, and the index they share survived both captures.
+    let trees = results
+        .iter()
+        .map(|commit| {
+            let commit = commit.as_ref().unwrap();
+            let tree = run_git(&repo, &["rev-parse", &format!("{commit}^{{tree}}")]).unwrap();
+            String::from_utf8(tree).unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(trees[0], trees[1]);
+    assert!(index_paths(&repo, &private_index(&f)).contains(&"new.txt".to_string()));
+}
+
+#[test]
+fn a_capture_guard_held_elsewhere_times_out() {
+    let f = Fixture::new();
+    let guard = private_guard(&f);
+    let held = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&guard)
+        .unwrap();
+    held.try_lock().unwrap();
+    let error = CaptureGuard::acquire_within(&guard, Duration::from_millis(50))
+        .err()
+        .expect("a guard another owner holds must not be taken twice");
+    assert!(error.contains("Another MonoCode instance"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_file_named_index_does_not_rebuild_the_index() {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    f.write("index.html", "<html>\n");
+    f.store.begin_turn("session", f.cwd(), "first").unwrap();
+    f.store.finish_turn("session", f.cwd(), "first").unwrap();
+    let index = private_index(&f);
+    let inode = std::fs::metadata(&index).unwrap().ino();
+
+    let file = f.repo.join("index.html");
+    std::fs::write(&file, "<html>two\n").unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&file).is_ok() {
+        // Root ignores file modes, so the failure cannot be provoked here.
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        return;
+    }
+    let error = f
+        .store
+        .begin_turn("session", f.cwd(), "second")
+        .unwrap_err();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(error.contains("index.html"), "{error}");
+    // Rebuilding would replace the file and lose the stat cache.
+    assert_eq!(private_index(&f), index);
+    assert_eq!(std::fs::metadata(&index).unwrap().ino(), inode);
+}
+
+/// A `git` child of a killed app renames its lock by path. Abandoning the
+/// index name is what keeps it away from the capture that follows.
+#[test]
+fn a_dead_writer_cannot_reach_the_next_generation() {
+    let f = Fixture::new();
+    f.write("a.txt", "one\n");
+    f.store.begin_turn("session", f.cwd(), "first").unwrap();
+    f.store.finish_turn("session", f.cwd(), "first").unwrap();
+    let dead = private_index(&f);
+    let lock = index_lock(&dead);
+    std::fs::write(&lock, b"").unwrap();
+
+    f.store.begin_turn("session", f.cwd(), "second").unwrap();
+    f.write("a.txt", "two\n");
+    f.store.finish_turn("session", f.cwd(), "second").unwrap();
+    let live = private_index(&f);
+    assert_ne!(live, dead);
+    // The dead writer's lock is left alone: the capture moved to a path the
+    // dead writer never saw.
+    assert!(lock.exists());
+
+    // Whatever the dead writer does with its own path ...
+    std::fs::write(&lock, b"partial").unwrap();
+    std::fs::rename(&lock, &dead).unwrap();
+    // ... the current generation and its recording are untouched.
+    assert!(live.exists());
+    assert!(
+        std::fs::read(&live).unwrap().starts_with(b"DIRC"),
+        "the live index must not be a lock file renamed over it"
+    );
+    assert_eq!(
+        f.store
+            .file_diff("session", f.cwd(), "a.txt")
+            .unwrap()
+            .current,
+        "two\n"
+    );
 }

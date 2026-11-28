@@ -5,13 +5,17 @@
 //! Shared reviews require successful edit evidence for each displayed file,
 //! without inferring which process owns individual lines. Synchronous: callers
 //! run these on a background executor.
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::ffi::OsString;
+use std::fs::TryLockError;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::scm::{expand_home, path_to_js, MAX_TEXT_FILE_BYTES};
 
@@ -86,6 +90,21 @@ impl Store {
 
     fn session_dir(&self, session_id: &str) -> PathBuf {
         self.root.join(session_id)
+    }
+
+    /// One index per worktree, kept so its stat cache survives between turns.
+    /// Linked worktrees have distinct roots and must not share the cache.
+    fn index_dir(&self) -> Result<PathBuf, String> {
+        let dir = self.root.join("indexes");
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(&dir).map_err(|e| e.to_string())?;
+        Ok(dir)
     }
 
     /// Successful structured edits by this session's running turn.
@@ -265,7 +284,9 @@ impl Store {
                 run_git(&root, &["update-ref", &reference, before])?;
                 Ok(before.clone())
             } else {
-                let fresh = capture_workspace(&root, &reference)?;
+                let repo = std::fs::canonicalize(&review.repo).map_err(|e| e.to_string())?;
+                let indexes = self.index_dir()?;
+                let fresh = capture_workspace(&root, &repo, &reference, &indexes)?;
                 if carried.files.is_empty() {
                     Ok(fresh)
                 } else {
@@ -296,7 +317,14 @@ impl Store {
             return Ok(());
         };
         if turn.before.is_some() {
-            match capture_workspace(Path::new(&review.cwd), &turn_ref(session_id, id, "after")) {
+            let root = Path::new(&review.cwd);
+            let captured = std::fs::canonicalize(&review.repo)
+                .map_err(|e| e.to_string())
+                .and_then(|repo| {
+                    let indexes = self.index_dir()?;
+                    capture_workspace(root, &repo, &turn_ref(session_id, id, "after"), &indexes)
+                });
+            match captured {
                 Ok(oid) => turn.after = Some(oid),
                 Err(error) => turn.error = Some(error),
             }
@@ -925,63 +953,552 @@ fn run_git(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     checked_output(&mut git_command(root, args))
 }
 
-struct PrivateIndex(PathBuf);
-impl Drop for PrivateIndex {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-        let _ = std::fs::remove_file(self.0.with_extension("lock"));
+fn index_command(dir: &Path, index: &Path, args: &[&str]) -> Command {
+    let mut command = git_command(
+        dir,
+        &[
+            "-c",
+            "core.splitIndex=false",
+            "-c",
+            "core.ignoreStat=false",
+            "-c",
+            "core.trustctime=true",
+            "-c",
+            "core.checkStat=default",
+        ],
+    );
+    command
+        .args(args)
+        .env("GIT_INDEX_FILE", index)
+        .env("GIT_AUTHOR_NAME", "Monoptah")
+        .env("GIT_AUTHOR_EMAIL", "checkpoint@monocode.local")
+        .env("GIT_COMMITTER_NAME", "Monoptah")
+        .env("GIT_COMMITTER_EMAIL", "checkpoint@monocode.local");
+    command
+}
+
+// Git's NUL-delimited listings already contain literal paths. Never trim them
+// or interpret quoting: those bytes can be part of a filename.
+fn nul_records(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
+    bytes
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+}
+
+fn entry_path(entry: &[u8]) -> Result<&[u8], String> {
+    entry
+        .iter()
+        .position(|byte| *byte == b'\t')
+        .map(|tab| &entry[tab + 1..])
+        .ok_or_else(|| "Invalid checkpoint index entry".into())
+}
+
+fn run_with_input(mut command: Command, input: Vec<u8>) -> Result<(i32, Vec<u8>, Vec<u8>), String> {
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or("Failed to open checkpoint input")?;
+    // Write on a separate thread: a large listing can fill the stdout pipe
+    // while Git still waits for stdin, which would deadlock a serial writer.
+    let writer = std::thread::spawn(move || stdin.write_all(&input));
+    let output = child.wait_with_output().map_err(|e| e.to_string())?;
+    let code = output.status.code().unwrap_or(-1);
+    if code == 0 {
+        writer
+            .join()
+            .map_err(|_| "Checkpoint input thread failed".to_string())?
+            .map_err(|e| e.to_string())?;
+    } else {
+        let _ = writer.join();
+    }
+    Ok((code, output.stdout, output.stderr))
+}
+
+fn stdin_failure(code: i32, stderr: &[u8]) -> String {
+    let stderr = String::from_utf8_lossy(stderr).trim().to_string();
+    if stderr.is_empty() {
+        format!("Checkpoint index update failed (status {code})")
+    } else {
+        stderr
     }
 }
 
-fn capture_workspace(root: &Path, reference: &str) -> Result<String, String> {
-    if run_git(root, &["config", "--bool", "core.sparseCheckout"])
+fn capture_workspace(
+    root: &Path,
+    repo: &Path,
+    reference: &str,
+    indexes: &Path,
+) -> Result<String, String> {
+    let key = index_key(repo);
+    // Cooperating captures of one worktree use the same guard even if they
+    // recreate the index or fall back to a scratch index.
+    let _guard = CaptureGuard::acquire(&indexes.join(format!("{key}.capture")))?;
+    if run_git(repo, &["config", "--bool", "core.sparseCheckout"])
         .ok()
         .is_some_and(|bytes| bytes.starts_with(b"true"))
     {
         return Err("Workspace checkpoints are unavailable for sparse checkouts".into());
     }
-    let index =
-        PrivateIndex(std::env::temp_dir().join(format!("monocode-checkpoint-{}", unique_id())));
-    let run = |args: &[&str]| {
-        checked_output(
-            git_command(root, args)
-                .env("GIT_INDEX_FILE", &index.0)
-                .env("GIT_AUTHOR_NAME", "Monoptah")
-                .env("GIT_AUTHOR_EMAIL", "checkpoint@monocode.local")
-                .env("GIT_COMMITTER_NAME", "Monoptah")
-                .env("GIT_COMMITTER_EMAIL", "checkpoint@monocode.local"),
-        )
-    };
-    if run_git(root, &["rev-parse", "--verify", "HEAD"]).is_ok() {
-        run(&["read-tree", "HEAD"])?;
-    } else {
-        run(&["read-tree", "--empty"])?;
+    let head = run_git(repo, &["rev-parse", "--verify", "HEAD^{tree}"])
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok());
+    let head = head.as_deref().map(str::trim);
+    let config = run_git(repo, &["config", "--null", "--list"])?;
+    if root != repo || needs_fresh_index(&config) {
+        return capture_fresh(root, repo, reference, head);
     }
+    let mut digest = Sha256::new();
+    digest.update(head.unwrap_or_default());
+    digest.update(&config);
+    let basis = format!("{:x}", digest.finalize());
+    // Read the generation only after the guard: another process may have
+    // published a newer one while this capture waited.
+    let active = indexes.join(format!("{key}.active"));
+    let mut generation = index_generation(indexes, &key)?;
+    if active.try_exists().map_err(|e| e.to_string())? {
+        // A Git child from an interrupted capture may not own index.lock yet.
+        generation = bump_generation(indexes, &key, generation)?;
+    }
+    std::fs::File::create(&active).map_err(|e| e.to_string())?;
+    let _active = ActiveCapture(active);
+    let index = index_file(indexes, &key, generation);
+    let ignore_case = enabled_config(&config, b"core.ignorecase");
+    match capture_workspace_once(repo, reference, &index, head, &basis, ignore_case) {
+        Err(error) if lost_index_lock(&error) || corrupt_index(&error) => {
+            // Abandoning the path is the only safe recovery. A `git` child of
+            // a killed app renames `<index>.lock` by path, so reusing the name
+            // would let it replace whatever this capture had just written.
+            let next = bump_generation(indexes, &key, generation)?;
+            capture_workspace_once(
+                repo,
+                reference,
+                &index_file(indexes, &key, next),
+                head,
+                &basis,
+                ignore_case,
+            )
+        }
+        result => result,
+    }
+}
+
+fn needs_fresh_index(config: &[u8]) -> bool {
+    // A configured clean filter runs only when an attribute selects it.
+    // Inspect those attributes separately and use Git's last autocrlf value.
+    enabled_config(config, b"core.autocrlf")
+}
+
+fn enabled_config(config: &[u8], key: &[u8]) -> bool {
+    let value = nul_records(config)
+        .filter_map(|entry| {
+            let mut parts = entry.splitn(2, |byte| *byte == b'\n');
+            (parts.next()? == key).then(|| parts.next().unwrap_or(b"true"))
+        })
+        .last();
+    value.is_some_and(|value| {
+        !matches!(
+            value.to_ascii_lowercase().as_slice(),
+            b"false" | b"off" | b"no" | b"0"
+        )
+    })
+}
+
+struct ActiveCapture(PathBuf);
+impl Drop for ActiveCapture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn has_exact_spelling(
+    root: &Path,
+    bytes: &[u8],
+    directories: &mut HashMap<PathBuf, HashSet<OsString>>,
+) -> bool {
+    #[cfg(unix)]
+    let path = {
+        use std::os::unix::ffi::OsStrExt;
+        Path::new(std::ffi::OsStr::from_bytes(bytes))
+    };
+    #[cfg(not(unix))]
+    let path = match std::str::from_utf8(bytes) {
+        Ok(path) => Path::new(path),
+        Err(_) => return false,
+    };
+    let mut parent = root.to_path_buf();
+    for name in path {
+        let names = directories.entry(parent.clone()).or_insert_with(|| {
+            if !std::fs::symlink_metadata(&parent).is_ok_and(|info| info.file_type().is_dir()) {
+                return HashSet::new();
+            }
+            std::fs::read_dir(&parent)
+                .into_iter()
+                .flatten()
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name())
+                .collect()
+        });
+        if !names.contains(name) {
+            return false;
+        }
+        parent.push(name);
+    }
+    true
+}
+
+fn has_conversion_attributes(repo: &Path, index: &Path) -> Result<bool, String> {
+    let paths = checked_output(&mut index_command(
+        repo,
+        index,
+        &[
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ],
+    ))?;
+    if paths.is_empty() {
+        return Ok(false);
+    }
+    let (code, attributes, stderr) = run_with_input(
+        index_command(repo, index, &["check-attr", "--all", "--stdin", "-z"]),
+        paths,
+    )?;
+    if code != 0 {
+        return Err(stdin_failure(code, &stderr));
+    }
+    // check-attr emits path, attribute, value. Even an explicitly disabled
+    // conversion uses the fresh path so future attribute edits can't reuse
+    // a blob captured under a different policy.
+    Ok(attributes
+        .split(|byte| *byte == 0)
+        .skip(1)
+        .step_by(3)
+        .any(|name| {
+            matches!(
+                name,
+                b"filter" | b"text" | b"eol" | b"crlf" | b"ident" | b"working-tree-encoding"
+            )
+        }))
+}
+
+fn seed_index(repo: &Path, index: &Path, head: Option<&str>) -> Result<(), String> {
+    checked_output(&mut index_command(
+        repo,
+        index,
+        &["read-tree", head.unwrap_or("--empty")],
+    ))
+    .map(|_| ())
+}
+
+fn capture_fresh(
+    root: &Path,
+    repo: &Path,
+    reference: &str,
+    head: Option<&str>,
+) -> Result<String, String> {
+    let index = std::env::temp_dir().join(format!("monocode-checkpoint-{}.index", unique_id()));
+    let result = seed_index(repo, &index, head)
+        .and_then(|()| finish_workspace_capture(root, repo, reference, &index));
+    remove_scratch_index(&index);
+    result
+}
+
+fn remove_scratch_index(index: &Path) {
+    let _ = std::fs::remove_file(index);
+    let mut lock = index.as_os_str().to_owned();
+    lock.push(".lock");
+    let _ = std::fs::remove_file(lock);
+}
+
+fn index_key(repo: &Path) -> String {
+    format!("{:x}", Sha256::digest(path_to_js(repo).as_bytes()))
+}
+
+fn index_file(indexes: &Path, key: &str, generation: u64) -> PathBuf {
+    indexes.join(format!("{key}.{generation}.index"))
+}
+
+/// Missing means the first capture for this worktree. Anything else is an
+/// error: guessing a generation would write to a path another capture owns.
+fn index_generation(indexes: &Path, key: &str) -> Result<u64, String> {
+    let path = indexes.join(format!("{key}.gen"));
+    match std::fs::read_to_string(&path) {
+        Ok(text) => text.trim().parse().map_err(|e| {
+            format!(
+                "Invalid checkpoint index generation {}: {e}",
+                path.display()
+            )
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(format!("Could not read {}: {error}", path.display())),
+    }
+}
+
+fn bump_generation(indexes: &Path, key: &str, generation: u64) -> Result<u64, String> {
+    let next = generation
+        .checked_add(1)
+        .ok_or("Checkpoint index generation overflow")?;
+    let path = indexes.join(format!("{key}.gen"));
+    // Published atomically, so a reader never sees half a number, and synced
+    // so a machine that loses power right after the rename does not read back
+    // an empty file and fail every later capture.
+    let staged = indexes.join(format!("{key}.gen.tmp"));
+    let mut file = std::fs::File::create(&staged).map_err(|e| e.to_string())?;
+    file.write_all(next.to_string().as_bytes())
+        .map_err(|e| e.to_string())?;
+    file.sync_all().map_err(|e| e.to_string())?;
+    drop(file);
+    std::fs::rename(&staged, &path).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    std::fs::File::open(indexes)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|e| e.to_string())?;
+    Ok(next)
+}
+
+/// Longest a capture waits for another process's capture of the same
+/// workspace. The slowest cold capture here takes about 90s, so this never
+/// cuts a real capture short; past it the other owner is wedged.
+const CAPTURE_GUARD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const CAPTURE_GUARD_POLL: Duration = Duration::from_millis(50);
+
+/// Held for a whole capture, so cooperating captures of one workspace run one
+/// at a time across app processes. Closing the file releases it, and the
+/// kernel does so when this process exits or dies, so a crash costs one failed
+/// capture rather than blocking the worktree until a lock file ages out.
+///
+/// It does not cover a `git` child that outlives a killed app: that child can
+/// still hold, and later rename, `Git`'s own lock. See `lost_index_lock`.
+struct CaptureGuard {
+    _file: std::fs::File,
+}
+
+impl CaptureGuard {
+    fn acquire(guard: &Path) -> Result<Self, String> {
+        Self::acquire_within(guard, CAPTURE_GUARD_TIMEOUT)
+    }
+
+    fn acquire_within(path: &Path, timeout: Duration) -> Result<Self, String> {
+        // The sidecar outlives each capture on purpose: removing it while an
+        // owner holds the old inode would let the next capture lock a new
+        // one.
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path)
+            .map_err(|e| format!("Could not open the capture guard {}: {e}", path.display()))?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(Self { _file: file }),
+                Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    std::thread::sleep(CAPTURE_GUARD_POLL)
+                }
+                Err(TryLockError::WouldBlock) => {
+                    return Err(format!(
+                        "Another MonoCode instance is capturing this workspace: {}",
+                        path.display()
+                    ))
+                }
+                Err(TryLockError::Error(error)) => {
+                    return Err(format!(
+                        "Could not lock the capture guard {}: {error}",
+                        path.display()
+                    ))
+                }
+            }
+        }
+    }
+}
+
+/// Git could not take, or lost, the lock it writes the index through.
+fn lost_index_lock(error: &str) -> bool {
+    [
+        "index.lock",
+        // Git renames by path: a dead writer that finished first takes this
+        // capture's lock, so the rename that follows has no source file.
+        "unable to write new index file",
+    ]
+    .iter()
+    .any(|message| error.contains(message))
+}
+
+fn corrupt_index(error: &str) -> bool {
+    [
+        "index file corrupt",
+        "bad index file",
+        "index file smaller than expected",
+        "unknown index entry format",
+        "Unable to read index",
+    ]
+    .iter()
+    .any(|message| error.contains(message))
+}
+
+fn capture_workspace_once(
+    repo: &Path,
+    reference: &str,
+    index: &Path,
+    head: Option<&str>,
+    basis: &str,
+    ignore_case: bool,
+) -> Result<String, String> {
+    let basis_path = index.with_extension("basis");
+    let reseed =
+        !index.exists() || std::fs::read(&basis_path).ok().as_deref() != Some(basis.as_bytes());
+    if reseed {
+        seed_index(repo, index, head)?;
+    }
+    let run = |dir: &Path, args: &[&str]| checked_output(&mut index_command(dir, index, args));
+    let head_entries = if let Some(head) = head {
+        run(
+            repo,
+            &["ls-tree", "-r", "-z", "--full-name", head, "--", "."],
+        )?
+    } else {
+        Vec::new()
+    };
+    let listing = run(
+        repo,
+        &["ls-files", "-z", "--stage", "--full-name", "--", "."],
+    )?;
+    let indexed = nul_records(&listing)
+        .map(entry_path)
+        .collect::<Result<Vec<_>, String>>()?;
+    let present: HashSet<&[u8]> = indexed.iter().copied().collect();
+    let mut head_paths: HashSet<&[u8]> = HashSet::new();
+    let mut align = Vec::new();
+    for entry in nul_records(&head_entries) {
+        let path = entry_path(entry)?;
+        head_paths.insert(path);
+        if !present.contains(path) {
+            // Keep the recorded mode and object id, including symlinks and
+            // submodules, and never rewrite an entry that still has stat data.
+            align.extend_from_slice(entry);
+            align.push(0);
+        }
+    }
+    if !align.is_empty() {
+        let (code, _, stderr) = run_with_input(
+            index_command(repo, index, &["update-index", "-z", "--index-info"]),
+            align,
+        )?;
+        if code != 0 {
+            return Err(stdin_failure(code, &stderr));
+        }
+    }
+    // Git applies no ignore rule to a path already in the index, so an entry
+    // Git stopped tracking would be captured again and its bytes written into
+    // the object database. Drop those before the add: a file HEAD tracks can
+    // legitimately match a rule, and those stay.
+    let ignored = run(
+        repo,
+        &[
+            "ls-files",
+            "-c",
+            "-i",
+            "--exclude-standard",
+            "-z",
+            "--",
+            ".",
+        ],
+    )?;
+    let mut removals = Vec::new();
+    let mut directories = HashMap::new();
+    for entry in nul_records(&listing) {
+        let path = entry_path(entry)?;
+        if !head_paths.contains(path)
+            && (entry.starts_with(b"160000 ")
+                || (ignore_case && !has_exact_spelling(repo, path, &mut directories)))
+        {
+            // A cache-only gitlink may now be an ordinary directory. An
+            // untracked case-only rename uses its on-disk spelling.
+            removals.extend_from_slice(path);
+            removals.push(0);
+        }
+    }
+    for path in nul_records(&ignored) {
+        if !head_paths.contains(path) {
+            removals.extend_from_slice(path);
+            removals.push(0);
+        }
+    }
+    if !removals.is_empty() {
+        let (code, _, stderr) = run_with_input(
+            index_command(
+                repo,
+                index,
+                &["update-index", "--force-remove", "-z", "--stdin"],
+            ),
+            removals,
+        )?;
+        if code != 0 {
+            return Err(stdin_failure(code, &stderr));
+        }
+    }
+    match has_conversion_attributes(repo, index) {
+        Ok(false) => {}
+        Err(error) if lost_index_lock(&error) || corrupt_index(&error) => return Err(error),
+        _ => return capture_fresh(repo, repo, reference, head),
+    }
+    let result = finish_workspace_capture(repo, repo, reference, index)?;
+    // A missing or partial marker causes the next run to reseed safely.
+    if reseed {
+        let _ = std::fs::write(basis_path, basis);
+    }
+    Ok(result)
+}
+
+fn finish_workspace_capture(
+    root: &Path,
+    repo: &Path,
+    reference: &str,
+    index: &Path,
+) -> Result<String, String> {
+    let run = |dir: &Path, args: &[&str]| checked_output(&mut index_command(dir, index, args));
     let durable = [
         "-c",
         "core.fsync=objects,reference",
         "-c",
         "core.fsyncMethod=fsync",
     ];
-    run(&[durable.as_slice(), &["add", "-A", "--", "."]].concat())?;
-    let tree = String::from_utf8(run(&[durable.as_slice(), &["write-tree"]].concat())?)
+    run(
+        root,
+        &[durable.as_slice(), &["add", "-A", "--", "."]].concat(),
+    )?;
+    let tree = String::from_utf8(run(repo, &[durable.as_slice(), &["write-tree"]].concat())?)
         .map_err(|e| e.to_string())?;
-    let commit = String::from_utf8(run(&[
-        durable.as_slice(),
+    let commit = String::from_utf8(run(
+        repo,
         &[
-            "commit-tree",
-            tree.trim(),
-            "-m",
-            "Monoptah workspace checkpoint",
-        ],
-    ]
-    .concat())?)
+            durable.as_slice(),
+            &[
+                "commit-tree",
+                tree.trim(),
+                "-m",
+                "Monoptah workspace checkpoint",
+            ],
+        ]
+        .concat(),
+    )?)
     .map_err(|e| e.to_string())?;
-    run(&[
-        durable.as_slice(),
-        &["update-ref", reference, commit.trim()],
-    ]
-    .concat())?;
+    run(
+        repo,
+        &[
+            durable.as_slice(),
+            &["update-ref", reference, commit.trim()],
+        ]
+        .concat(),
+    )?;
     Ok(commit.trim().to_string())
 }
 
@@ -1001,18 +1518,22 @@ fn overlay_baseline(
     files: &[(String, Option<Blob>)],
     reference: &str,
 ) -> Result<String, String> {
-    let index =
-        PrivateIndex(std::env::temp_dir().join(format!("monocode-checkpoint-{}", unique_id())));
-    let run = |args: &[&str]| {
-        checked_output(
-            git_command(root, args)
-                .env("GIT_INDEX_FILE", &index.0)
-                .env("GIT_AUTHOR_NAME", "Monoptah")
-                .env("GIT_AUTHOR_EMAIL", "checkpoint@monocode.local")
-                .env("GIT_COMMITTER_NAME", "Monoptah")
-                .env("GIT_COMMITTER_EMAIL", "checkpoint@monocode.local"),
-        )
-    };
+    // A scratch index, not the cached one: the overlay must leave the stat
+    // cache that `index_path` keeps for workspace captures untouched.
+    let index = std::env::temp_dir().join(format!("monocode-overlay-{}.index", unique_id()));
+    let result = overlay_baseline_once(root, &index, fresh, files, reference);
+    remove_scratch_index(&index);
+    result
+}
+
+fn overlay_baseline_once(
+    root: &Path,
+    index: &Path,
+    fresh: &str,
+    files: &[(String, Option<Blob>)],
+    reference: &str,
+) -> Result<String, String> {
+    let run = |args: &[&str]| checked_output(&mut index_command(root, index, args));
     run(&["read-tree", fresh])?;
     for (relative, blob) in files {
         match blob {

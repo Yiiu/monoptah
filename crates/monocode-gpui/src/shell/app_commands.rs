@@ -494,13 +494,19 @@ impl Shell {
                             return None;
                         }
                         let live = self.sessions.get(id).map(|view| view.read(cx));
-                        let model =
-                            live.and_then(|view| view.settings.model.clone())
-                                .or_else(|| {
-                                    self.session_details
-                                        .get(id)
-                                        .and_then(|details| details.model.clone())
-                                });
+                        // A loaded choice of None explicitly means the provider default.
+                        let model = live
+                            .filter(|view| {
+                                view.settings_loaded()
+                                    || view.settings.revision != 0
+                                    || view.settings.model.is_some()
+                            })
+                            .map(|view| view.settings.model.as_deref())
+                            .unwrap_or_else(|| {
+                                self.session_details
+                                    .get(id)
+                                    .and_then(|details| details.model.as_deref())
+                            });
                         let has_draft = live.is_some_and(|view| {
                             view.has_saved_draft() || !view.input.read(cx).content.is_empty()
                         }) || self.draft_sessions.contains(id)
