@@ -3,6 +3,42 @@ use std::path::PathBuf;
 pub(crate) struct StartOrchestration(pub monocode_core::orchestration::Plan);
 pub(crate) struct StopOrchestration;
 
+#[cfg(test)]
+#[gpui::test]
+fn attachment_validation_resumes_when_shutdown_fails(test: &mut gpui::TestAppContext) {
+    let selected = tempfile::NamedTempFile::new().unwrap();
+    let queued = tempfile::NamedTempFile::new().unwrap();
+    let store = Store::open(std::path::Path::new(":memory:")).unwrap();
+    let summary = store.create("codex", "/project").unwrap();
+    let window = test.update(|cx| {
+        cx.default_global::<crate::QuitGate>()
+            .0
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        cx.open_window(Default::default(), |_, cx| {
+            cx.new(|cx| Conversation::new(summary, Arc::new(Mutex::new(store)), cx))
+        })
+        .unwrap()
+    });
+    window
+        .update(test, |view, _, cx| {
+            view.attaching = true;
+            view.pending_attachments.push(queued.path().into());
+            view.finish_attachment_read(Ok(vec![selected.path().into()]), cx);
+            view.add_attachments(vec!["ignored-during-shutdown".into()], cx);
+            assert!(view.attachments.is_empty());
+            assert!(view.attaching);
+        })
+        .unwrap();
+    test.update(crate::cancel_shutdown);
+    test.run_until_parked();
+    window
+        .update(test, |view, _, _| {
+            assert_eq!(view.attachments, [selected.path(), queued.path()]);
+            assert!(!view.attaching);
+        })
+        .unwrap();
+}
+
 impl Conversation {
     pub(crate) fn request_folder(&mut self, cx: &mut Context<Self>) {
         if self.settings.mono.is_none() {
@@ -258,12 +294,14 @@ impl Conversation {
         result: Result<Vec<PathBuf>, String>,
         cx: &mut Context<Self>,
     ) {
-        self.attaching = false;
         if crate::saving_for_shutdown(cx) {
-            self.pending_attachments.clear();
-            cx.notify();
+            let view = cx.entity().downgrade();
+            crate::resume_if_quit_fails(cx, move |cx| {
+                let _ = view.update(cx, |this, cx| this.finish_attachment_read(result, cx));
+            });
             return;
         }
+        self.attaching = false;
         match result {
             Ok(paths) => {
                 // Keep removals made while the background validation ran.

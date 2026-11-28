@@ -159,13 +159,28 @@ actions!(application, [Quit]);
 /// one App per process) so tests, which each build their own App, cannot trip
 /// each other's quit.
 #[derive(Default)]
-struct QuitGate(AtomicBool);
+struct QuitGate(AtomicBool, Vec<QuitCancelled>);
+
+type QuitCancelled = Box<dyn FnOnce(&mut App)>;
 
 impl Global for QuitGate {}
 
 pub(crate) fn saving_for_shutdown(cx: &App) -> bool {
     cx.try_global::<QuitGate>()
         .is_some_and(|gate| gate.0.load(Ordering::SeqCst))
+}
+
+pub(crate) fn resume_if_quit_fails(cx: &mut App, callback: impl FnOnce(&mut App) + 'static) {
+    cx.global_mut::<QuitGate>().1.push(Box::new(callback));
+}
+
+fn cancel_shutdown(cx: &mut App) {
+    let gate = cx.global_mut::<QuitGate>();
+    gate.0.store(false, Ordering::SeqCst);
+    let deferred = std::mem::take(&mut gate.1);
+    for callback in deferred {
+        callback(cx);
+    }
 }
 
 fn quit(cx: &mut App) {
@@ -210,7 +225,7 @@ fn quit_after_saving(cx: &mut App, finish: impl FnOnce(&mut App) + 'static) {
             for saver in savers {
                 saver.resume();
             }
-            cx.update(|cx| cx.global::<QuitGate>().0.store(false, Ordering::SeqCst));
+            cx.update(cancel_shutdown);
             eprintln!("Not quitting: saving UI state is still failing");
             return;
         }
