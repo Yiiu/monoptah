@@ -291,6 +291,62 @@ fn operator_scopes_sessions_and_preserves_an_unsent_draft(cx: &mut TestAppContex
 }
 
 #[gpui::test]
+fn operator_send_refuses_while_shutdown_saves_drafts(cx: &mut TestAppContext) {
+    let (window, _, caller) = setup(cx);
+    let worker = window
+        .update(cx, |shell, _, cx| {
+            let summary = locked(&shell.store)
+                .unwrap()
+                .create("codex", &shell.sessions[&caller].read(cx).summary.cwd)
+                .unwrap();
+            let id = summary.id;
+            shell.add(summary, cx);
+            shell.sessions[&id].update(cx, |view, cx| view.load(cx));
+            id
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, _, cx| {
+            assert!(shell.sessions[&worker].read(cx).ready_for_external(cx));
+            cx.default_global::<crate::QuitGate>()
+                .0
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+        .unwrap();
+    let error = call(
+        window,
+        caller,
+        "shutdown",
+        "sessions.send",
+        json!({"sessionId":worker,"prompt":"This prompt was not submitted"}),
+        cx,
+    )
+    .unwrap_err();
+    assert!(error.contains("busy, loading"), "{error}");
+    window
+        .update(cx, |shell, _, cx| {
+            assert!(
+                shell.sessions[&worker]
+                    .read(cx)
+                    .input
+                    .read(cx)
+                    .content
+                    .is_empty()
+            );
+            assert!(
+                locked(&shell.store)
+                    .unwrap()
+                    .load(worker)
+                    .unwrap()
+                    .rows
+                    .is_empty()
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
 fn operator_tools_use_the_current_model_selection(cx: &mut TestAppContext) {
     let _no_clis = crate::shell::surface_tests::NoClis::new();
     let (window, _, caller) = setup(cx);

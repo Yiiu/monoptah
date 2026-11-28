@@ -2480,6 +2480,16 @@ impl Store {
             .filter_map(|(key, value)| Some((key.strip_prefix(prefix)?.to_string(), value.clone())))
             .collect())
     }
+    pub(super) fn shared_composer_draft_sessions(&self, prefix: &str) -> HashSet<i64> {
+        self.shared
+            .as_ref()
+            .unwrap()
+            .extras
+            .borrow()
+            .keys()
+            .filter_map(|key| key.strip_prefix(prefix)?.parse().ok())
+            .collect()
+    }
     pub(super) fn shared_drafts(&self) -> Result<HashSet<i64>, String> {
         let mut query = sql(self.conn.prepare(&format!(
             "SELECT id FROM sessions WHERE {}!=0",
@@ -2659,6 +2669,7 @@ impl Store {
             .execute("DELETE FROM sessions WHERE id=?1", [original]))?;
         self.shared_delete_setting(&format!("context:{id}"))?;
         self.shared_delete_setting(&format!("agent:{id}"))?;
+        self.shared_delete_setting(&super::composer_draft::key(id))?;
         sql(tx.commit())?;
         self.shared
             .as_ref()

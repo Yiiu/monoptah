@@ -3,6 +3,47 @@ use std::path::PathBuf;
 pub(crate) struct StartOrchestration(pub monocode_core::orchestration::Plan);
 pub(crate) struct StopOrchestration;
 
+#[cfg(test)]
+#[gpui::test]
+fn attachment_validation_resumes_when_shutdown_fails(test: &mut gpui::TestAppContext) {
+    use monocode_core::store::Store;
+    use std::sync::Mutex;
+
+    let root = std::env::current_dir().unwrap();
+    let selected = root.join("Cargo.toml");
+    let queued = root.join("Cargo.lock");
+    let store = Store::open(std::path::Path::new(":memory:")).unwrap();
+    let summary = store.create("codex", "/project").unwrap();
+    let window = test.update(|cx| {
+        crate::input::bind(cx);
+        cx.default_global::<crate::QuitGate>()
+            .0
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        cx.open_window(Default::default(), |_, cx| {
+            cx.new(|cx| Conversation::new(summary, Arc::new(Mutex::new(store)), cx))
+        })
+        .unwrap()
+    });
+    window
+        .update(test, |view, _, cx| {
+            view.attaching = true;
+            view.pending_attachments.push(queued.clone());
+            view.finish_attachment_read(Ok(vec![selected.clone()]), cx);
+            view.add_attachments(vec!["ignored-during-shutdown".into()], cx);
+            assert!(view.attachments.is_empty());
+            assert!(view.attaching);
+        })
+        .unwrap();
+    test.update(crate::cancel_shutdown);
+    test.run_until_parked();
+    window
+        .update(test, |view, _, _| {
+            assert_eq!(view.attachments, [selected, queued]);
+            assert!(!view.attaching);
+        })
+        .unwrap();
+}
+
 impl Conversation {
     pub(crate) fn request_folder(&mut self, cx: &mut Context<Self>) {
         if self.settings.mono.is_none() {
@@ -222,6 +263,9 @@ impl Conversation {
         true
     }
     pub(super) fn add_attachments(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        if crate::saving_for_shutdown(cx) {
+            return;
+        }
         for path in paths {
             if !self.attachments.contains(&path) && !self.pending_attachments.contains(&path) {
                 self.pending_attachments.push(path);
@@ -255,6 +299,13 @@ impl Conversation {
         result: Result<Vec<PathBuf>, String>,
         cx: &mut Context<Self>,
     ) {
+        if crate::saving_for_shutdown(cx) {
+            let view = cx.entity().downgrade();
+            crate::resume_if_quit_fails(cx, move |cx| {
+                let _ = view.update(cx, |this, cx| this.finish_attachment_read(result, cx));
+            });
+            return;
+        }
         self.attaching = false;
         match result {
             Ok(paths) => {
@@ -278,7 +329,7 @@ impl Conversation {
         let this = cx.entity().downgrade();
         let remove: crate::attachment_tray::OnRemove = std::rc::Rc::new(move |ix, _, cx| {
             let _ = this.update(cx, |this, cx| {
-                if ix < this.attachments.len() {
+                if !crate::saving_for_shutdown(cx) && ix < this.attachments.len() {
                     this.attachments.remove(ix);
                     cx.notify();
                 }
@@ -352,7 +403,8 @@ impl Conversation {
         )
     }
     pub(crate) fn ready_for_external(&self, cx: &gpui::App) -> bool {
-        self.history_ready()
+        !crate::saving_for_shutdown(cx)
+            && self.history_ready()
             && !self.editing_last_turn.pending()
             && !self.busy
             && !self.stopping

@@ -9,6 +9,7 @@ pub(super) struct Metadata<'a> {
     #[cfg(test)]
     terminal_busy: bool,
     draft: bool,
+    composer_draft: bool,
 }
 impl Metadata<'_> {
     pub(super) fn display_title(&self) -> String {
@@ -25,7 +26,7 @@ impl Metadata<'_> {
         self.live.and_then(|chat| chat.auto_resume_state(now))
     }
     pub(super) fn has_saved_draft(&self) -> bool {
-        self.live.map_or(self.draft, Conversation::has_saved_draft)
+        self.composer_draft || self.live.map_or(self.draft, Conversation::has_saved_draft)
     }
 }
 
@@ -42,6 +43,7 @@ impl Shell {
             #[cfg(test)]
             terminal_busy,
             draft: self.draft_sessions.contains(&id),
+            composer_draft: self.composer_draft_sessions.contains(&id),
         }
     }
     /// Opening and explicit previews materialize chats; enumerating or scrolling

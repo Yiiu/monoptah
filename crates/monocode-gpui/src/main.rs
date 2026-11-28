@@ -159,9 +159,29 @@ actions!(application, [Quit]);
 /// one App per process) so tests, which each build their own App, cannot trip
 /// each other's quit.
 #[derive(Default)]
-struct QuitGate(AtomicBool);
+struct QuitGate(AtomicBool, Vec<QuitCancelled>);
+
+type QuitCancelled = Box<dyn FnOnce(&mut App)>;
 
 impl Global for QuitGate {}
+
+pub(crate) fn saving_for_shutdown(cx: &App) -> bool {
+    cx.try_global::<QuitGate>()
+        .is_some_and(|gate| gate.0.load(Ordering::SeqCst))
+}
+
+pub(crate) fn resume_if_quit_fails(cx: &mut App, callback: impl FnOnce(&mut App) + 'static) {
+    cx.global_mut::<QuitGate>().1.push(Box::new(callback));
+}
+
+fn cancel_shutdown(cx: &mut App) {
+    let gate = cx.global_mut::<QuitGate>();
+    gate.0.store(false, Ordering::SeqCst);
+    let deferred = std::mem::take(&mut gate.1);
+    for callback in deferred {
+        callback(cx);
+    }
+}
 
 fn quit(cx: &mut App) {
     if notifications::updater::defer_quit(cx) {
@@ -187,17 +207,26 @@ fn quit_after_saving(cx: &mut App, finish: impl FnOnce(&mut App) + 'static) {
     {
         return;
     }
-    let Some(saver) = ui_store_saves::inbox_saver(cx) else {
+    let savers = ui_store_saves::pending_savers(cx);
+    if savers.is_empty() {
         stop_processes(cx, finish);
         return;
-    };
-    let drained = saver.drain();
+    }
+    let drained: Vec<_> = savers
+        .iter()
+        .map(ui_store_saves::UiStoreSaves::drain)
+        .collect();
     cx.spawn(async move |cx| {
-        if !matches!(drained.recv().await, Ok(Ok(()))) {
-            cx.update(|cx| cx.global::<QuitGate>().0.store(false, Ordering::SeqCst));
-            // The Inbox keeps showing the save error, and the saver takes saves
-            // again, so the user can retry by quitting once more.
-            eprintln!("Not quitting: saving the inbox state is still failing");
+        let mut saved = true;
+        for result in drained {
+            saved &= matches!(result.recv().await, Ok(Ok(())));
+        }
+        if !saved {
+            for saver in savers {
+                saver.resume();
+            }
+            cx.update(cancel_shutdown);
+            eprintln!("Not quitting: saving UI state is still failing");
             return;
         }
         cx.update(|cx| stop_processes(cx, finish));
@@ -820,13 +849,18 @@ mod persistence_safety_tests {
     }
 
     #[gpui::test]
-    fn quit_waits_for_latest_setting(cx: &mut TestAppContext) {
+    fn quit_waits_for_latest_setting_and_pending_composer_draft(cx: &mut TestAppContext) {
         let store = memory_store();
+        let session = store.lock().unwrap().create("codex", "/project").unwrap();
+        let draft = r#"{"text":"latest draft","attachments":[]}"#;
         cx.update(|cx| {
             ui_store_saves::install(store.clone(), cx);
             ui_store_saves::inbox_saver(cx)
                 .unwrap()
                 .save_latest("latest".into())
+                .unwrap();
+            ui_store_saves::composer_saver(&store, session.id, cx)
+                .save_latest(draft.into())
                 .unwrap();
         });
         let held = HeldStore::hold(&store);
@@ -842,11 +876,50 @@ mod persistence_safety_tests {
         );
         assert!(held.release());
         cx.run_until_parked();
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_millis(200));
+        cx.run_until_parked();
         assert!(
             matches!(restarted.try_recv(), Ok(Some(_))),
             "the relaunch happened only after the save"
         );
         assert_eq!(inbox_setting(&store).as_deref(), Some("latest"));
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .read_composer_draft(session.id)
+                .unwrap()
+                .as_deref(),
+            Some(draft),
+        );
+    }
+
+    #[gpui::test]
+    fn a_new_session_composer_rejects_typing_during_shutdown(cx: &mut TestAppContext) {
+        use gpui::EntityInputHandler;
+        let composer = cx.update(|cx| {
+            cx.default_global::<QuitGate>()
+                .0
+                .store(true, Ordering::SeqCst);
+            cx.open_window(Default::default(), |_, cx| {
+                cx.new(input::Input::session_composer)
+            })
+            .unwrap()
+        });
+        composer
+            .update(cx, |input, window, cx| {
+                input.replace_text_in_range(None, "late draft", window, cx);
+                assert!(input.content.is_empty());
+            })
+            .unwrap();
+        cx.update(|cx| cx.global::<QuitGate>().0.store(false, Ordering::SeqCst));
+        composer
+            .update(cx, |input, window, cx| {
+                input.replace_text_in_range(None, "editing resumed", window, cx);
+                assert_eq!(input.content, "editing resumed");
+            })
+            .unwrap();
     }
 
     #[gpui::test]

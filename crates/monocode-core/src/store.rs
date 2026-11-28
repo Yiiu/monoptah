@@ -23,7 +23,9 @@ pub use remote::{
     RemoteUpload, CONVERTED, MISSING_HOST, SANDBOX_STOPPED_DELETE,
 };
 pub(crate) use shared::handle as desktop_session_handle;
+mod composer_draft;
 mod session_activity;
+pub use composer_draft::ComposerDraft;
 pub use session_activity::SessionActivity;
 mod session_metadata;
 pub use session_metadata::{MobileSessionMetadata, SessionSidebarMetadata};
@@ -1603,7 +1605,7 @@ impl Store {
         tx.execute("DELETE FROM native_reminders WHERE session_id=?1", [id])
             .map_err(|e| e.to_string())?;
         tx.execute(
-            "DELETE FROM native_settings WHERE key IN (?1,?2,?3,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21) OR key LIKE ?4",
+            "DELETE FROM native_settings WHERE key IN (?1,?2,?3,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22) OR key LIKE ?4",
             params![
                 format!("agent:{id}"),
                 format!("context:{id}"),
@@ -1625,7 +1627,8 @@ impl Store {
                 format!("cloud-continue:{id}"),
                 format!("cloud-move-point:{id}"),
                 format!("cloud-continue-broken:{id}"),
-                format!("gate-before-row:{id}")
+                format!("gate-before-row:{id}"),
+                composer_draft::key(id)
             ],
         )
         .map_err(|e| e.to_string())?;

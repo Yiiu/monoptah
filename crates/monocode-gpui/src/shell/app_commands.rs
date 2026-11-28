@@ -509,7 +509,8 @@ impl Shell {
                             });
                         let has_draft = live.is_some_and(|view| {
                             view.has_saved_draft() || !view.input.read(cx).content.is_empty()
-                        }) || self.draft_sessions.contains(id);
+                        }) || self.draft_sessions.contains(id)
+                            || self.composer_draft_sessions.contains(id);
                         Some((
                             metadata.summary.clone(),
                             json!({
@@ -681,7 +682,8 @@ impl Shell {
                         .sessions
                         .get(&id)
                         .is_some_and(|v| v.read(cx).has_saved_draft())
-                        || self.draft_sessions.contains(&id);
+                        || self.draft_sessions.contains(&id)
+                        || self.composer_draft_sessions.contains(&id);
                     let remote = self
                         .session_metadata(id, cx)
                         .summary
@@ -900,6 +902,7 @@ impl Shell {
                             }
                             if !view.read(cx).ready_for_external(cx)
                                 || view.read(cx).has_saved_draft()
+                                || self.composer_draft_sessions.contains(&id)
                             {
                                 Err("Session is busy, loading, or has an unsent draft. Its draft was preserved.".into())
                             } else {

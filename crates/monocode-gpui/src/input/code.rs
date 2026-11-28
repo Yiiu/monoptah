@@ -827,6 +827,9 @@ impl Input {
         self.history(true, cx);
     }
     fn history(&mut self, redo: bool, cx: &mut Context<Self>) {
+        if self.paused_for_shutdown(cx) {
+            return;
+        }
         if self.code.is_none() {
             if self.read_only || self.marked.is_some() {
                 return;
