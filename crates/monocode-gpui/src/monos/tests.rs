@@ -792,6 +792,59 @@ fn heartbeat_runs_keep_the_monos_selected_permissions(cx: &mut TestAppContext) {
     }
 }
 
+#[gpui::test]
+fn background_runs_and_child_launches_use_the_model_picked_after_a_switch(cx: &mut TestAppContext) {
+    let _no_clis = crate::shell::surface_tests::NoClis::new();
+    let s = setup(cx);
+    s.manager.update(cx, |m, cx| {
+        m.chats[&s.id].update(cx, |chat, cx| {
+            chat.mono_config(Kind::Claude, Some("fable".into()), Default::default(), cx)
+                .unwrap();
+            // Simulate opening a chat whose previous choice has been saved.
+            chat.settings.model = Some("fable".into());
+            chat.mono_config(
+                Kind::Codex,
+                Some("gpt-6.2-astra".into()),
+                Default::default(),
+                cx,
+            )
+            .unwrap();
+            // Exercise the real launcher without starting a provider or probing a triage model.
+            chat.settings.usage_limit = Some(Default::default());
+        });
+        m.start_heartbeat(&s.id, "Check for follow-ups".into(), cx);
+    });
+    cx.run_until_parked();
+    s.manager.read_with(cx, |m, cx| {
+        assert!(m.error.is_none(), "heartbeat failed: {:?}", m.error);
+        let run = &m.running[&m.active_run.expect("heartbeat session was created")];
+        let view = run.view.read(cx);
+        assert_eq!(view.summary.provider, "codex");
+        assert_eq!(view.mono_model().as_deref(), Some("gpt-6.2-astra"));
+        assert!(!view.busy);
+    });
+
+    let started = call(
+        &s,
+        "after-model-switch",
+        "sessions.start",
+        json!({"project":s.project,"prompt":"Follow up","draft":true}),
+        cx,
+    )
+    .try_recv()
+    .unwrap()
+    .unwrap();
+    let child = started["sessionId"].as_i64().unwrap();
+    s.window
+        .update(cx, |shell, _, cx| {
+            let child = shell.mono_session_entity(child).expect("child session");
+            let child = child.read(cx);
+            assert_eq!(child.summary.provider, "codex");
+            assert_eq!(child.mono_model().as_deref(), Some("gpt-6.2-astra"));
+        })
+        .unwrap();
+}
+
 pub(super) fn call(
     s: &Setup,
     request: &str,
