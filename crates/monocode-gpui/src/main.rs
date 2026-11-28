@@ -163,6 +163,11 @@ struct QuitGate(AtomicBool);
 
 impl Global for QuitGate {}
 
+pub(crate) fn saving_for_shutdown(cx: &App) -> bool {
+    cx.try_global::<QuitGate>()
+        .is_some_and(|gate| gate.0.load(Ordering::SeqCst))
+}
+
 fn quit(cx: &mut App) {
     if notifications::updater::defer_quit(cx) {
         return;
@@ -873,6 +878,33 @@ mod persistence_safety_tests {
                 .as_deref(),
             Some(draft),
         );
+    }
+
+    #[gpui::test]
+    fn a_new_session_composer_rejects_typing_during_shutdown(cx: &mut TestAppContext) {
+        use gpui::EntityInputHandler;
+        let composer = cx.update(|cx| {
+            cx.default_global::<QuitGate>()
+                .0
+                .store(true, Ordering::SeqCst);
+            cx.open_window(Default::default(), |_, cx| {
+                cx.new(input::Input::session_composer)
+            })
+            .unwrap()
+        });
+        composer
+            .update(cx, |input, window, cx| {
+                input.replace_text_in_range(None, "late draft", window, cx);
+                assert!(input.content.is_empty());
+            })
+            .unwrap();
+        cx.update(|cx| cx.global::<QuitGate>().0.store(false, Ordering::SeqCst));
+        composer
+            .update(cx, |input, window, cx| {
+                input.replace_text_in_range(None, "editing resumed", window, cx);
+                assert_eq!(input.content, "editing resumed");
+            })
+            .unwrap();
     }
 
     #[gpui::test]

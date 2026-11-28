@@ -1971,13 +1971,16 @@ impl Shell {
                 if !this.session_summaries.contains_key(&id) {
                     return;
                 }
-                if draft.0 {
-                    this.composer_draft_sessions.insert(id);
+                let changed = if draft.0 {
+                    this.composer_draft_sessions.insert(id)
                 } else {
-                    this.composer_draft_sessions.remove(&id);
+                    this.composer_draft_sessions.remove(&id)
+                };
+                // Navigation already invalidates chrome. Editing the visible
+                // composer should keep the sidebar and tab surfaces cached.
+                if changed && this.workspace.active != Some(id) {
+                    this.notify_sidebar(cx);
                 }
-                this.notify_sidebar(cx);
-                this.tabs_frame.update(cx, |_, cx| cx.notify());
             },
         ));
         self.observations

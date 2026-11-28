@@ -221,6 +221,9 @@ impl Conversation {
         true
     }
     pub(super) fn add_attachments(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        if crate::saving_for_shutdown(cx) {
+            return;
+        }
         for path in paths {
             if !self.attachments.contains(&path) && !self.pending_attachments.contains(&path) {
                 self.pending_attachments.push(path);
@@ -253,6 +256,11 @@ impl Conversation {
         cx: &mut Context<Self>,
     ) {
         self.attaching = false;
+        if crate::saving_for_shutdown(cx) {
+            self.pending_attachments.clear();
+            cx.notify();
+            return;
+        }
         match result {
             Ok(paths) => {
                 // Keep removals made while the background validation ran.
@@ -275,7 +283,7 @@ impl Conversation {
         let this = cx.entity().downgrade();
         let remove: crate::attachment_tray::OnRemove = std::rc::Rc::new(move |ix, _, cx| {
             let _ = this.update(cx, |this, cx| {
-                if ix < this.attachments.len() {
+                if !crate::saving_for_shutdown(cx) && ix < this.attachments.len() {
                     this.attachments.remove(ix);
                     cx.notify();
                 }

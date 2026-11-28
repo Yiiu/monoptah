@@ -1181,6 +1181,9 @@ impl Conversation {
         today_key: Option<&str>,
         cx: &mut Context<Self>,
     ) {
+        if crate::saving_for_shutdown(cx) {
+            return;
+        }
         self.input.update(cx, |input, cx| input.set_text(text, cx));
         if let Some(key) = today_key {
             self.completion
@@ -1259,7 +1262,7 @@ impl Conversation {
     /// `invert` sends a mid-turn message the opposite way from the follow-up
     /// preference: queued when it steers, steering when it queues.
     fn send_follow_up(&mut self, invert: bool, cx: &mut Context<Self>) {
-        if self.refuse_while_saving_copy(cx) {
+        if crate::saving_for_shutdown(cx) || self.refuse_while_saving_copy(cx) {
             return;
         }
         if self.cloud_create_pending() {

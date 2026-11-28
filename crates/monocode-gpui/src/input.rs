@@ -229,6 +229,7 @@ pub struct Input {
     height: f32,
     single_line: bool,
     read_only: bool,
+    pause_for_shutdown: bool,
     secret: bool,
     max_chars: Option<usize>,
     centered: bool,
@@ -318,6 +319,7 @@ impl Input {
             height: MIN_HEIGHT,
             single_line: false,
             read_only: false,
+            pause_for_shutdown: false,
             secret: false,
             max_chars: None,
             centered: false,
@@ -481,6 +483,7 @@ impl Input {
     /// The session composer: one line tall until the text grows.
     pub fn session_composer(cx: &mut Context<Self>) -> Self {
         let mut input = Self::new(cx);
+        input.pause_for_shutdown = true;
         input.min_height = LINE_HEIGHT;
         input.height = LINE_HEIGHT;
         input
@@ -558,6 +561,9 @@ impl Input {
     }
     pub(crate) fn set_read_only(&mut self, value: bool) {
         self.read_only = value;
+    }
+    fn paused_for_shutdown(&self, cx: &gpui::App) -> bool {
+        self.pause_for_shutdown && crate::saving_for_shutdown(cx)
     }
     pub(crate) fn set_max_chars(&mut self, value: usize) {
         self.max_chars = Some(value);
@@ -1202,6 +1208,9 @@ impl Input {
         }
     }
     fn submit(&mut self, _: &Submit, w: &mut Window, cx: &mut Context<Self>) {
+        if self.paused_for_shutdown(cx) {
+            return;
+        }
         if self.accept_completion(cx) {
             return;
         }
@@ -1222,6 +1231,9 @@ impl Input {
         }
     }
     fn submit_secondary(&mut self, _: &SubmitSecondary, _: &mut Window, cx: &mut Context<Self>) {
+        if self.paused_for_shutdown(cx) {
+            return;
+        }
         if self.secondary_submit {
             if self.marked.is_none() {
                 cx.emit(Submitted);
@@ -1408,8 +1420,8 @@ fn from16(text: &str, offset: usize) -> usize {
 }
 
 impl EntityInputHandler for Input {
-    fn accepts_text_input(&self, _: &mut Window, _: &mut Context<Self>) -> bool {
-        !self.read_only
+    fn accepts_text_input(&self, _: &mut Window, cx: &mut Context<Self>) -> bool {
+        !self.read_only && !self.paused_for_shutdown(cx)
     }
     fn text_input_configuration(
         &mut self,
@@ -1472,7 +1484,7 @@ impl EntityInputHandler for Input {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.read_only {
+        if self.read_only || self.paused_for_shutdown(cx) {
             return;
         }
         self.user_edits += 1;
@@ -1579,7 +1591,7 @@ impl EntityInputHandler for Input {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.read_only {
+        if self.read_only || self.paused_for_shutdown(cx) {
             return;
         }
         self.user_edits += 1;
