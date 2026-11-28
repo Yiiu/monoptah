@@ -247,23 +247,24 @@ impl Conversation {
                     store.history_before(id)?,
                 )
             };
-            crate::runtime::recovery::show_pending(&store, id, &mut history.rows);
+            let recovery = crate::runtime::recovery::show_pending(&store, id, &mut history.rows);
             Ok::<_, String>((
                 crate::transcript::PreparedHistory::at(history.rows, mono, anchor),
                 turns,
                 before,
+                recovery,
             ))
         });
         cx.spawn(async move |this, cx| {
             let result = work.await;
             let _ = this.update(cx, |this, cx| {
                 this.finish_history_preview(
-                    result.as_ref().ok().map(|(history, _, _)| history),
+                    result.as_ref().ok().map(|(history, _, _, _)| history),
                     cx,
                 );
                 this.loading = false;
                 match result {
-                    Ok((history, turns, before)) => {
+                    Ok((history, turns, before, recovery)) => {
                         this.settings.turns = turns.clone();
                         let pager = this.history_pager();
                         this.transcript.update(cx, |view, cx| {
@@ -273,7 +274,7 @@ impl Conversation {
                         });
                         this.history_unloaded = false;
                         this.sync_review(cx);
-                        this.status = "Ready".into();
+                        this.status = recovery.unwrap_or("Ready").into();
                         if let Some((row, query)) = this.pending_search.take() {
                             this.reveal_search(row, query, cx);
                         }

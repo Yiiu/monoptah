@@ -1049,19 +1049,21 @@ impl Conversation {
                             )?;
                         }
                     }
-                    crate::runtime::recovery::show_pending(&store, id, &mut history.rows);
+                    let recovery =
+                        crate::runtime::recovery::show_pending(&store, id, &mut history.rows);
                     let edits = if mono {
                         Vec::new()
                     } else {
                         let db = locked(&store)?;
                         git_actions::restored_session_edits(&db, id, &history.rows)?
                     };
-                    Ok((history, edits))
+                    Ok((history, edits, recovery))
                 })()
-                .map(|(history, edits)| {
+                .map(|(history, edits, recovery)| {
                     (
                         crate::transcript::PreparedHistory::at(history.rows, mono, anchor),
                         edits,
+                        recovery,
                     )
                 }),
                 settings,
@@ -1073,7 +1075,10 @@ impl Conversation {
         cx.spawn(async move |this, cx| {
             let (result, settings, context, follow_ups, before) = work.await;
             let _ = this.update(cx, |this, cx| {
-                this.finish_history_preview(result.as_ref().ok().map(|(history, _)| history), cx);
+                this.finish_history_preview(
+                    result.as_ref().ok().map(|(history, _, _)| history),
+                    cx,
+                );
                 this.loading = false;
                 this.context = context.ok().flatten();
                 match follow_ups {
@@ -1127,14 +1132,14 @@ impl Conversation {
                     this.sweep_auto_resume(cx);
                 }
                 match result {
-                    Ok((history, edits)) => {
+                    Ok((history, edits, recovery)) => {
                         this.remember_session_edits(edits);
                         let pager = this.history_pager();
                         this.transcript.update(cx, |v, cx| {
                             v.install_prepared_history(history, cx);
                             v.set_history_pager(before.ok().flatten(), Some(pager));
                         });
-                        this.status = "Ready".into();
+                        this.status = recovery.unwrap_or("Ready").into();
                         this.loaded = true;
                         if let Some((row, query)) = this.pending_search.take() {
                             this.reveal_search(row, query, cx);

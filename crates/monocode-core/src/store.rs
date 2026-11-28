@@ -45,7 +45,7 @@ pub use edit::EditSnapshot;
 pub use monocode_import::native_model;
 pub use monocode_import::{monocode_database, ImportReport};
 use rusqlite::{params, Connection};
-pub use shared::{HistoryPage, PAGE_TURNS};
+pub use shared::{HistoryPage, ReplyRecoveryRevision, PAGE_TURNS};
 pub use side_threads::DesktopSideThread;
 use std::path::Path;
 
@@ -1108,9 +1108,13 @@ impl Store {
     }
     /// Read the durable rows after a failed final save without adopting a
     /// different transcript revision as that run's recovery baseline.
-    pub fn reply_recovery_baseline(&self, session: i64) -> Result<Option<Transcript>, String> {
+    pub fn reply_recovery_baseline(
+        &self,
+        session: i64,
+        revision: ReplyRecoveryRevision,
+    ) -> Result<Option<Transcript>, String> {
         if self.shared.is_some() {
-            self.shared_reply_recovery_baseline(session)
+            self.shared_reply_recovery_baseline(session, revision)
         } else {
             self.load(session).map(Some)
         }

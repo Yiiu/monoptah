@@ -479,7 +479,8 @@ impl Conversation {
         let end = if self.notification_was_cancelled() {
             TurnEnd::Cancelled
         } else if self.status == "Ready"
-            || self.agent_outcome == Some(monocode_core::agent_status::Outcome::Completed)
+            || (self.agent_outcome == Some(monocode_core::agent_status::Outcome::Completed)
+                && crate::runtime::recovery::is_retained_status(&self.status))
         {
             TurnEnd::Completed
         } else {

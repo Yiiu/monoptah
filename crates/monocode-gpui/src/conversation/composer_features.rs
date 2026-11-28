@@ -345,7 +345,8 @@ impl Conversation {
         let text = monocode_core::response::prose(&rows[start..]);
         (
             self.status == "Ready"
-                || self.agent_outcome == Some(monocode_core::agent_status::Outcome::Completed),
+                || (self.agent_outcome == Some(monocode_core::agent_status::Outcome::Completed)
+                    && crate::runtime::recovery::is_retained_status(&self.status)),
             monocode_core::response::limit(&format!("{}\n{}", self.status, text), 12_000),
         )
     }

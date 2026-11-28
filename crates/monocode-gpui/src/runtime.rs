@@ -346,7 +346,7 @@ fn run_turn_using(
             .iter()
             .rposition(Row::is_prompt)
             .map_or(0, |at| at + 1);
-        persistence::save_turn_receipt(&store, summary.id, turn, info.clone())?;
+        pending.save_turn_receipt(&store, summary.id, turn, info.clone())?;
         turn_receipt = Some((turn, info));
         initial_delivery = settings.mono_message_id.clone();
         let creating_worktree = settings.new_worktree && settings.worktree_cwd.is_none();
@@ -974,7 +974,7 @@ fn run_turn_using(
                                     provider_turn_id: root.provider_turn_id.clone(),
                                     ..Default::default()
                                 };
-                                persistence::save_turn_receipt(&store, summary.id, turn, steer)?;
+                                pending.save_turn_receipt(&store, summary.id, turn, steer)?;
                             }
                         }
                         Event::FollowUpFailed { id, error } => {
@@ -1406,7 +1406,7 @@ fn run_turn_using(
         info.duration_known = true;
         info.completed_at = info.started_at.map(|_| completed);
         info.stopped = cancelled;
-        if let Err(error) = persistence::save_turn_receipt(&store, summary.id, turn, info) {
+        if let Err(error) = pending.save_turn_receipt(&store, summary.id, turn, info) {
             status = format!("{status} · Saving turn metadata failed: {error}");
         }
     }

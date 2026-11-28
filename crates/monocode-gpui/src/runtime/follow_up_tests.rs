@@ -266,6 +266,7 @@ for line in sys.stdin:
     };
     worker.join().unwrap();
     assert!(last.status.contains("Saving failed"), "{}", last.status);
+    assert!(last.reply_pending, "{}", last.status);
     assert!(saw_reply, "{} {:?}", last.status, last.rows);
     let saved = || locked(&store).unwrap().load(session).unwrap().rows;
     let before = saved();
@@ -274,10 +275,17 @@ for line in sys.stdin:
     let journal = fixture
         .0
         .join("sessions.db.gpui-unsaved")
-        .join(format!("{session}.json"));
-    assert!(journal.exists(), "the reply needs to survive a restart");
+        .read_dir()
+        .unwrap()
+        .next()
+        .expect("the reply needs to survive a restart")
+        .unwrap()
+        .path();
     let mut shown = before.clone();
-    recovery::show_pending(&store, session, &mut shown);
+    assert_eq!(
+        recovery::show_pending(&store, session, &mut shown),
+        Some(recovery::REPLY_RETAINED)
+    );
     assert!(shown.iter().any(|row| row.text == "The whole answer"));
 
     let (worker, receive) = turn(summary, "Next", None);
@@ -287,6 +295,8 @@ for line in sys.stdin:
     assert!(update.status.contains("last reply isn't saved yet"));
     assert_eq!(saved(), before);
 
+    recovery::forget_pending(&store, session);
+    assert_eq!(saved(), before);
     disk.room();
     let reopened = Arc::new(Mutex::new(Store::open_monocode(&path).unwrap()));
     recovery::recover_journals(&reopened);
@@ -311,13 +321,36 @@ fn recovery_preserves_a_different_reply_to_the_same_prompt() {
     transcript.begin("user");
     transcript.append("Same question");
     db.write_rows(session, 0, &transcript.rows).unwrap();
+    let expected = db.reply_recovery_revision(session).unwrap();
     let store = Arc::new(Mutex::new(db));
     let answer = transcript.begin("assistant");
     transcript.append("Unsaved answer");
+    let mut unconfirmed = transcript.rows.clone();
+    unconfirmed.insert(
+        answer,
+        Row {
+            role: "user".into(),
+            text: "Steer whose acceptance failed".into(),
+            first: true,
+            sent_at: None,
+        },
+    );
     assert_eq!(
         recovery::retain(
             &store,
             session,
+            expected,
+            &unconfirmed,
+            &[(answer, &unconfirmed[answer..])]
+        )
+        .unwrap(),
+        None,
+    );
+    assert_eq!(
+        recovery::retain(
+            &store,
+            session,
+            expected,
             &transcript.rows,
             &[(answer, &transcript.rows[answer..])],
         )
@@ -329,6 +362,19 @@ fn recovery_preserves_a_different_reply_to_the_same_prompt() {
     independent
         .write_rows(session, answer, &transcript.rows[answer..])
         .unwrap();
+    // A history view can refresh the shared store's cache during this turn.
+    // That read must not silently replace the runtime's original revision.
+    assert_eq!(
+        locked(&store).unwrap().load(session).unwrap().rows,
+        transcript.rows
+    );
+    assert!(
+        locked(&store)
+            .unwrap()
+            .reply_recovery_baseline(session, expected)
+            .unwrap()
+            .is_none()
+    );
     recovery::save_pending(&store, session).unwrap();
     {
         let db = locked(&store).unwrap();
